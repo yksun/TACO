@@ -60,7 +60,7 @@ See [INSTALLATION.md](INSTALLATION.md) for detailed instructions.
 ### Quick Install
 
 ```bash
-git clone https://github.com/ysun-fieldmuseum/TACO.git
+git clone https://github.com/yksun/TACO.git
 cd TACO
 conda env create -f taco-env.yml
 conda activate taco

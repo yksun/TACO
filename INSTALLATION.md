@@ -12,7 +12,7 @@ TACO requires a Unix-like operating system (Linux or macOS) with:
 
 ```bash
 # Clone the repository
-git clone https://github.com/ysun-fieldmuseum/TACO.git
+git clone https://github.com/yksun/TACO.git
 cd TACO
 
 # Create the conda environment
