@@ -2,44 +2,21 @@ name: taco
 channels:
   - conda-forge
   - bioconda
+  - defaults
 dependencies:
-  # core
-  - python=3.10
-
-  # assemblers
-  - canu
-  - nextdenovo
+  - python>=3.8
+  - canu>=2.2
+  - nextdenovo>=2.5
   - peregrine
   - pbipa
-  - flye
-  - hifiasm
-
-  # alignment / core
-  - minimap2
-  - bwa
-  - samtools
-  - seqtk
-  - miniasm
-
-  # evaluation
-  - busco
-  - quast
+  - flye>=2.9
+  - hifiasm>=0.19
+  - busco>=5.4
+  - quast>=5.2
+  - minimap2>=2.24
+  - seqtk>=1.3
+  - funannotate>=1.8
+  - bwa>=0.7
+  - samtools>=1.15
   - merqury
   - meryl
-
-  # misc tools used in pipeline
-  - funannotate
-  - quickmerge
-
-  # utilities
-  - pigz
-  - curl
-  - wget
-  - git
-  - make
-  - gxx_linux-64
-  - parallel
-
-  # python stability
-  - numpy
-  - pandas

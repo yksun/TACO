@@ -1,4 +1,215 @@
 # ------------------------------------------------------------
+# v0.5.6
+# - MAJOR CHANGE (Steps 9, 10, 14): Replaced seqtk telo exact-motif telomere detection
+#   with hybrid scoring system supporting de novo k-mer discovery, built-in motif families
+#   (canonical TTAGGG, budding yeast TG1-3, Candida), and per-end composite scoring.
+#   Three-tier classification: strict_t2t (both ends ≥0.25), single_tel_strong (one end ≥0.25),
+#   telomere_supported (one end ≥0.08).
+#
+# - FIX (Step 12): Updated backbone scoring to read new telomere column names
+#   ("Telomere strict T2T contigs", "Telomere single-end strong contigs") instead of
+#   old names ("Telomere double-end contigs", "Telomere single-end contigs").
+#
+# - FIX (Step 10): Fixed awk variable scope bug where LIST was passed as a positional
+#   argument instead of -v, making it unavailable in the BEGIN block and causing empty
+#   telomere pool extraction.
+#
+# - FIX (Step 16): Updated final report to use score-based telomere classification from
+#   .telomere_end_scores.tsv instead of position-based heuristics, with consistent column names.
+#
+# - CHANGE (Step 12): Backbone scoring now uses BUSCO S% (single-copy) instead of C%
+#   (completeness) to avoid rewarding highly duplicated assemblies as backbone candidates.
+#   Reduced T2T/single-end telomere weights (pool can rescue), increased contigs penalty.
+#   Formula: BUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200 + MerquryQV*20
+#   - contigs*30 + log10(N50)*150.
+#
+# - FIX (Step 10): Pool classification .list files are now written directly by Python,
+#   eliminating awk TSV extraction as a potential failure point.
+#
+# - MAJOR CHANGE (Step 10): Reworked telomere-pool construction from seqtk telo
+#   coordinate output. Contigs are now separated into biologically distinct classes:
+#   strict T2T contigs, best single-end telomeric contigs, and optimized telomere-supported contigs.
+#
+# - MAJOR CHANGE (Step 10): Preserved the strict meaning of t2t.fasta.
+#   It contains only true double-end telomere-to-telomere contigs.
+#   Best single-end telomeric representatives are written to single_tel_best.fasta,
+#   and the optimized combined pool is written to telomere_supported_best.fasta.
+#
+# - MAJOR CHANGE (Step 10): Added redundancy reduction for single-end telomeric contigs
+#   using all-vs-all minimap2 clustering and longest-representative selection.
+#
+# - MAJOR CHANGE (Step 10): Updated protected telomere-pool priority to:
+#   strict T2T > best single-end telomeric representatives > optimized telomere-supported pool.
+#
+# - MAJOR CHANGE (Step 12): Replaced older final merge behavior with cleaned backbone
+#   refinement logic. The selected assembler output is used as the backbone assembly,
+#   while redundant backbone contigs can be replaced or rescued using the optimized telomere pool.
+#
+# - MAJOR CHANGE (Step 12): Added support for optional automatic backbone selection modes:
+#   smart scoring or legacy N50-only selection.
+#
+# - CHANGE (Step 12): Increased telomere contribution in smart backbone scoring to better
+#   reflect telomere-end retention during final assembly refinement.
+#
+# - CHANGE (Step 12): Added optional Merqury integration for assembler ranking and final
+#   reporting when --merqury or --merqury-db is supplied.
+#
+# - FIX (Step 12): Improved fungal single-end telomere rescue by relaxing terminal overhang,
+#   alignment identity, and coverage thresholds.
+#
+# - CHANGE (Step 12): Telomere rescue now prioritizes single_tel_best_clean.fasta as the
+#   preferred rescue pool before falling back to broader telomeric sets.
+#
+# - CHANGE (Step 14): Updated final telomere analysis to report strict T2T, single-end,
+#   total telomere-supported contigs, protected telomere mode, and rescue counts.
+#
+# - CHANGE (Step 16): Updated final comparison reporting to include Merqury metrics,
+#   telomere-pool statistics, rescue counts, selection score, selected assembler,
+#   auto-selection mode, and score formula in final_results/final_result.csv.
+#
+# - CHANGE (Step 18): Added assembly-only mode to run assembler benchmarking/comparison
+#   without final telomere-aware refinement, while still generating assemblies/assembly_info.csv
+#   and optional Merqury comparison output.
+#
+# - FIX: Removed duplicated old parser/selection code, aligned usage text with current logic,
+#   and cleaned older command fragments left from pre-0.5.x versions.
+#
+# - DESIGN UPDATE: TACO now follows a telomere-pool optimization and backbone-refinement
+#   strategy rather than repeated structural merging, improving chromosome-end retention
+#   while reducing non-telomeric redundancy.
+# ------------------------------------------------------------
+# v0.5.5
+# - MAJOR CHANGE (Steps 9, 10, 14): Replaced seqtk telo exact-motif telomere detection
+#   with hybrid scoring system supporting de novo k-mer discovery, built-in motif families
+#   (canonical TTAGGG, budding yeast TG1-3, Candida), and per-end composite scoring.
+#   Three-tier classification: strict_t2t (both ends ≥0.25), single_tel_strong (one end ≥0.25),
+#   telomere_supported (one end ≥0.08).
+#
+# - FIX (Step 12): Updated backbone scoring to read new telomere column names
+#   ("Telomere strict T2T contigs", "Telomere single-end strong contigs") instead of
+#   old names ("Telomere double-end contigs", "Telomere single-end contigs").
+#
+# - FIX (Step 10): Fixed awk variable scope bug where LIST was passed as a positional
+#   argument instead of -v, making it unavailable in the BEGIN block and causing empty
+#   telomere pool extraction.
+#
+# - FIX (Step 16): Updated final report to use score-based telomere classification from
+#   .telomere_end_scores.tsv instead of position-based heuristics, with consistent column names.
+#
+# - CHANGE (Step 12): Backbone scoring now uses BUSCO S% (single-copy) instead of C%
+#   (completeness) to avoid rewarding highly duplicated assemblies as backbone candidates.
+#   Reduced T2T/single-end telomere weights (pool can rescue), increased contigs penalty.
+#   Formula: BUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200 + MerquryQV*20
+#   - contigs*30 + log10(N50)*150.
+#
+# - FIX (Step 10): Pool classification .list files are now written directly by Python,
+#   eliminating awk TSV extraction as a potential failure point.
+#
+# - MAJOR CHANGE (Step 10): Reworked telomere-pool construction from seqtk telo
+#   coordinate output. Contigs are now separated into biologically distinct classes:
+#   strict T2T contigs, best single-end telomeric contigs, and optimized telomere-supported contigs.
+#
+# - MAJOR CHANGE (Step 10): Preserved the strict meaning of t2t.fasta.
+#   It contains only true double-end telomere-to-telomere contigs.
+#   Best single-end telomeric representatives are written to single_tel_best.fasta,
+#   and the optimized combined pool is written to telomere_supported_best.fasta.
+#
+# - MAJOR CHANGE (Step 10): Added redundancy reduction for single-end telomeric contigs
+#   using all-vs-all minimap2 clustering and longest-representative selection.
+#
+# - MAJOR CHANGE (Step 10): Updated protected telomere-pool priority to:
+#   strict T2T > best single-end telomeric representatives > optimized telomere-supported pool.
+#
+# - MAJOR CHANGE (Step 12): Replaced older final merge behavior with cleaned backbone
+#   refinement logic. The selected assembler output is used as the backbone assembly,
+#   while redundant backbone contigs can be replaced or rescued using the optimized telomere pool.
+#
+# - MAJOR CHANGE (Step 12): Added support for optional automatic backbone selection modes:
+#   smart scoring or legacy N50-only selection.
+#
+# - CHANGE (Step 12): Increased telomere contribution in smart backbone scoring to better
+#   reflect telomere-end retention during final assembly refinement.
+#
+# - CHANGE (Step 12): Added optional Merqury integration for assembler ranking and final
+#   reporting when --merqury or --merqury-db is supplied.
+#
+# - FIX (Step 12): Improved fungal single-end telomere rescue by relaxing terminal overhang,
+#   alignment identity, and coverage thresholds.
+#
+# - CHANGE (Step 12): Telomere rescue now prioritizes single_tel_best_clean.fasta as the
+#   preferred rescue pool before falling back to broader telomeric sets.
+#
+# - CHANGE (Step 14): Updated final telomere analysis to report strict T2T, single-end,
+#   total telomere-supported contigs, protected telomere mode, and rescue counts.
+#
+# - CHANGE (Step 16): Updated final comparison reporting to include Merqury metrics,
+#   telomere-pool statistics, rescue counts, selection score, selected assembler,
+#   auto-selection mode, and score formula in final_results/final_result.csv.
+#
+# - CHANGE (Step 18): Added assembly-only mode to run assembler benchmarking/comparison
+#   without final telomere-aware refinement, while still generating assemblies/assembly_info.csv
+#   and optional Merqury comparison output.
+#
+# - FIX: Removed duplicated old parser/selection code, aligned usage text with current logic,
+#   and cleaned older command fragments left from pre-0.5.x versions.
+#
+# - DESIGN UPDATE: TACO now follows a telomere-pool optimization and backbone-refinement
+#   strategy rather than repeated structural merging, improving chromosome-end retention
+#   while reducing non-telomeric redundancy.
+# ------------------------------------------------------------
+# v0.5.4
+# - MAJOR CHANGE (Step 10): Reworked telomere-pool construction from seqtk telo
+#   coordinate output. Contigs are now separated into biologically distinct classes:
+#   strict T2T contigs, best single-end telomeric contigs, and optimized telomere-supported contigs.
+#
+# - MAJOR CHANGE (Step 10): Preserved the strict meaning of t2t.fasta.
+#   It contains only true double-end telomere-to-telomere contigs.
+#   Best single-end telomeric representatives are written to single_tel_best.fasta,
+#   and the optimized combined pool is written to telomere_supported_best.fasta.
+#
+# - MAJOR CHANGE (Step 10): Added redundancy reduction for single-end telomeric contigs
+#   using all-vs-all minimap2 clustering and longest-representative selection.
+#
+# - MAJOR CHANGE (Step 10): Updated protected telomere-pool priority to:
+#   strict T2T > best single-end telomeric representatives > optimized telomere-supported pool.
+#
+# - MAJOR CHANGE (Step 12): Replaced older final merge behavior with cleaned backbone
+#   refinement logic. The selected assembler output is used as the backbone assembly,
+#   while redundant backbone contigs can be replaced or rescued using the optimized telomere pool.
+#
+# - MAJOR CHANGE (Step 12): Added support for optional automatic backbone selection modes:
+#   smart scoring or legacy N50-only selection.
+#
+# - CHANGE (Step 12): Increased telomere contribution in smart backbone scoring to better
+#   reflect telomere-end retention during final assembly refinement.
+#
+# - CHANGE (Step 12): Added optional Merqury integration for assembler ranking and final
+#   reporting when --merqury or --merqury-db is supplied.
+#
+# - FIX (Step 12): Improved fungal single-end telomere rescue by relaxing terminal overhang,
+#   alignment identity, and coverage thresholds.
+#
+# - CHANGE (Step 12): Telomere rescue now prioritizes single_tel_best_clean.fasta as the
+#   preferred rescue pool before falling back to broader telomeric sets.
+#
+# - CHANGE (Step 14): Updated final telomere analysis to report strict T2T, single-end,
+#   total telomere-supported contigs, protected telomere mode, and rescue counts.
+#
+# - CHANGE (Step 16): Updated final comparison reporting to include Merqury metrics,
+#   telomere-pool statistics, rescue counts, selection score, selected assembler,
+#   auto-selection mode, and score formula in final_results/final_result.csv.
+#
+# - CHANGE (Step 18): Added assembly-only mode to run assembler benchmarking/comparison
+#   without final telomere-aware refinement, while still generating assemblies/assembly_info.csv
+#   and optional Merqury comparison output.
+#
+# - FIX: Removed duplicated old parser/selection code, aligned usage text with current logic,
+#   and cleaned older command fragments left from pre-0.5.x versions.
+#
+# - DESIGN UPDATE: TACO now follows a telomere-pool optimization and backbone-refinement
+#   strategy rather than repeated structural merging, improving chromosome-end retention
+#   while reducing non-telomeric redundancy.
+# ------------------------------------------------------------
 # v0.5.3
 # - MAJOR CHANGE (Step 10): Reworked telomere-pool construction from seqtk telo
 #   coordinate output. Contigs are now separated into biologically distinct classes:

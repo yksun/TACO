@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# TACO runtime outputs
+logs/
+benchmark_logs/
+assemblies/
+busco/
+merqury/
+final_results/
+temp/
+*.log
+
+# Assembler outputs
+hicanu/
+NextDenovo/
+peregrine-2021/
+ipa/
+flye/
+hifiasm/
+
+# Intermediate files
+*.paf
+*.delta
+*.coords
+*.fasta.fai
+merged_*.fasta
+allmerged_*.fasta
+t2t*.fasta
+single_tel*.fasta
+telomere_supported*.fasta
+protected_telomere_contigs.fasta
+*.self.paf
+
+# Config files generated at runtime
+run_*.cfg
+input_*.fofn
+reads_*.lst
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
