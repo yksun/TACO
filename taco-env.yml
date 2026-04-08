@@ -7,6 +7,11 @@ dependencies:
   - python>=3.8
   - pip
   # Assemblers
+  # canu needs a working Java runtime — openjdk must be listed explicitly
+  # to prevent the "undefined symbol: JLI_StringDup" error from bioconda builds.
+  # If canu still fails (e.g. you get a dev build), install the stable binary
+  # from https://github.com/marbl/canu/releases and place it on PATH.
+  - openjdk>=11
   - canu>=2.2
   - nextdenovo>=2.5
   - flye>=2.9
@@ -18,7 +23,6 @@ dependencies:
   - quast>=5.2
   - minimap2>=2.24
   - seqtk>=1.3
-  - funannotate>=1.8
   - bwa>=0.7
   - samtools>=1.15
   # Optional (Merqury k-mer QV scoring)

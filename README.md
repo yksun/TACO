@@ -8,10 +8,10 @@ TACO is a telomere-aware all-in-one multi-assembler comparison and refinement pi
 
 TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natural History**.
 
-![Latest Version](https://img.shields.io/github/v/tag/ysun-fieldmuseum/TACO?label=Latest%20Version)
-![Last Commit](https://img.shields.io/github/last-commit/ysun-fieldmuseum/TACO)
-![Issues](https://img.shields.io/github/issues/ysun-fieldmuseum/TACO)
-![License](https://img.shields.io/github/license/ysun-fieldmuseum/TACO)
+![Latest Version](https://img.shields.io/github/v/tag/yksun/TACO?label=Latest%20Version)
+![Last Commit](https://img.shields.io/github/last-commit/yksun/TACO)
+![Issues](https://img.shields.io/github/issues/yksun/TACO)
+![License](https://img.shields.io/github/license/yksun/TACO)
 
 ---
 
@@ -74,7 +74,7 @@ After installation, the `taco` command is available system-wide within the conda
 
 ### Requirements
 
-TACO requires a Unix-like system (Linux or macOS) with Python >= 3.8 and Conda. All pipeline dependencies (assemblers, analysis tools) are specified in `taco-env.yml`. TACO's Python modules use only the standard library with no additional pip packages. Peregrine and IPA may require manual installation (see [INSTALLATION.md](INSTALLATION.md)).
+TACO requires a Unix-like system (Linux or macOS) with Python >= 3.8 and Conda. Most dependencies are installed via `taco-env.yml`. TACO's Python modules use only the standard library with no additional pip packages. Canu, Peregrine, and IPA require manual installation (see [INSTALLATION.md](INSTALLATION.md)). If any assembler is absent or fails, TACO skips that step and continues with the others.
 
 ## Quick Start
 
@@ -256,7 +256,7 @@ TACO/
 
 ## Troubleshooting
 
-**Canu reports `master +XX changes`:** You are using a development build. Install a stable Canu release before benchmarking.
+**Canu reports `master +XX changes` or Step 1 fails with a Java error:** The conda environment now includes `openjdk>=11` to fix the Java runtime. If you still see this error, the bioconda canu may be a dev build — download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. TACO detects dev builds and warns you; if canu fails, the pipeline continues with the remaining assemblers.
 
 **IPA or Peregrine skipped:** These assemblers only support certain platforms. IPA requires PacBio HiFi; Peregrine does not support Nanopore. Use `--platform` to match your data type.
 

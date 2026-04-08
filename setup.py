@@ -9,7 +9,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Yukun Sun",
     author_email="ysun@fieldmuseum.org",
-    url="https://github.com/ysun-fieldmuseum/TACO",
+    url="https://github.com/yksun/TACO",
     license="MIT",
     packages=find_packages(),
     python_requires=">=3.8",

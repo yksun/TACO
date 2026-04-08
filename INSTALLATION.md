@@ -31,7 +31,9 @@ After installation, the `taco` command is available anywhere within the conda en
 
 The conda environment provides all external bioinformatics tools. The `pip install -e .` step registers the `taco` command so you can run it from any directory.
 
-**Assemblers (via conda):** HiCanu (canu), NextDenovo, Flye, Hifiasm
+**Assemblers (via conda):** NextDenovo, Flye, Hifiasm
+
+**HiCanu:** The conda environment includes `canu` and `openjdk>=11` to provide a working Java runtime and avoid the `undefined symbol: JLI_StringDup` error. If you still get Java errors (e.g. from a bioconda dev build), download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. If canu is missing or fails, Step 1 is skipped and all other assemblers continue normally.
 
 **Analysis tools (via conda):** BUSCO, QUAST, Minimap2, Funannotate, Seqtk, BWA, Samtools
 
@@ -105,5 +107,5 @@ TACO uses only the Python standard library. If you see import errors, ensure Pyt
 **Merqury not working:**
 Merqury is optional. Install with `conda install -c bioconda merqury meryl` or use `--no-merqury` to skip.
 
-**Canu reports `master +XX changes`:**
-You are using a development build. Install a stable Canu release (e.g., v2.2 or v2.3).
+**Canu reports `master +XX changes` or Step 1 fails with a Java error:**
+The conda environment now includes `openjdk>=11` to provide a working Java runtime. If you still see this error, the bioconda canu package may be a dev build. Download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. TACO detects dev builds and warns you. If canu fails, the pipeline continues with the remaining assemblers.

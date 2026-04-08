@@ -158,7 +158,7 @@ class PipelineRunner:
         tools = [
             "canu", "nextDenovo", "pg_asm", "ipa", "flye", "hifiasm",
             "seqtk", "busco", "minimap2", "bwa", "samtools",
-            "funannotate", "merge_wrapper.py", "python3",
+            "merge_wrapper.py", "python3",
         ]
         for t in tools:
             if shutil.which(t) or shutil.which(t.replace(".py", "")):
@@ -184,7 +184,7 @@ class PipelineRunner:
         required = [
             "python3", "canu", "nextDenovo", "pg_asm", "ipa",
             "flye", "hifiasm", "seqtk", "busco", "minimap2",
-            "bwa", "samtools", "funannotate",
+            "bwa", "samtools",
         ]
         missing = [c for c in required if not shutil.which(c)]
         # quast can be quast.py or quast

@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import json
 import math
+import tempfile
 from pathlib import Path
 
 
@@ -81,6 +82,147 @@ def _extract_by_list(listfile, infa, outfa):
             s = ''.join(seq)
             for i in range(0, len(s), 60):
                 o.write(s[i:i+60] + "\n")
+
+
+def _read_fasta_records(path):
+    """Read a FASTA file and yield (name, sequence) tuples."""
+    name = None
+    seq = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('>'):
+                if name is not None:
+                    yield name, ''.join(seq)
+                name = line[1:].strip().split()[0]
+                seq = []
+            else:
+                seq.append(line.strip())
+    if name is not None:
+        yield name, ''.join(seq)
+
+
+def _write_fasta(records, path, wrap=60):
+    """Write list of (name, seq) to a FASTA file with line wrapping."""
+    with open(path, 'w') as f:
+        for name, seq in records:
+            f.write(f">{name}\n")
+            for i in range(0, len(seq), wrap):
+                f.write(seq[i:i+wrap] + "\n")
+
+
+def _fasta_sort_minlen(infa, outfa, prefix="contig", minlen=0):
+    """
+    Sort FASTA by contig length (descending), rename as prefix_1, prefix_2, ...,
+    and filter out contigs shorter than minlen.
+
+    Replaces: funannotate sort -i <in> -b <prefix> -o <out> --minlen <N>
+    """
+    if not os.path.isfile(infa) or os.path.getsize(infa) == 0:
+        with open(outfa, 'w') as f:
+            pass
+        return 0
+
+    recs = [(name, seq) for name, seq in _read_fasta_records(infa)
+            if len(seq) >= minlen]
+    recs.sort(key=lambda x: len(x[1]), reverse=True)
+
+    renamed = [(f"{prefix}_{i}", seq) for i, (_, seq) in enumerate(recs, start=1)]
+    _write_fasta(renamed, outfa)
+    return len(renamed)
+
+
+def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None):
+    """
+    Remove contigs that are mostly contained within larger contigs, using
+    minimap2 self-alignment.  Keeps the longer contig when two overlap.
+
+    Replaces: funannotate clean -i <in> -p <pct_cov> -o <out> [--exhaustive]
+
+    Algorithm:
+      1. Self-align with minimap2 -x asm5 -DP
+      2. For each alignment, if the smaller query is covered >= pct_cov%
+         by the larger target, mark the query for removal.
+      3. Write surviving contigs to outfa.
+      4. If exhaustive, repeat until no more removals.
+    """
+    if not os.path.isfile(infa) or os.path.getsize(infa) == 0:
+        with open(outfa, 'w') as f:
+            pass
+        return
+
+    if not shutil.which("minimap2"):
+        if runner:
+            runner.log_warn("minimap2 not found; skipping contig cleaning (funannotate clean replacement)")
+        shutil.copy(infa, outfa)
+        return
+
+    current = infa
+    round_num = 0
+    max_rounds = 20  # safety limit for exhaustive mode
+
+    while True:
+        round_num += 1
+        recs = {name: seq for name, seq in _read_fasta_records(current)}
+        if len(recs) <= 1:
+            break
+
+        # Self-align with minimap2
+        with tempfile.NamedTemporaryFile(suffix=".paf", delete=False, mode='w') as paf_tmp:
+            paf_path = paf_tmp.name
+
+        try:
+            cmd = f"minimap2 -x asm5 -DP --no-long-join -r 500 -c {current} {current}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            with open(paf_path, 'w') as f:
+                f.write(result.stdout)
+        except Exception:
+            break
+
+        # Parse PAF to find contained contigs
+        remove = set()
+        for line in open(paf_path):
+            parts = line.strip().split('\t')
+            if len(parts) < 12:
+                continue
+            qname, qlen, qstart, qend = parts[0], int(parts[1]), int(parts[2]), int(parts[3])
+            tname, tlen = parts[5], int(parts[6])
+            if qname == tname:
+                continue  # skip self-hits
+
+            q_cov = (qend - qstart) * 100.0 / qlen if qlen > 0 else 0
+
+            # If the query is shorter/equal and sufficiently covered, mark for removal
+            if qlen <= tlen and q_cov >= pct_cov:
+                remove.add(qname)
+
+        os.unlink(paf_path)
+
+        if not remove:
+            break
+
+        if runner:
+            runner.log(f"  Cleaning round {round_num}: removing {len(remove)} contained contig(s)")
+
+        # Write survivors to temp file for next round
+        survivors = [(n, s) for n, s in _read_fasta_records(current) if n not in remove]
+        tmp_out = current + f".clean_round{round_num}.tmp"
+        _write_fasta(survivors, tmp_out)
+
+        # Clean up previous temp (if not the original input)
+        if current != infa and os.path.isfile(current):
+            os.unlink(current)
+        current = tmp_out
+
+        if not exhaustive:
+            break
+        if round_num >= max_rounds:
+            break
+
+    # Move final result to outfa
+    if current != infa:
+        shutil.move(current, outfa)
+    else:
+        shutil.copy(current, outfa)
 
 
 def _build_busco_csv(runner):
@@ -345,63 +487,148 @@ def _build_assembly_info(runner):
     runner.log(f"Wrote {info_csv}")
 
 
+def _assembler_skip(runner, step_num, name, reason):
+    """Log a standard skip message and return."""
+    runner.log_warn(f"Step {step_num}: {name} skipped — {reason}")
+
+
 def step_01_canu(runner):
-    """Step 1 - Assembly using HiCanu."""
+    """Step 1 - Assembly using HiCanu (non-fatal)."""
     runner.log("Step 1 - Assembly of the genome using HiCanu")
-    runner.log_version("canu", "canu")
-    cmd = f"canu -p canu -d hicanu genomeSize={runner.genomesize} maxThreads={runner.threads} -pacbio-hifi {runner.fastq}"
-    runner.run_cmd(cmd, desc="Running canu")
+
+    if not shutil.which("canu"):
+        _assembler_skip(runner, 1, "canu", "binary not found. Install a stable release from "
+                        "https://github.com/marbl/canu/releases and place it on PATH.")
+        return
+
+    # Platform flag
+    flag_map = {"pacbio-hifi": "-pacbio-hifi", "nanopore": "-nanopore", "pacbio": "-pacbio"}
+    canu_flag = flag_map.get(runner.platform, "-pacbio-hifi")
+
+    # Warn about development builds (broken Java in some conda-installed builds)
+    ver = runner.log_version("canu", "canu")
+    if ver and ("master" in ver or "changes" in ver):
+        runner.log_warn(f"Canu appears to be a development build: {ver}")
+        runner.log_warn("Development builds may have broken Java dependencies. "
+                        "Install a stable release from https://github.com/marbl/canu/releases")
+
+    cmd = (f"canu -p canu -d hicanu genomeSize={runner.genomesize} "
+           f"maxThreads={runner.threads} {canu_flag} {runner.fastq}")
+    result = runner.run_cmd(cmd, desc="Running canu", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 1: canu failed. Skipping. Other assemblers will continue. "
+                        "Check logs/step_1.log for details.")
 
 
 def step_02_nextdenovo(runner):
-    """Step 2 - Assembly using NextDenovo."""
+    """Step 2 - Assembly using NextDenovo (non-fatal)."""
     runner.log("Step 2 - Assembly of the genome using NextDenovo")
+
+    if not shutil.which("nextDenovo"):
+        _assembler_skip(runner, 2, "nextDenovo", "binary not found. Install via: conda install -c bioconda nextdenovo")
+        return
+
     runner.log_version("nextDenovo", "nextDenovo")
     cmd = f"nextDenovo run_{runner.project}.cfg"
-    runner.run_cmd(cmd, desc="Running nextDenovo")
+    result = runner.run_cmd(cmd, desc="Running nextDenovo", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 2: nextDenovo failed. Skipping. Check logs/step_2.log for details.")
 
 
 def step_03_peregrine(runner):
-    """Step 3 - Assembly using Peregrine."""
+    """Step 3 - Assembly using Peregrine (non-fatal; skipped for Nanopore)."""
     runner.log("Step 3 - Assembly of the genome using Peregrine")
+
+    # Peregrine does not support Nanopore reads
+    if runner.platform == "nanopore":
+        _assembler_skip(runner, 3, "peregrine", "does not support Nanopore reads")
+        return
+
+    if not shutil.which("pg_asm"):
+        _assembler_skip(runner, 3, "peregrine", "pg_asm not found. Install peregrine-2021 from "
+                        "https://github.com/cschin/peregrine-2021")
+        return
+
     runner.log_version("pg_asm", "pg_asm")
     cmd = f"pg_asm reads_{runner.project}.lst peregrine-2021"
-    runner.run_cmd(cmd, desc="Running peregrine")
+    result = runner.run_cmd(cmd, desc="Running peregrine", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 3: peregrine failed. Skipping. Check logs/step_3.log for details.")
 
 
 def step_04_ipa(runner):
-    """Step 4 - Assembly using IPA."""
+    """Step 4 - Assembly using IPA (non-fatal; HiFi only)."""
     runner.log("Step 4 - Assembly of the genome using IPA")
+
+    # IPA only supports PacBio HiFi reads
+    if runner.platform != "pacbio-hifi":
+        _assembler_skip(runner, 4, "IPA", f"only supports PacBio HiFi reads (platform={runner.platform})")
+        return
+
+    if not shutil.which("ipa"):
+        _assembler_skip(runner, 4, "IPA", "binary not found. Install via: conda install -c bioconda pbipa")
+        return
+
     runner.log_version("ipa", "ipa")
     if os.path.isdir("ipa"):
         runner.log("Removing existing IPA run directory")
         shutil.rmtree("ipa")
     cmd = f"ipa local --nthreads {runner.threads} --njobs 1 --run-dir ipa -i {runner.fastq}"
-    runner.run_cmd(cmd, desc="Running ipa")
+    result = runner.run_cmd(cmd, desc="Running ipa", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 4: IPA failed. Skipping. Check logs/step_4.log for details.")
 
 
 def step_05_flye(runner):
-    """Step 5 - Assembly using Flye."""
+    """Step 5 - Assembly using Flye (non-fatal)."""
     runner.log("Step 5 - Assembly of the genome using Flye")
+
+    if not shutil.which("flye"):
+        _assembler_skip(runner, 5, "flye", "binary not found. Install via: conda install -c bioconda flye")
+        return
+
+    flag_map = {"pacbio-hifi": "--pacbio-hifi", "nanopore": "--nano-hq", "pacbio": "--pacbio-raw"}
+    flye_flag = flag_map.get(runner.platform, "--pacbio-hifi")
+
     runner.log_version("flye", "flye")
-    cmd = f"flye --pacbio-hifi {runner.fastq} --out-dir flye --threads {runner.threads}"
-    runner.run_cmd(cmd, desc="Running flye")
+    cmd = f"flye {flye_flag} {runner.fastq} --out-dir flye --threads {runner.threads}"
+    result = runner.run_cmd(cmd, desc="Running flye", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 5: flye failed. Skipping. Check logs/step_5.log for details.")
 
 
 def step_06_hifiasm(runner):
-    """Step 6 - Assembly using Hifiasm."""
+    """Step 6 - Assembly using Hifiasm (non-fatal)."""
     runner.log("Step 6 - Assembly of the genome using Hifiasm")
+
+    if not shutil.which("hifiasm"):
+        _assembler_skip(runner, 6, "hifiasm", "binary not found. Install via: conda install -c bioconda hifiasm")
+        return
+
     os.makedirs("hifiasm", exist_ok=True)
     runner.log_version("hifiasm", "hifiasm")
-    cmd = f"cd hifiasm && hifiasm -o hifiasm.asm -t {runner.threads} {runner.fastq} 2> hifiasm.log"
-    runner.run_cmd(cmd, desc="Running hifiasm", check=False)
+
+    # Platform-specific flags for hifiasm
+    platform_flag = ""
+    if runner.platform == "nanopore":
+        platform_flag = "--ont"
+    elif runner.platform == "pacbio":
+        platform_flag = ""  # hifiasm uses default mode for CLR (less common)
+
+    cmd = f"cd hifiasm && hifiasm -o hifiasm.asm -t {runner.threads} {platform_flag} {runner.fastq} 2> hifiasm.log"
+    result = runner.run_cmd(cmd, desc="Running hifiasm", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 6: hifiasm failed. Skipping. Check logs/step_6.log for details.")
+        return
 
     if os.path.isfile("hifiasm/hifiasm.asm.bp.p_ctg.gfa"):
         cmd = "cd hifiasm && awk '/^S/{print \">\"$2; print $3}' hifiasm.asm.bp.p_ctg.gfa > hifiasm.fasta"
-        runner.run_cmd(cmd, desc="Converting GFA to FASTA", check=False)
+        result = runner.run_cmd(cmd, desc="Converting GFA to FASTA", check=False)
+        if result.returncode != 0:
+            runner.log_warn("Step 6: GFA-to-FASTA conversion failed. Check logs/step_6.log.")
     else:
-        runner.log_error("Hifiasm primary contig GFA not found: hifiasm.asm.bp.p_ctg.gfa")
-        raise RuntimeError("Hifiasm assembly failed")
+        runner.log_warn("Step 6: hifiasm primary contig GFA not found (hifiasm.asm.bp.p_ctg.gfa). "
+                        "Assembly may have failed or produced no output.")
 
 
 def step_07_normalize(runner):
@@ -606,9 +833,9 @@ def step_10_telomere_pool(runner):
                     with open(f) as inp:
                         out.write(inp.read())
 
-    runner.log_version("funannotate", "funannotate")
-    cmd = "funannotate sort -i allmerged_telo.fasta -b contig -o allmerged_telo_sort.fasta --minlen 500"
-    runner.run_cmd(cmd, desc="Sorting telomere contigs", check=False)
+    n_sorted = _fasta_sort_minlen("allmerged_telo.fasta", "allmerged_telo_sort.fasta",
+                                   prefix="contig", minlen=500)
+    runner.log(f"Sorted telomere contigs: {n_sorted} contigs >= 500 bp")
 
     runner.log_version("seqtk", "seqtk")
     cmd = f"seqtk telo -s 1 -m {runner.motif} allmerged_telo_sort.fasta > allmerged.telo.list"
@@ -640,13 +867,13 @@ def step_10_telomere_pool(runner):
             with open("single_tel_best.fasta") as f:
                 out.write(f.read())
 
-    # Clean with funannotate
+    # Clean contained/duplicate contigs (replaces funannotate clean)
     for src, dst in [("t2t.fasta", "t2t_clean.fasta"),
                      ("single_tel_best.fasta", "single_tel_best_clean.fasta"),
                      ("telomere_supported_best.fasta", "telomere_supported_best_clean.fasta")]:
         if os.path.isfile(src) and os.path.getsize(src) > 0:
-            cmd = f"funannotate clean -i {src} -p 30 -o {dst} --exhaustive"
-            runner.run_cmd(cmd, desc=f"Cleaning {src}", check=False)
+            runner.log(f"Cleaning contained contigs from {src}")
+            _fasta_clean_contained(src, dst, pct_cov=30, exhaustive=True, runner=runner)
         else:
             with open(dst, "w") as f:
                 pass
@@ -806,9 +1033,10 @@ def step_12_refine(runner):
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
-    runner.log_version("funannotate", "funannotate")
-    cmd = f"funannotate sort -i assemblies/final_merge.raw.fasta -b contig -o merged_{assembler}_sort.fa --minlen 500"
-    runner.run_cmd(cmd, desc="Sorting final merged assembly", check=False)
+    n_sorted = _fasta_sort_minlen("assemblies/final_merge.raw.fasta",
+                                   f"merged_{assembler}_sort.fa",
+                                   prefix="contig", minlen=500)
+    runner.log(f"Sorted final merged assembly: {n_sorted} contigs >= 500 bp")
 
     shutil.copy(f"merged_{assembler}_sort.fa", "assemblies/final.merged.fasta")
     runner.log("Wrote assemblies/final.merged.fasta")
