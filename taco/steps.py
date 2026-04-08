@@ -569,6 +569,21 @@ def step_04_ipa(runner):
         _assembler_skip(runner, 4, "IPA", "binary not found. Install via: conda install -c bioconda pbipa")
         return
 
+    # IPA calls snakemake internally with --reason, which was removed in v8
+    smk = shutil.which("snakemake")
+    if smk:
+        try:
+            sv = subprocess.run(f"{smk} --version", shell=True, capture_output=True, text=True)
+            smk_ver = sv.stdout.strip()
+            if smk_ver and int(smk_ver.split(".")[0]) >= 8:
+                runner.log_warn(f"Snakemake {smk_ver} detected — IPA requires Snakemake 7.x "
+                                "(v8 removed the --reason flag that IPA depends on). "
+                                "Fix: conda install 'snakemake>=7,<8'")
+                _assembler_skip(runner, 4, "IPA", "incompatible Snakemake version")
+                return
+        except (ValueError, IndexError):
+            pass  # couldn't parse version, let IPA try anyway
+
     runner.log_version("ipa", "ipa")
     if os.path.isdir("ipa"):
         runner.log("Removing existing IPA run directory")
