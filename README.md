@@ -8,7 +8,7 @@ TACO is a telomere-aware all-in-one multi-assembler comparison and refinement pi
 
 TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natural History**.
 
-![Latest Version](https://img.shields.io/github/v/tag/yksun/TACO?label=Latest%20Version)
+![Latest Version](https://img.shields.io/github/v/tag/yksun/TACO?sort=semver&label=Latest%20Version)
 ![Last Commit](https://img.shields.io/github/last-commit/yksun/TACO)
 ![Issues](https://img.shields.io/github/issues/yksun/TACO)
 ![License](https://img.shields.io/github/license/yksun/TACO)
