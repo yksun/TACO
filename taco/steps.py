@@ -653,8 +653,8 @@ def step_07_normalize(runner):
             rename_and_sort_fasta(runner, dest, tmp_renamed, prefix)
             shutil.move(tmp_renamed, dest)
 
-    if runner.fasta and os.path.isfile(runner.fasta) and os.path.getsize(runner.fasta) > 0:
-        shutil.copy(runner.fasta, "./assemblies/external.result.fasta")
+    if runner.external_fasta and os.path.isfile(runner.external_fasta) and os.path.getsize(runner.external_fasta) > 0:
+        shutil.copy(runner.external_fasta, "./assemblies/external.result.fasta")
 
 
 def step_08_busco(runner):
@@ -730,8 +730,8 @@ def step_09_telomere(runner):
         for name, src in pairs:
             if os.path.isfile(src) and os.path.getsize(src) > 0:
                 shutil.copy(src, f"./assemblies/{name}.result.fasta")
-        if runner.fasta and os.path.isfile(runner.fasta) and os.path.getsize(runner.fasta) > 0:
-            shutil.copy(runner.fasta, "./assemblies/external.result.fasta")
+        if runner.external_fasta and os.path.isfile(runner.external_fasta) and os.path.getsize(runner.external_fasta) > 0:
+            shutil.copy(runner.external_fasta, "./assemblies/external.result.fasta")
 
     existing_assemblies = glob.glob("assemblies/*.result.fasta")
     if not existing_assemblies:
