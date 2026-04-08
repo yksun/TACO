@@ -274,6 +274,10 @@ If you use TACO in a publication, please cite the software and archive the exact
 
 TACO was developed at the Grainger Bioinformatics Center, Field Museum of Natural History, Chicago, Illinois, USA.
 
+## Changelog
+
+See [docs/CHANGELOG.md](docs/CHANGELOG.md) for the full version history, including detailed notes on the v0.5.6 → v1.0.0 Bash-to-Python conversion.
+
 ## License
 
 TACO is released under the [MIT License](LICENSE).
