@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # TACO - Telomere-Aware Contig Optimization
-# Thin wrapper that delegates to the Python entry point.
-# Usage: ./run_taco [options]   OR   python3 -m taco [options]
+# Wrapper script. After `pip install -e .`, just use: taco [options]
+# This wrapper is for running without pip install.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 exec python3 -m taco "$@"

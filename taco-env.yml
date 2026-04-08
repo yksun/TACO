@@ -5,12 +5,15 @@ channels:
   - defaults
 dependencies:
   - python>=3.8
+  - pip
+  # Assemblers
   - canu>=2.2
   - nextdenovo>=2.5
-  - peregrine
-  - pbipa
   - flye>=2.9
   - hifiasm>=0.19
+  - peregrine-2021
+  - pbipa
+  # Analysis tools
   - busco>=5.4
   - quast>=5.2
   - minimap2>=2.24
@@ -18,5 +21,10 @@ dependencies:
   - funannotate>=1.8
   - bwa>=0.7
   - samtools>=1.15
+  # Optional (Merqury k-mer QV scoring)
   - merqury
   - meryl
+  # Optional (telomere repeat discovery)
+  # - tidk
+  - pip:
+    - -e .

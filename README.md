@@ -64,14 +64,17 @@ git clone https://github.com/yksun/TACO.git
 cd TACO
 conda env create -f taco-env.yml
 conda activate taco
+pip install -e .
 
-# Run TACO
-python3 -m taco --help
+# Verify
+taco --help
 ```
+
+After installation, the `taco` command is available system-wide within the conda environment.
 
 ### Requirements
 
-TACO requires a Unix-like system (Linux or macOS) with Python >= 3.8 and Conda. All pipeline dependencies (assemblers, analysis tools) are specified in `taco-env.yml`. TACO's Python modules use only the standard library with no additional pip packages.
+TACO requires a Unix-like system (Linux or macOS) with Python >= 3.8 and Conda. All pipeline dependencies (assemblers, analysis tools) are specified in `taco-env.yml`. TACO's Python modules use only the standard library with no additional pip packages. Peregrine and IPA may require manual installation (see [INSTALLATION.md](INSTALLATION.md)).
 
 ## Quick Start
 
@@ -80,7 +83,7 @@ TACO requires a Unix-like system (Linux or macOS) with Python >= 3.8 and Conda. 
 ```bash
 mkdir -p my_project && cd my_project
 
-python3 -m taco -g 12m -t 16 \
+taco -g 12m -t 16 \
   --fastq /path/to/reads.fastq \
   -m TTAGGG
 ```
@@ -88,7 +91,7 @@ python3 -m taco -g 12m -t 16 \
 **Assembly-only comparison** (benchmarking only):
 
 ```bash
-python3 -m taco -g 12m -t 16 \
+taco -g 12m -t 16 \
   --fastq /path/to/reads.fastq \
   -m TTAGGG \
   --assembly-only
@@ -97,7 +100,7 @@ python3 -m taco -g 12m -t 16 \
 **With Merqury QV scoring:**
 
 ```bash
-python3 -m taco -g 12m -t 16 \
+taco -g 12m -t 16 \
   --fastq /path/to/reads.fastq \
   -m TTAGGG \
   --merqury-db reads.meryl
@@ -229,10 +232,11 @@ project_directory/
 
 ```
 TACO/
-├── run_taco                # Shell wrapper (runs python3 -m taco)
+├── setup.py                # pip install entry point
+├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
 │   ├── __init__.py         # Package metadata (v1.0.0)
-│   ├── __main__.py         # Entry point (python3 -m taco)
+│   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
 │   ├── steps.py            # All 18 step implementations
@@ -242,10 +246,11 @@ TACO/
 │   ├── clustering.py       # Minimap2-based contig clustering
 │   ├── backbone.py         # Backbone selection and scoring
 │   └── reporting.py        # Final report generation
-├── taco-env.yml            # Conda environment specification
-├── INSTALLATION.md         # Installation guide
+├── docs/                   # Documentation and images
+├── taco-env.yml            # Conda environment
+├── INSTALLATION.md
 ├── README.md
-├── LICENSE                 # MIT License
+├── LICENSE
 └── .gitignore
 ```
 

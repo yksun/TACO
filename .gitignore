@@ -3,8 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
+*.egg
 dist/
 build/
+.eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
 
 # TACO runtime outputs
 logs/

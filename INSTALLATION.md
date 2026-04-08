@@ -4,7 +4,6 @@
 
 TACO requires a Unix-like operating system (Linux or macOS) with:
 
-- Bash >= 4.0
 - Python >= 3.8
 - Conda or Micromamba
 
@@ -15,36 +14,70 @@ TACO requires a Unix-like operating system (Linux or macOS) with:
 git clone https://github.com/yksun/TACO.git
 cd TACO
 
-# Create the conda environment
+# Create the conda environment (includes all analysis tools)
 conda env create -f taco-env.yml
-
-# Activate the environment
 conda activate taco
 
-# Verify installation
-python3 -m taco --help
+# Install TACO as a command
+pip install -e .
+
+# Verify
+taco --help
 ```
 
-## Conda Environment
+After installation, the `taco` command is available anywhere within the conda environment.
 
-TACO bundles all dependencies in a single conda environment defined in
-`taco-env.yml`. The environment includes:
+## What Gets Installed
 
-**Assemblers:** HiCanu (via canu), NextDenovo, Peregrine, IPA (PacBio), Flye, Hifiasm
+The conda environment provides all external bioinformatics tools. The `pip install -e .` step registers the `taco` command so you can run it from any directory.
 
-**Analysis tools:** BUSCO, QUAST, Minimap2, Funannotate, Seqtk, BWA, Samtools
+**Assemblers (via conda):** HiCanu (canu), NextDenovo, Flye, Hifiasm
 
-**Optional tools:** Merqury + Meryl (assembly QV scoring), tidk (improves telomere auto-detection)
+**Analysis tools (via conda):** BUSCO, QUAST, Minimap2, Funannotate, Seqtk, BWA, Samtools
 
-## Manual Installation
+**Optional tools (via conda):** Merqury + Meryl (assembly QV scoring), tidk (telomere repeat discovery)
 
-If you prefer not to use the bundled environment:
+## Manual Installation of Peregrine and IPA
 
-1. Install Python >= 3.8 (standard library only; no pip packages needed)
-2. Install each assembler following its own documentation
-3. Install analysis tools: busco, quast, minimap2, funannotate, seqtk, bwa, samtools
-4. Ensure all tools are available on your PATH
-5. Run `python3 -m taco --help` to verify
+Peregrine and IPA are not reliably available through current bioconda channels and may require manual installation.
+
+### Peregrine
+
+```bash
+# Clone and build from source
+git clone https://github.com/cschin/peregrine-2021.git
+cd peregrine-2021
+# Follow the build instructions in the repository
+```
+
+Ensure `pg_asm` is on your PATH after installation. If Peregrine is not installed, TACO will skip Step 3 with a warning.
+
+### IPA (PacBio Improved Phased Assembler)
+
+```bash
+# Try conda first
+conda install -c bioconda pbipa
+
+# Or install from source
+# https://github.com/PacificBiosciences/pbipa
+```
+
+IPA only supports PacBio HiFi reads. If not installed, TACO will skip Step 4 with a warning.
+
+## Running TACO
+
+After installation, simply use the `taco` command:
+
+```bash
+mkdir -p my_project && cd my_project
+taco -g 12m -t 16 --fastq /path/to/reads.fastq -m TTAGGG
+```
+
+**Alternative (without pip install):** Use the shell wrapper which sets PYTHONPATH automatically:
+
+```bash
+~/opt/TACO/run_taco -g 12m -t 16 --fastq /path/to/reads.fastq
+```
 
 ## Sequencing Platform Support
 
@@ -56,68 +89,21 @@ TACO supports three sequencing platforms via the `--platform` flag:
 | Oxford Nanopore | `--platform nanopore` | canu, nextDenovo, flye, hifiasm |
 | PacBio CLR | `--platform pacbio` | canu, nextDenovo, peregrine, flye, hifiasm |
 
-IPA only supports PacBio HiFi reads. Peregrine does not support Nanopore reads.
-Incompatible assemblers are automatically skipped with a warning.
-
-## Running TACO
-
-TACO can be run in two ways:
-
-```bash
-# Option 1: Python module (recommended)
-python3 -m taco -g 12m -t 16 --fastq reads.fastq
-
-# Option 2: Shell wrapper
-./run_taco -g 12m -t 16 --fastq reads.fastq
-```
-
-To run from any directory, add the TACO directory to PYTHONPATH:
-
-```bash
-echo 'export PYTHONPATH="/path/to/TACO:$PYTHONPATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-## Project Structure
-
-```
-TACO/
-├── run_taco                # Shell wrapper (runs python3 -m taco)
-├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.0.0)
-│   ├── __main__.py         # Entry point (python3 -m taco)
-│   ├── cli.py              # Argument parsing
-│   ├── pipeline.py         # Pipeline runner
-│   ├── steps.py            # All 18 step implementations
-│   ├── utils.py            # Shared utilities and FASTA I/O
-│   ├── telomere_detect.py  # Hybrid telomere detection engine
-│   ├── telomere_pool.py    # Telomere pool classification
-│   ├── clustering.py       # Minimap2-based contig clustering
-│   ├── backbone.py         # Backbone selection and scoring
-│   └── reporting.py        # Final report generation
-├── taco-env.yml            # Conda environment specification
-├── INSTALLATION.md
-├── README.md
-├── LICENSE
-└── .gitignore
-```
+Incompatible or missing assemblers are automatically skipped with a warning.
 
 ## Troubleshooting
 
-**"Command not found" errors:**
-Ensure the taco conda environment is activated: `conda activate taco`
+**`taco: command not found` after pip install:**
+Make sure the taco conda environment is activated: `conda activate taco`
 
-**Permission denied on run_taco:**
-Make the wrapper executable: `chmod +x run_taco`, or use `python3 -m taco` directly.
+**`No module named taco`:**
+Run `pip install -e .` from the TACO repository directory, or use `./run_taco` instead.
 
 **Missing Python modules:**
-TACO uses only the Python standard library. If you see import errors, ensure
-Python >= 3.8 is installed and the `taco/` directory is alongside `TACO.sh`.
+TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and run `pip install -e .` again.
 
 **Merqury not working:**
-Merqury is optional. If not installed, TACO will skip Merqury metrics.
-To install: `conda install -c bioconda merqury meryl`
+Merqury is optional. Install with `conda install -c bioconda merqury meryl` or use `--no-merqury` to skip.
 
 **Canu reports `master +XX changes`:**
-You are using a development build. Install a stable Canu release (e.g., v2.2 or v2.3)
-before running benchmarks.
+You are using a development build. Install a stable Canu release (e.g., v2.2 or v2.3).
