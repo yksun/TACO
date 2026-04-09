@@ -15,6 +15,10 @@ import json
 import math
 import tempfile
 from pathlib import Path
+from collections import defaultdict
+
+from taco.telomere_detect import detect_telomeres, write_detection_outputs
+from taco.clustering import cluster_and_select
 
 
 def rename_and_sort_fasta(runner, infa, outfa, prefix):
@@ -727,8 +731,8 @@ def step_08_busco(runner):
 
 
 def step_09_telomere(runner):
-    """Step 9 - Extract telomere-containing contigs and compute metrics."""
-    runner.log("Step 9 - Extract telomere-containing contigs and compute telomere metrics")
+    """Step 9 - Hybrid telomere detection and scoring on all assemblies."""
+    runner.log("Step 9 - Hybrid telomere detection and scoring")
     os.makedirs("assemblies", exist_ok=True)
 
     existing_assemblies = glob.glob("assemblies/*.result.fasta")
@@ -757,33 +761,36 @@ def step_09_telomere(runner):
     tdouble = {}
     tsingle = {}
 
-    runner.log_version("seqtk", "seqtk")
-
     for fasta_path in sorted(existing_assemblies):
         asm = os.path.basename(fasta_path).replace(".result.fasta", "").replace(".fasta", "")
-        list_file = fasta_path.replace(".result.fasta", ".telo.list").replace(".fasta", ".telo.list")
-        out_file = fasta_path.replace(".result.fasta", ".telo.fasta").replace(".fasta", ".telo.fasta")
+        out_prefix = fasta_path.replace(".result.fasta", "").replace(".fasta", "")
 
-        cmd = f"seqtk telo -s 1 -m {runner.motif} {fasta_path} > {list_file}"
-        runner.run_cmd(cmd, desc=f"Extracting telomeres from {asm}", check=False)
+        runner.log(f"Running hybrid telomere detection on {asm}")
+        try:
+            results = detect_telomeres(
+                fasta_path,
+                mode=runner.telomere_mode,
+                user_motif=runner.motif,
+                end_window=runner.telo_end_window,
+                score_window=runner.telo_score_window,
+                kmer_min=runner.telo_kmer_min,
+                kmer_max=runner.telo_kmer_max,
+                threads=runner.threads,
+            )
+            write_detection_outputs(results, fasta_path, out_prefix)
+        except Exception as e:
+            runner.log_warn(f"Hybrid detection failed for {asm}: {e}; skipping")
+            results = []
 
-        cmd = f"awk '{{print $1}}' {list_file} | sed 's/[[:space:]].*$//' | tr -d '\\r' | sort -u > {list_file}.ids"
-        runner.run_cmd(cmd, desc=f"Extracting telomere IDs for {asm}", check=False)
+        # Count classifications
+        counts = defaultdict(int)
+        for r in results:
+            counts[r["classification"]] += 1
 
-        if os.path.isfile(f"{list_file}.ids") and os.path.getsize(f"{list_file}.ids") > 0:
-            cmd = f"seqtk subseq {fasta_path} {list_file}.ids > {out_file}"
-            runner.run_cmd(cmd, desc=f"Extracting telomere sequences for {asm}", check=False)
-            if os.path.isfile(out_file) and os.path.getsize(out_file) > 0:
-                runner.log(f"Wrote {os.path.basename(out_file)}")
-            else:
-                runner.log_warn(f"{out_file} is empty")
-        else:
-            runner.log_warn(f"No telomere-containing contigs for {asm}; writing empty {out_file}")
-            with open(out_file, 'w') as f:
-                pass
-
-        tdouble[asm] = 0
-        tsingle[asm] = 0
+        tdouble[asm] = counts.get("strict_t2t", 0)
+        tsingle[asm] = counts.get("single_tel_strong", 0)
+        runner.log(f"  {asm}: {tdouble[asm]} strict_t2t, {tsingle[asm]} single_tel_strong, "
+                   f"{counts.get('telomere_supported', 0)} telomere_supported")
 
     # Build CSV matrices
     matrix_csv = "assemblies/assembly.telo.csv"
@@ -852,22 +859,74 @@ def step_10_telomere_pool(runner):
                                    prefix="contig", minlen=500)
     runner.log(f"Sorted telomere contigs: {n_sorted} contigs >= 500 bp")
 
-    runner.log_version("seqtk", "seqtk")
-    cmd = f"seqtk telo -s 1 -m {runner.motif} allmerged_telo_sort.fasta > allmerged.telo.list"
-    runner.run_cmd(cmd, desc="Extracting telomere list", check=False)
+    # ===== Hybrid telomere detection on merged pool =====
+    runner.log("Running hybrid telomere detection on merged pool")
+    pool_fasta = "allmerged_telo_sort.fasta"
+    try:
+        pool_results = detect_telomeres(
+            pool_fasta,
+            mode=runner.telomere_mode,
+            user_motif=runner.motif,
+            end_window=runner.telo_end_window,
+            score_window=runner.telo_score_window,
+            kmer_min=runner.telo_kmer_min,
+            kmer_max=runner.telo_kmer_max,
+            threads=runner.threads,
+        )
+        write_detection_outputs(pool_results, pool_fasta, "allmerged")
+    except Exception as e:
+        runner.log_warn(f"Hybrid detection on merged pool failed: {e}")
+        pool_results = []
 
-    # Create output lists
-    for fname in ["t2t.list", "single_tel.list", "telomere_supported.list"]:
+    # Build tier ID lists from classification results
+    t2t_ids = sorted(set(r["contig"] for r in pool_results if r["classification"] == "strict_t2t"))
+    single_ids = sorted(set(r["contig"] for r in pool_results if r["classification"] == "single_tel_strong"))
+    supported_ids = sorted(set(r["contig"] for r in pool_results
+                               if r["classification"] in ("strict_t2t", "single_tel_strong", "telomere_supported")))
+
+    # Write .list files
+    for fname, ids in [("t2t.list", t2t_ids), ("single_tel.list", single_ids),
+                       ("telomere_supported.list", supported_ids)]:
         with open(fname, "w") as f:
-            pass
+            for x in ids:
+                f.write(x + "\n")
 
-    # Extract FASTAs by list
-    _extract_by_list("t2t.list", "allmerged_telo_sort.fasta", "t2t.fasta")
-    _extract_by_list("single_tel.list", "allmerged_telo_sort.fasta", "single_tel.fasta")
-    _extract_by_list("telomere_supported.list", "allmerged_telo_sort.fasta", "telomere_supported.fasta")
+    # Read merged pool sequences for FASTA extraction
+    pool_seqs = dict(_read_fasta_records(pool_fasta)) if os.path.isfile(pool_fasta) else {}
 
-    # Single-end optimization
-    if os.path.isfile("single_tel.fasta") and os.path.getsize("single_tel.fasta") > 0:
+    # Write .fasta files directly from classification
+    for fname, ids in [("t2t.fasta", t2t_ids), ("single_tel.fasta", single_ids),
+                       ("telomere_supported.fasta", supported_ids)]:
+        recs = [(n, pool_seqs[n]) for n in ids if n in pool_seqs]
+        _write_fasta(recs, fname)
+
+    runner.log(f"Pool classification: {len(t2t_ids)} t2t, {len(single_ids)} single, {len(supported_ids)} supported")
+
+    # ===== Redundancy reduction for T2T contigs via minimap2 clustering =====
+    if os.path.isfile("t2t.fasta") and os.path.getsize("t2t.fasta") > 0 and shutil.which("minimap2"):
+        runner.log("Selecting best T2T representative per chromosome via minimap2 clustering")
+        cmd = f"minimap2 -x asm20 -D -P -t {runner.threads} t2t.fasta t2t.fasta"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        with open("t2t.self.paf", "w") as f:
+            f.write(result.stdout)
+        cluster_and_select("t2t.fasta", "t2t.self.paf", "t2t_best.fasta",
+                           "t2t_cluster_summary.tsv", label="T2T",
+                           min_identity=0.95, min_coverage=0.85)
+        shutil.copy("t2t_best.fasta", "t2t.fasta")
+    else:
+        runner.log_info("T2T clustering skipped (no T2T contigs or minimap2 not available)")
+
+    # ===== Redundancy reduction for single-end contigs via minimap2 clustering =====
+    if os.path.isfile("single_tel.fasta") and os.path.getsize("single_tel.fasta") > 0 and shutil.which("minimap2"):
+        runner.log("Selecting best single-end telomeric representatives via minimap2 clustering")
+        cmd = f"minimap2 -x asm20 -D -P -t {runner.threads} single_tel.fasta single_tel.fasta"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        with open("single_tel.self.paf", "w") as f:
+            f.write(result.stdout)
+        cluster_and_select("single_tel.fasta", "single_tel.self.paf", "single_tel_best.fasta",
+                           "telomere_cluster_summary.tsv", label="single-end",
+                           min_identity=0.95, min_coverage=0.85)
+    elif os.path.isfile("single_tel.fasta") and os.path.getsize("single_tel.fasta") > 0:
         shutil.copy("single_tel.fasta", "single_tel_best.fasta")
     else:
         with open("single_tel_best.fasta", "w") as f:
@@ -960,26 +1019,35 @@ def step_11_quast(runner):
     runner.log("Wrote assemblies/assembly.quast.csv")
 
 
-def step_12_refine(runner):
-    """Step 12 - Final assembly refinement with optimized telomere-end replacement."""
-    runner.log("Step 12 - Final assembly refinement with optimized telomere-end replacement")
-    os.makedirs("merqury", exist_ok=True)
-    os.makedirs("assemblies", exist_ok=True)
+def _run_merqury_preselection(runner):
+    """Run Merqury on all assembler outputs for pre-selection scoring."""
+    db = runner.merqury_db
+    if not db:
+        for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
+            if os.path.isdir(cand):
+                db = cand
+                break
 
-    # Merqury support
-    if runner.merqury_enable:
-        db = runner.merqury_db
-        if not db:
-            for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
-                if os.path.isdir(cand):
-                    db = cand
-                    break
+    if db and os.path.isdir(db) and shutil.which("merqury.sh"):
+        runner.log_info(f"Running Merqury pre-selection using database: {db}")
+        runner.log_version("merqury.sh", "merqury.sh")
 
-        if db and os.path.isdir(db) and shutil.which("merqury.sh"):
-            runner.log_info(f"Running Merqury pre-selection using database: {db}")
-            runner.log_version("merqury.sh", "merqury.sh")
+        assemblers = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+        for asm in assemblers:
+            asm_fa = f"assemblies/{asm}.result.fasta"
+            if not os.path.isfile(asm_fa) or os.path.getsize(asm_fa) == 0:
+                continue
+            qv_file = os.path.join("merqury", f"{asm}.qv")
+            comp_file = os.path.join("merqury", f"{asm}.completeness.stats")
+            if not os.path.isfile(qv_file) or not os.path.isfile(comp_file):
+                cmd = f"merqury.sh {db} {asm_fa} merqury/{asm}"
+                runner.run_cmd(cmd, desc=f"Merqury on {asm}", check=False)
+    else:
+        runner.log_warn("Merqury requested but merqury.sh or a valid .meryl database was not found; skipping.")
 
-    # Write Merqury CSV
+
+def _write_merqury_csv():
+    """Write assemblies/assembly.merqury.csv from Merqury output files."""
     assemblers = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
     rows = [["Metric"] + assemblers, ["Merqury QV"], ["Merqury completeness (%)"]]
 
@@ -1002,13 +1070,265 @@ def step_12_refine(runner):
     with open("assemblies/assembly.merqury.csv", "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
-    # Build assembly info
+
+def _auto_select_backbone(runner):
+    """Auto-select best backbone assembler using smart scoring or N50 mode.
+
+    Reads assembly_info.csv (transposed format: Metric,canu,flye,...) and
+    applies the scoring formula matching TACO.sh Step 12B.
+    """
+    info_csv = "assemblies/assembly_info.csv"
+    mode = runner.auto_mode or "smart"
+    debug_tsv = "assemblies/selection_debug.tsv"
+    decision_txt = "assemblies/selection_decision.txt"
+
+    if not os.path.isfile(info_csv) or os.path.getsize(info_csv) == 0:
+        runner.log_warn("assembly_info.csv missing or empty; cannot auto-select assembler.")
+        return None
+
+    with open(info_csv, newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return None
+
+    header = [h.strip() for h in rows[0]]
+
+    # Build row lookup: metric_name -> row
+    metric_rows = {}
+    for r in rows[1:]:
+        if r and r[0]:
+            metric_rows[r[0].strip().lower()] = r
+
+    def get_val(metric_name_lower, col_idx, default=0.0):
+        row = metric_rows.get(metric_name_lower)
+        if row is None:
+            return default
+        try:
+            return float(row[col_idx])
+        except (IndexError, ValueError):
+            return default
+
+    best_name = None
+    best_score = None
+    records = []
+
+    for idx, asm in enumerate(header[1:], start=1):
+        asm = asm.strip()
+        if not asm:
+            continue
+        fa = f"assemblies/{asm}.result.fasta"
+        if not os.path.isfile(fa) or os.path.getsize(fa) == 0:
+            continue
+
+        busco = get_val("busco s (%)", idx)
+        contigs = get_val("# contigs", idx)
+        n50 = get_val("n50", idx)
+        t2t = get_val("telomere strict t2t contigs", idx)
+        single = get_val("telomere single-end strong contigs", idx)
+        merqury_qv = get_val("merqury qv", idx)
+        merqury_comp = get_val("merqury completeness (%)", idx)
+
+        if mode == "n50":
+            if n50 <= 0:
+                continue
+            score = n50
+        else:
+            if contigs <= 0 or n50 <= 0:
+                continue
+            score = (
+                busco * 1000
+                + t2t * 300
+                + single * 150
+                + merqury_comp * 200
+                + merqury_qv * 20
+                - contigs * 30
+                + math.log10(n50) * 150
+            )
+
+        records.append({
+            "assembler": asm, "busco_s": busco, "t2t": t2t,
+            "single_tel": single, "merqury_qv": merqury_qv,
+            "merqury_comp": merqury_comp, "contigs": contigs,
+            "n50": n50, "score": score,
+        })
+
+        runner.log(f"  {asm}: BUSCO_S={busco} T2T={t2t} single={single} "
+                   f"MerquryQV={merqury_qv} MerquryComp={merqury_comp} "
+                   f"contigs={contigs} N50={n50} score={score:.1f}")
+
+        if best_score is None or score > best_score:
+            best_name = asm
+            best_score = score
+
+    # Write debug TSV
+    with open(debug_tsv, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["assembler", "busco_s", "t2t", "single_tel",
+                     "merqury_qv", "merqury_comp", "contigs", "n50", "score"])
+        for r in records:
+            w.writerow([r["assembler"], r["busco_s"], r["t2t"], r["single_tel"],
+                        r["merqury_qv"], r["merqury_comp"], r["contigs"], r["n50"], r["score"]])
+
+    # Write decision file
+    with open(decision_txt, "w") as f:
+        f.write(f"auto_mode\t{mode}\n")
+        f.write(f"selected_assembler\t{best_name or ''}\n")
+        f.write(f"selected_score\t{best_score if best_score is not None else ''}\n")
+        f.write("score_formula\tBUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200 + MerquryQV*20 - contigs*30 + log10(N50)*150\n")
+
+    return best_name
+
+
+def _clean_backbone_headers(asm_fa, out_fa):
+    """Sanitize backbone FASTA headers (remove special chars, deduplicate names)."""
+    seen = {}
+    recs = []
+    for name, seq in _read_fasta_records(asm_fa):
+        if not seq:
+            continue
+        base = name.split()[0]
+        base = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)
+        if base in seen:
+            seen[base] += 1
+            new = f"{base}_{seen[base]}"
+        else:
+            seen[base] = 1
+            new = base
+        recs.append((new, seq))
+    _write_fasta(recs, out_fa)
+
+
+def _filter_redundant_to_protected(paf_path, backbone_fa, out_fa, cov_thr=0.95, id_thr=0.95):
+    """Remove backbone contigs that are redundant to the protected telomere pool.
+
+    Uses PAF from minimap2 alignment of backbone vs protected pool.
+    Keeps backbone contigs that are NOT covered >= cov_thr with identity >= id_thr.
+    """
+    best = {}
+    if os.path.isfile(paf_path):
+        with open(paf_path) as f:
+            for ln in f:
+                if not ln.strip() or ln.startswith("#"):
+                    continue
+                p = ln.rstrip().split("\t")
+                if len(p) < 12:
+                    continue
+                qname, qlen = p[0], int(p[1])
+                qs, qe = int(p[2]), int(p[3])
+                matches, alnlen = int(p[9]), int(p[10])
+                if qlen <= 0 or alnlen <= 0:
+                    continue
+                ident = matches / max(1, alnlen)
+                cov = (qe - qs) / max(1, qlen)
+                cur = best.get(qname, (0.0, 0.0))
+                if cov > cur[0] or (abs(cov - cur[0]) < 1e-12 and ident > cur[1]):
+                    best[qname] = (cov, ident)
+
+    drop = {q for q, (cov, ident) in best.items() if cov >= cov_thr and ident >= id_thr}
+
+    recs = [(n, s) for n, s in _read_fasta_records(backbone_fa) if n not in drop]
+    _write_fasta(recs, out_fa)
+    return len(drop)
+
+
+def _name_dedup_fasta(protected_fa, input_fa, output_fa):
+    """Remove contigs from input_fa whose names match protected_fa IDs."""
+    protected_ids = set()
+    if os.path.isfile(protected_fa):
+        for name, _ in _read_fasta_records(protected_fa):
+            protected_ids.add(name)
+
+    recs = [(n, s) for n, s in _read_fasta_records(input_fa) if n not in protected_ids]
+    _write_fasta(recs, output_fa)
+    return len(protected_ids)
+
+
+def _telomere_rescue(single_fa, backbone_fa, paf_path, out_ids, out_fa,
+                     min_ident=0.90, min_cov=0.80, min_ext=500):
+    """Replace backbone contigs with telomeric single-end contigs when they extend the backbone.
+
+    For each backbone contig that has a single-end telomeric contig aligned to it with
+    sufficient identity, coverage, and terminal extension, replace the backbone contig
+    with the telomeric contig.
+    """
+    single = dict(_read_fasta_records(single_fa))
+    backbone = dict(_read_fasta_records(backbone_fa))
+
+    best = {}  # tname -> ((ext, ident, cov, len, qname), qname)
+    if os.path.isfile(paf_path):
+        for ln in open(paf_path):
+            if not ln.strip() or ln.startswith("#"):
+                continue
+            p = ln.rstrip().split("\t")
+            if len(p) < 12:
+                continue
+            qname, qlen = p[0], int(p[1])
+            qs, qe = int(p[2]), int(p[3])
+            tname = p[5]
+            matches, alnlen = int(p[9]), int(p[10])
+            if qname not in single or tname not in backbone:
+                continue
+            if alnlen <= 0 or qlen <= 0:
+                continue
+            ident = matches / max(1, alnlen)
+            cov_q = (qe - qs) / max(1, qlen)
+            ext = max(qs, qlen - qe)  # terminal extension
+            if ident < min_ident or cov_q < min_cov or ext < min_ext:
+                continue
+            score = (ext, ident, cov_q, len(single[qname]), qname)
+            cur = best.get(tname)
+            if cur is None or score > cur[0]:
+                best[tname] = (score, qname)
+
+    replaced = set()
+    with open(out_ids, "w") as ids:
+        for tname, (_, qname) in sorted(best.items()):
+            replaced.add(tname)
+            ids.write(f"{tname}\t{qname}\n")
+
+    used_single = set(qname for _, qname in best.values())
+    recs = []
+    for qname in sorted(used_single):
+        if qname in single:
+            recs.append((qname, single[qname]))
+    for tname in backbone:
+        if tname not in replaced:
+            recs.append((tname, backbone[tname]))
+
+    _write_fasta(recs, out_fa)
+    return len(replaced)
+
+
+def step_12_refine(runner):
+    """Step 12 - Final assembly refinement with optimized telomere-end replacement."""
+    runner.log("Step 12 - Final assembly refinement with optimized telomere-end replacement")
+    os.makedirs("merqury", exist_ok=True)
+    os.makedirs("assemblies", exist_ok=True)
+
+    # ---- 12A. Optional Merqury pre-selection ----
+    if runner.merqury_enable:
+        _run_merqury_preselection(runner)
+    else:
+        runner.log_info("Merqury disabled for this run")
+
+    # Always write Merqury summary CSV
+    _write_merqury_csv()
+
+    # Build assembly info (combines BUSCO + QUAST + telomere + Merqury)
     _build_assembly_info(runner)
 
-    # Get selected backbone
+    # ---- 12B. Auto-select backbone assembler ----
     assembler = runner.assembler
     if not assembler:
-        runner.log_warn("Using first available assembler as backbone")
+        runner.log_info(f"Selection criteria: BUSCO + telomere + Merqury + contiguity + N50")
+        assembler = _auto_select_backbone(runner)
+        if assembler:
+            runner.log_info(f"Auto-selected assembler: {assembler}")
+        else:
+            runner.log_warn("Auto-selection failed; using first available assembler as fallback")
+
+    # Fallback: pick first available assembler
+    if not assembler:
         for asm in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm", "external"]:
             if os.path.isfile(f"assemblies/{asm}.result.fasta") and \
                os.path.getsize(f"assemblies/{asm}.result.fasta") > 0:
@@ -1024,6 +1344,7 @@ def step_12_refine(runner):
         runner.log_error(f"Selected assembler '{assembler}' does not have valid FASTA at {asm_fa}")
         raise RuntimeError("Invalid assembler selection")
 
+    # Read protected telomere pool from Step 10
     protected_fasta = ""
     protected_mode = "none"
     if os.path.isfile("protected_telomere_contigs.fasta") and \
@@ -1036,19 +1357,125 @@ def step_12_refine(runner):
     runner.log_info(f"Protected mode for final refinement: {protected_mode}")
     runner.log_info(f"Selected backbone assembly: {asm_fa}")
 
-    # For now, simple final merge
-    if os.path.isfile("protected_telomere_contigs.fasta") and os.path.getsize("protected_telomere_contigs.fasta") > 0:
-        with open("assemblies/final_merge.raw.fasta", "w") as out:
-            with open("protected_telomere_contigs.fasta") as f:
-                out.write(f.read())
-            with open(asm_fa) as f:
-                out.write(f.read())
+    # ---- 12C. Prepare cleaned backbone ----
+    backbone_fa = "assemblies/backbone.clean.fa"
+    _clean_backbone_headers(asm_fa, backbone_fa)
+
+    # ---- 12D. Remove backbone contigs redundant to protected telomere pool ----
+    if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
+        runner.log_info(f"Using protected telomere contigs from {protected_fasta}")
+        shutil.copy(protected_fasta, "assemblies/protected.telomere.fa")
+
+        if shutil.which("minimap2"):
+            runner.log_version("minimap2", "minimap2")
+            paf = "assemblies/backbone_vs_protected.paf"
+            cmd = f"minimap2 -x asm20 -t {runner.threads} assemblies/protected.telomere.fa {backbone_fa}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            with open(paf, "w") as f:
+                f.write(result.stdout)
+
+            n_dropped = _filter_redundant_to_protected(
+                paf, backbone_fa, "assemblies/backbone.filtered.fa",
+                cov_thr=float(os.environ.get("PROTECT_COV", "0.95")),
+                id_thr=float(os.environ.get("PROTECT_ID", "0.95")),
+            )
+            runner.log(f"Removed {n_dropped} backbone contigs redundant to protected pool")
+        else:
+            runner.log_warn("minimap2 not found; cannot filter redundant backbone contigs.")
+            shutil.copy(backbone_fa, "assemblies/backbone.filtered.fa")
+
+        # Name-based dedup: remove backbone contigs whose names match protected IDs
+        _name_dedup_fasta("assemblies/protected.telomere.fa",
+                          "assemblies/backbone.filtered.fa",
+                          "assemblies/backbone.filtered.nodup.fa")
     else:
-        shutil.copy(asm_fa, "assemblies/final_merge.raw.fasta")
+        runner.log_warn("No protected telomere contigs found; keeping backbone for telomere rescue only")
+        with open("assemblies/protected.telomere.fa", "w") as f:
+            pass
+        shutil.copy(backbone_fa, "assemblies/backbone.filtered.nodup.fa")
+
+    # ---- 12E. Telomere rescue using optimized best single-end pool ----
+    single_tel_src = ""
+    for candidate in ["single_tel_best_clean.fasta", "single_tel_clean.fasta", "single_tel.fasta"]:
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            single_tel_src = candidate
+            break
+
+    if single_tel_src:
+        runner.log_info(f"Running telomere rescue using {single_tel_src}")
+        shutil.copy("assemblies/backbone.filtered.nodup.fa", "assemblies/backbone.telomere_rescued.fa")
+
+        if shutil.which("minimap2"):
+            rescue_paf = "assemblies/single_tel_vs_backbone.paf"
+            cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                   f"assemblies/backbone.telomere_rescued.fa {single_tel_src}")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            with open(rescue_paf, "w") as f:
+                f.write(result.stdout)
+
+            n_rescued = _telomere_rescue(
+                single_tel_src,
+                "assemblies/backbone.telomere_rescued.fa",
+                rescue_paf,
+                "assemblies/single_tel.replaced.ids",
+                "assemblies/backbone.telomere_rescued.next.fa",
+            )
+            runner.log(f"Telomere rescue: {n_rescued} backbone contigs replaced with telomeric versions")
+
+            if os.path.isfile("assemblies/backbone.telomere_rescued.next.fa") and \
+               os.path.getsize("assemblies/backbone.telomere_rescued.next.fa") > 0:
+                shutil.move("assemblies/backbone.telomere_rescued.next.fa",
+                            "assemblies/backbone.telomere_rescued.fa")
+        else:
+            runner.log_warn("minimap2 not found; skipping telomere rescue.")
+    else:
+        runner.log_info("No single-end telomeric contigs available for telomere rescue")
+        shutil.copy("assemblies/backbone.filtered.nodup.fa", "assemblies/backbone.telomere_rescued.fa")
+
+    # ---- 12F. Remove rescued contigs redundant to protected set ----
+    if os.path.isfile("assemblies/protected.telomere.fa") and \
+       os.path.getsize("assemblies/protected.telomere.fa") > 0 and \
+       os.path.isfile("assemblies/backbone.telomere_rescued.fa") and \
+       shutil.which("minimap2"):
+        dedup_paf = "assemblies/rescued_vs_protected.paf"
+        cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+               f"assemblies/protected.telomere.fa assemblies/backbone.telomere_rescued.fa")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        with open(dedup_paf, "w") as f:
+            f.write(result.stdout)
+
+        _filter_redundant_to_protected(
+            dedup_paf,
+            "assemblies/backbone.telomere_rescued.fa",
+            "assemblies/backbone.telomere_rescued.dedup.fa",
+            cov_thr=0.95, id_thr=0.95,
+        )
+    else:
+        shutil.copy("assemblies/backbone.telomere_rescued.fa",
+                     "assemblies/backbone.telomere_rescued.dedup.fa")
+
+    # ---- 12G. Final combine ----
+    prot = "assemblies/protected.telomere.fa"
+    rescued = "assemblies/backbone.telomere_rescued.dedup.fa"
+    raw_out = "assemblies/final_merge.raw.fasta"
+
+    if os.path.isfile(prot) and os.path.getsize(prot) > 0 and \
+       os.path.isfile(rescued) and os.path.getsize(rescued) > 0:
+        with open(raw_out, "w") as out:
+            with open(prot) as f:
+                out.write(f.read())
+            with open(rescued) as f:
+                out.write(f.read())
+    elif os.path.isfile(prot) and os.path.getsize(prot) > 0:
+        shutil.copy(prot, raw_out)
+    elif os.path.isfile(rescued) and os.path.getsize(rescued) > 0:
+        shutil.copy(rescued, raw_out)
+    else:
+        shutil.copy(asm_fa, raw_out)
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
-    n_sorted = _fasta_sort_minlen("assemblies/final_merge.raw.fasta",
+    n_sorted = _fasta_sort_minlen(raw_out,
                                    f"merged_{assembler}_sort.fa",
                                    prefix="contig", minlen=500)
     runner.log(f"Sorted final merged assembly: {n_sorted} contigs >= 500 bp")
@@ -1099,20 +1526,102 @@ def step_13_busco_final(runner):
         finally:
             os.chdir(cwd)
 
-    # Create dummy merged.busco.csv
-    with open("assemblies/merged.busco.csv", "w") as f:
-        f.write("Metric,merged\n")
-        f.write("BUSCO C (%),\n")
-        f.write("BUSCO S (%),\n")
-        f.write("BUSCO D (%),\n")
-        f.write("BUSCO F (%),\n")
-        f.write("BUSCO M (%),\n")
+    # Parse BUSCO results from busco/final or busco/run_final
+    def _parse_busco_final():
+        """Parse BUSCO metrics from final run outputs."""
+        roots = []
+        for d in ("busco/final", "busco/run_final"):
+            if os.path.isdir(d):
+                roots.append(d)
+        if not roots:
+            return None
+
+        for root in sorted(roots, key=os.path.getmtime, reverse=True):
+            # Try JSON first
+            js_files = sorted(glob.glob(os.path.join(root, "**", "short_summary*.json"), recursive=True),
+                              key=os.path.getmtime, reverse=True)
+            for jf in js_files:
+                try:
+                    with open(jf) as f:
+                        data = json.load(f)
+                    n = data.get("n") or (data.get("lineage_dataset") or {}).get("n")
+                    per = data.get("percentages") or {}
+                    if n and per:
+                        return {k: float(per.get(k, 0)) for k in "CSDFM"} | {"n": int(n)}
+                except Exception:
+                    continue
+
+            # Try TXT
+            txt_files = sorted(glob.glob(os.path.join(root, "**", "short_summary*.txt"), recursive=True),
+                               key=os.path.getmtime, reverse=True)
+            for tf in txt_files:
+                try:
+                    txt = open(tf, errors="ignore").read()
+                    m = re.search(r"C:(\d+(?:\.\d+)?)%.*?S:(\d+(?:\.\d+)?)%.*?D:(\d+(?:\.\d+)?)%.*?F:(\d+(?:\.\d+)?)%.*?M:(\d+(?:\.\d+)?)%.*?n:(\d+)", txt, re.S)
+                    if m:
+                        return {"C": float(m.group(1)), "S": float(m.group(2)),
+                                "D": float(m.group(3)), "F": float(m.group(4)),
+                                "M": float(m.group(5)), "n": int(m.group(6))}
+                except Exception:
+                    continue
+
+            # Try full_table TSV
+            ft_files = sorted(glob.glob(os.path.join(root, "**", "full_table*.tsv"), recursive=True),
+                              key=os.path.getmtime, reverse=True)
+            for ft in ft_files:
+                try:
+                    S = D = F = M = n = 0
+                    for ln in open(ft):
+                        if not ln or ln.startswith("#"):
+                            continue
+                        parts = ln.split("\t")
+                        st = parts[1].strip() if len(parts) > 1 else ""
+                        n += 1
+                        if st == "Complete": S += 1
+                        elif st == "Duplicated": D += 1
+                        elif st == "Fragmented": F += 1
+                        elif st == "Missing": M += 1
+                    if n > 0:
+                        pct = lambda x: 100.0 * float(x) / float(n) if n else 0.0
+                        return {"C": pct(S + D), "S": pct(S), "D": pct(D),
+                                "F": pct(F), "M": pct(M), "n": n}
+                except Exception:
+                    continue
+        return None
+
+    metrics = _parse_busco_final()
+    def fmt_pct(x):
+        s = f"{float(x):.1f}"
+        return s.rstrip('0').rstrip('.') if '.' in s else s
+
+    if metrics:
+        rows = [
+            ["Metric", "merged"],
+            ["BUSCO C (%)", fmt_pct(metrics["C"])],
+            ["BUSCO S (%)", fmt_pct(metrics["S"])],
+            ["BUSCO D (%)", fmt_pct(metrics["D"])],
+            ["BUSCO F (%)", fmt_pct(metrics["F"])],
+            ["BUSCO M (%)", fmt_pct(metrics["M"])],
+        ]
+    else:
+        runner.log_warn("Could not parse BUSCO outputs for final assembly")
+        rows = [
+            ["Metric", "merged"],
+            ["BUSCO C (%)", ""],
+            ["BUSCO S (%)", ""],
+            ["BUSCO D (%)", ""],
+            ["BUSCO F (%)", ""],
+            ["BUSCO M (%)", ""],
+        ]
+
+    with open("assemblies/merged.busco.csv", "w", newline="") as f:
+        csv.writer(f).writerows(rows)
     runner.log("Wrote assemblies/merged.busco.csv")
 
 
 def step_14_telomere_final(runner):
-    """Step 14 - Telomere analysis on final assembly."""
-    runner.log("Step 14 - Telomere analysis (final assembly)")
+    """Step 14 - Telomere analysis on final assembly (hybrid detection)."""
+    runner.log("Step 14 - Telomere analysis (final assembly, hybrid detection)")
     os.makedirs("assemblies", exist_ok=True)
 
     final_fa = "assemblies/final.merged.fasta"
@@ -1120,15 +1629,44 @@ def step_14_telomere_final(runner):
         runner.log_error(f"Final merged FASTA '{final_fa}' not found.")
         raise RuntimeError("No final assembly")
 
-    if not shutil.which("seqtk"):
-        runner.log_error("seqtk not found")
-        raise RuntimeError("seqtk not available")
+    # Run hybrid telomere detection on final assembly
+    runner.log(f"Running hybrid telomere detection on final assembly (mode: {runner.telomere_mode})")
+    try:
+        results = detect_telomeres(
+            final_fa,
+            mode=runner.telomere_mode,
+            user_motif=runner.motif,
+            end_window=runner.telo_end_window,
+            score_window=runner.telo_score_window,
+            kmer_min=runner.telo_kmer_min,
+            kmer_max=runner.telo_kmer_max,
+            threads=runner.threads,
+        )
+        write_detection_outputs(results, final_fa, "assemblies/final")
+    except Exception as e:
+        runner.log_warn(f"Hybrid detection on final assembly failed: {e}")
+        results = []
 
-    # Create dummy telomere CSV
-    with open("assemblies/merged.telo.csv", "w") as f:
-        f.write("Metric,merged\n")
-        f.write("Telomere double-end contigs,0\n")
-        f.write("Telomere single-end contigs,0\n")
+    # Count tiers
+    counts = defaultdict(int)
+    for r in results:
+        counts[r["classification"]] += 1
+    t2t = counts.get("strict_t2t", 0)
+    single = counts.get("single_tel_strong", 0)
+    supported = counts.get("telomere_supported", 0)
+
+    runner.log(f"Final assembly telomeres: {t2t} strict_t2t, {single} single_tel_strong, "
+               f"{supported} telomere_supported")
+
+    # Write merged.telo.csv with tier-based counts
+    rows = [
+        ["Metric", "merged"],
+        ["Telomere strict T2T contigs", str(t2t)],
+        ["Telomere single-end strong contigs", str(single)],
+        ["Telomere-supported contigs", str(t2t + single + supported)],
+    ]
+    with open("assemblies/merged.telo.csv", "w", newline="") as f:
+        csv.writer(f).writerows(rows)
     runner.log("Wrote assemblies/merged.telo.csv")
 
 
@@ -1148,40 +1686,321 @@ def step_15_quast_final(runner):
         cmd = f"{quast_bin} {final_fa} --labels final --threads {runner.threads} -o quast_final"
         runner.run_cmd(cmd, desc="Running QUAST on final assembly", check=False)
 
-    # Create dummy merged.quast.csv
-    with open("assemblies/merged.quast.csv", "w") as f:
-        f.write("Metric,merged\n")
+    # Parse QUAST output into merged.quast.csv
+    quast_report = os.path.join("quast_final", "report.tsv")
+    quast_treport = os.path.join("quast_final", "transposed_report.tsv")
+    rows = [["Metric", "merged"]]
+
+    if os.path.exists(quast_report):
+        with open(quast_report) as f:
+            for line in f:
+                parts = line.rstrip('\r\n').split('\t')
+                if len(parts) >= 2:
+                    rows.append([parts[0], parts[1]])
+    elif os.path.exists(quast_treport):
+        with open(quast_treport) as f:
+            treport_rows = list(csv.reader(f, delimiter='\t'))
+        if len(treport_rows) >= 2:
+            metrics = treport_rows[0][1:]
+            vals = treport_rows[1][1:] if len(treport_rows) > 1 else []
+            for i, m in enumerate(metrics):
+                v = vals[i] if i < len(vals) else ""
+                rows.append([m, v])
+
+    with open("assemblies/merged.quast.csv", "w", newline="") as f:
+        csv.writer(f).writerows(rows)
     runner.log("Wrote assemblies/merged.quast.csv")
 
 
 def step_16_final_report(runner):
-    """Step 16 - Generate final comparison report."""
+    """Step 16 - Generate final comparison report.
+
+    Runs Merqury on final assembly (if enabled), then combines per-assembler
+    metrics (assembly_info.csv) with final-merged metrics into
+    final_results/final_result.csv.
+    """
     runner.log("Step 16 - Final assembly comparison")
     os.makedirs("final_results", exist_ok=True)
+    os.makedirs("merqury", exist_ok=True)
 
-    # Create dummy final result CSV
-    with open("final_results/final_result.csv", "w") as f:
-        f.write("Metric,merged\n")
+    # ---- Run Merqury on final assembly ----
+    if runner.merqury_enable:
+        db = runner.merqury_db
+        if not db:
+            for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
+                if os.path.isdir(cand):
+                    db = cand
+                    break
+        if db and os.path.isdir(db) and shutil.which("merqury.sh"):
+            runner.log_info("Running Merqury on final assembly")
+            runner.log_version("merqury.sh", "merqury.sh")
+            cmd = f"merqury.sh {db} assemblies/final.merged.fasta merqury/final"
+            runner.run_cmd(cmd, desc="Merqury on final assembly", check=False)
+        else:
+            runner.log_warn("Merqury requested for final assembly but merqury.sh or .meryl database was not found; skipping.")
+    else:
+        runner.log_info("Merqury disabled for final assembly comparison")
+
+    # Write merged Merqury CSV
+    def _parse_first_float(path):
+        if not os.path.exists(path):
+            return ""
+        txt = open(path, "r", errors="ignore").read()
+        for pat in [r'(?i)qv[^0-9]*([0-9]+(?:\.[0-9]+)?)',
+                    r'(?i)completeness[^0-9]*([0-9]+(?:\.[0-9]+)?)',
+                    r'([0-9]+(?:\.[0-9]+)?)']:
+            m = re.search(pat, txt)
+            if m:
+                return m.group(1)
+        return ""
+
+    qv = _parse_first_float("merqury/final.qv")
+    comp = _parse_first_float("merqury/final.completeness.stats")
+    with open("assemblies/merged.merqury.csv", "w", newline="") as f:
+        csv.writer(f).writerows([
+            ["Metric", "merged"],
+            ["Merqury QV", qv],
+            ["Merqury completeness (%)", comp],
+        ])
+
+    # ---- Build comprehensive final report ----
+    # Load all merged metric files
+    from collections import OrderedDict
+    final_map = OrderedDict()
+
+    for _, path in [("telo", "assemblies/merged.telo.csv"),
+                    ("busco", "assemblies/merged.busco.csv"),
+                    ("quast", "assemblies/merged.quast.csv"),
+                    ("merqury", "assemblies/merged.merqury.csv")]:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            continue
+        with open(path, newline="") as f:
+            r = csv.reader(f)
+            hdr = next(r, None)
+            if not hdr or len(hdr) < 2:
+                continue
+            idx_metric, idx_merged = 0, 1
+            for i, h in enumerate(hdr):
+                name = (h or "").strip().lower()
+                if name == "metric":
+                    idx_metric = i
+                if name == "merged":
+                    idx_merged = i
+            for row in r:
+                if not row:
+                    continue
+                m_name = (row[idx_metric] if idx_metric < len(row) else "").strip()
+                v = (row[idx_merged] if idx_merged < len(row) else "").strip()
+                if m_name:
+                    final_map[m_name] = v
+
+    # Add telomere tier counts from score TSV if available
+    _telo_scores = "assemblies/final.telomere_end_scores.tsv"
+    if os.path.isfile(_telo_scores):
+        _t2t = _single = _supported = 0
+        with open(_telo_scores) as tf:
+            for tr in csv.DictReader(tf, delimiter="\t"):
+                _tier = tr.get("tier", "none")
+                if _tier == "strict_t2t":
+                    _t2t += 1
+                elif _tier == "single_tel_strong":
+                    _single += 1
+                elif _tier == "telomere_supported":
+                    _supported += 1
+        final_map["Telomere strict T2T contigs"] = str(_t2t)
+        final_map["Telomere single-end strong contigs"] = str(_single)
+        final_map["Telomere-supported contigs"] = str(_t2t + _single + _supported)
+
+    # Add selection metadata
+    decision_file = "assemblies/selection_decision.txt"
+    if os.path.isfile(decision_file):
+        with open(decision_file) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                k, *rest = line.split("\t", 1)
+                v = rest[0] if rest else ""
+                if k == "selected_score":
+                    final_map["Selection score"] = v
+                elif k == "selected_assembler":
+                    final_map["Selected assembler"] = v
+                elif k == "auto_mode":
+                    final_map["Auto-selection mode"] = v
+                elif k == "score_formula":
+                    final_map["Score formula"] = v
+
+    # Protected mode
+    if os.path.isfile("protected_telomere_mode.txt"):
+        with open("protected_telomere_mode.txt") as f:
+            final_map["Protected telomere mode"] = f.read().strip()
+
+    # Pool stats
+    def _count_fasta(path):
+        try:
+            with open(path) as f:
+                return str(sum(1 for ln in f if ln.startswith(">")))
+        except Exception:
+            return ""
+
+    final_map["Step10 strict T2T pool contigs"] = _count_fasta("t2t_clean.fasta")
+    final_map["Step10 best single-end telomere pool contigs"] = _count_fasta("single_tel_best_clean.fasta")
+    final_map["Step10 optimized telomere-supported pool contigs"] = _count_fasta("telomere_supported_best_clean.fasta")
+
+    # Rescue counts
+    try:
+        with open("assemblies/single_tel.replaced.ids") as f:
+            final_map["Step12 rescued telomere replacements"] = str(sum(1 for _ in f))
+    except Exception:
+        final_map["Step12 rescued telomere replacements"] = ""
+
+    # ---- Combine assembly_info.csv with merged metrics ----
+    info_csv = "assemblies/assembly_info.csv"
+    if os.path.isfile(info_csv) and os.path.getsize(info_csv) > 0:
+        with open(info_csv, newline="") as f:
+            r = csv.reader(f)
+            hdr = next(r, None)
+            body = [row for row in r if row]
+
+        if hdr:
+            hdr_out = list(hdr)
+            if "merged" not in [h.lower() for h in hdr]:
+                hdr_out.append("merged")
+
+            out_rows = []
+            for row in body:
+                base_row = row[:]
+                while len(base_row) < len(hdr_out) - 1:
+                    base_row.append("")
+                metric = (base_row[0] if base_row else "").strip()
+                out_rows.append(base_row + [final_map.get(metric, "")])
+
+            present_metrics = set(r[0].strip() for r in body if r and r[0].strip())
+            for m, v in final_map.items():
+                if m not in present_metrics:
+                    r = [""] * len(hdr_out)
+                    r[0] = m
+                    r[-1] = v
+                    out_rows.append(r)
+
+            with open("final_results/final_result.csv", "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(hdr_out)
+                w.writerows(out_rows)
+        else:
+            with open("final_results/final_result.csv", "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Metric", "merged"])
+                for m, v in final_map.items():
+                    w.writerow([m, v])
+    else:
+        with open("final_results/final_result.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Metric", "merged"])
+            for m, v in final_map.items():
+                w.writerow([m, v])
+
     runner.log("Wrote final_results/final_result.csv")
+
+    # Also copy assembly_info for easy access
+    if os.path.isfile("assemblies/assembly_info.csv"):
+        shutil.copy("assemblies/assembly_info.csv", "final_results/assembly_info.csv")
 
 
 def step_17_cleanup(runner):
-    """Step 17 - Cleanup temporary files."""
+    """Step 17 - Cleanup temporary files into structured output folders."""
     runner.log("Step 17 - Cleanup temporary files")
     os.makedirs("temp/merge/fasta", exist_ok=True)
+    os.makedirs("temp/merge/param", exist_ok=True)
     os.makedirs("temp/busco", exist_ok=True)
     os.makedirs("temp/log", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
+
+    # Move merge intermediates
+    for pattern in ["aln_summary_merged*.tsv", "anchor_summary_merged_*.txt"]:
+        for f in glob.glob(pattern):
+            shutil.move(f, "temp/merge/")
+    for pattern in [".merged_*", "merged_*.delta", "merged_*.coords", "merged_*.snps",
+                    "merged_*.delta.*", "merged_*.crunch", "merged_*.filter",
+                    "merged_*.qdiff", "merged_*.rdiff", "merged_*.mcoords"]:
+        for f in glob.glob(pattern):
+            shutil.move(f, "temp/merge/")
+
+    # Move BUSCO logs
+    if os.path.isdir("busco"):
+        for f in glob.glob("busco/**/*.log", recursive=True):
+            try:
+                shutil.move(f, "temp/busco/")
+            except Exception:
+                pass
+    for f in glob.glob("busco_*.log") + glob.glob("*busco*.log"):
+        try:
+            shutil.move(f, "temp/busco/")
+        except Exception:
+            pass
+
+    # Move merged FASTA intermediates
+    for f in glob.glob("merged_*.fasta") + glob.glob("merged_*.fa"):
+        try:
+            shutil.move(f, "temp/merge/fasta/")
+        except Exception:
+            pass
+
+    # Move param files
+    for f in glob.glob("param_summary_merged_*.txt"):
+        try:
+            shutil.move(f, "temp/merge/param/")
+        except Exception:
+            pass
+
+    # Move misc logs
+    for f in glob.glob("*.log"):
+        if "busco" in f.lower():
+            continue
+        try:
+            shutil.move(f, "temp/log/")
+        except Exception:
+            pass
+
+    # Move key results to final_results/
+    for src in [
+        "assemblies/final.merged.fasta",
+        "assemblies/selection_debug.tsv",
+        "assemblies/selection_decision.txt",
+        "assemblies/merged.merqury.csv",
+        "assemblies/merged.busco.csv",
+        "assemblies/merged.quast.csv",
+        "assemblies/merged.telo.csv",
+        "telomere_cluster_summary.tsv",
+        "telomere_support_summary.csv",
+        "protected_telomere_mode.txt",
+    ]:
+        if os.path.isfile(src):
+            try:
+                shutil.move(src, "final_results/")
+            except Exception:
+                pass
+
     runner.log("Cleanup complete.")
 
 
 def step_18_assembly_only(runner):
-    """Step 18 - Assembly-only comparison summary."""
+    """Step 18 - Assembly-only comparison summary (with optional Merqury)."""
     runner.log("Step 18 - Assembly-only comparison summary")
     os.makedirs("assemblies", exist_ok=True)
+    os.makedirs("merqury", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
 
-    # Create assembly info
+    # Run Merqury on all assemblies if enabled
+    if runner.merqury_enable:
+        _run_merqury_preselection(runner)
+    else:
+        runner.log_info("Merqury disabled for assembly-only comparison")
+
+    # Write Merqury CSV
+    _write_merqury_csv()
+
+    # Create assembly info (combines BUSCO + QUAST + telomere + Merqury)
     _build_assembly_info(runner)
 
     if os.path.isfile("assemblies/assembly_info.csv"):
