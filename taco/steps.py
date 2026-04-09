@@ -683,7 +683,7 @@ def step_08_busco(runner):
         runner.log_error("No assemblies in ./assemblies for BUSCO.")
         raise RuntimeError("No assemblies found")
 
-    lineage = runner.busco or "ascomycota_odb10"
+    lineage = runner.busco_lineage or "ascomycota_odb10"
 
     def has_busco_metrics(base):
         for d in [f"busco/{base}", f"busco/run_{base}"]:
@@ -967,7 +967,7 @@ def step_12_refine(runner):
     os.makedirs("assemblies", exist_ok=True)
 
     # Merqury support
-    if runner.merqury:
+    if runner.merqury_enable:
         db = runner.merqury_db
         if not db:
             for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
@@ -1006,7 +1006,7 @@ def step_12_refine(runner):
     _build_assembly_info(runner)
 
     # Get selected backbone
-    assembler = runner.choose
+    assembler = runner.assembler
     if not assembler:
         runner.log_warn("Using first available assembler as backbone")
         for asm in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm", "external"]:
@@ -1068,7 +1068,7 @@ def step_13_busco_final(runner):
         runner.log_error(f"Final merged FASTA '{final_fa}' not found.")
         raise RuntimeError("No final assembly")
 
-    lineage = runner.busco or "ascomycota_odb10"
+    lineage = runner.busco_lineage or "ascomycota_odb10"
 
     def has_final_metrics():
         for d in ["busco/final", "busco/run_final"]:
