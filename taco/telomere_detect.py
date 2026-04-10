@@ -1,41 +1,40 @@
-"""Hybrid telomere detection engine for TACO."""
+"""Hybrid telomere detection engine for TACO.
+
+Faithfully implements the same scoring algorithm as TACO.sh:
+  - De novo k-mer discovery with enrichment scoring and canonical rotation
+  - MOTIF_FAMILIES (canonical TTAGGG, budding yeast TG1-3, Candida 23-bp)
+  - Per-end composite scoring: density*0.40 + longest_run*0.30 +
+    distance_to_end*0.20 + covered_bp*0.10
+  - Three-tier classification: strict_t2t, single_tel_strong, telomere_supported
+"""
 import os
 import sys
 import re
 import csv
 import argparse
 import subprocess
-from collections import defaultdict
-import math
-
-try:
-    from taco.utils import read_fasta, write_fasta, revcomp
-except ImportError:
-    try:
-        from utils import read_fasta, write_fasta, revcomp
-    except ImportError:
-        pass
+import shutil
+import tempfile
+from collections import Counter, defaultdict
+from pathlib import Path
 
 
+# ── Motif family definitions (matches TACO.sh exactly) ──────────────────────
 MOTIF_FAMILIES = {
     "canonical": {
-        "motif": "TTAGGG",
-        "revcomp": "CCCTAA",
-        "description": "Vertebrate/filamentous fungal canonical repeat",
+        "forward": ["TTAGGG"],
         "regex_fwd": r"(TTAGGG){2,}",
         "regex_rev": r"(CCCTAA){2,}",
     },
     "budding_yeast": {
-        "motif": "TG1-3",
-        "description": "Budding yeast degenerate TG(1-3)/C(1-3)A",
+        "forward": [],
         "regex_fwd": r"(TG{1,3}){3,}",
         "regex_rev": r"(C{1,3}A){3,}",
     },
     "candida": {
-        "motif": "ACGGATGTCTAACTTCTTGGTGT",
-        "description": "Candida 23-bp telomere repeat",
+        "forward": ["ACGGATGTCTAACTTCTTGGTGT"],
         "regex_fwd": r"(ACGGATGTCTAACTTCTTGGTGT){2,}",
-        "regex_rev": r"(ACACCAAGAAGTTTAGACATCCGT){2,}",
+        "regex_rev": r"(ACACCAAGAAGTTAGACATCCGT){2,}",
     },
 }
 
@@ -53,334 +52,472 @@ THRESHOLDS = {
 }
 
 
-def extract_ends(seq, window=5000):
-    """Extract terminal sequences from contig.
+# ── Core utility functions ───────────────────────────────────────────────────
+
+def revcomp(seq):
+    """Return reverse complement of a DNA sequence."""
+    table = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    return seq.translate(table)[::-1]
+
+
+def read_fasta(path):
+    """Parse FASTA and return dict {name: uppercase_sequence}."""
+    seqs = {}
+    name = None
+    buf = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith(">"):
+                if name is not None:
+                    seqs[name] = "".join(buf)
+                name = line[1:].strip().split()[0]
+                buf = []
+            else:
+                buf.append(line.strip().upper())
+    if name is not None:
+        seqs[name] = "".join(buf)
+    return seqs
+
+
+def write_fasta(seqs_dict, path, wrap=60):
+    """Write dict {name: seq} to FASTA file."""
+    with open(path, "w") as f:
+        for name, seq in seqs_dict.items():
+            f.write(f">{name}\n")
+            for i in range(0, len(seq), wrap):
+                f.write(seq[i:i + wrap] + "\n")
+
+
+def extract_ends(seq, window):
+    """Extract terminal sequences from a contig.
+
+    Uses min(window, len//2) to avoid overlap of left and right ends.
+    Returns ("", "") if the usable window is < 10 bp.
+    """
+    w = min(window, len(seq) // 2)
+    if w < 10:
+        return ("", "")
+    return (seq[:w], seq[-w:])
+
+
+# ── K-mer discovery (enrichment-based, matching TACO.sh) ────────────────────
+
+def kmer_frequencies(seq, k):
+    """Count k-mer occurrences in a sequence."""
+    counts = Counter()
+    for i in range(len(seq) - k + 1):
+        counts[seq[i:i + k]] += 1
+    return counts
+
+
+def canonicalize_kmer(kmer):
+    """Return the canonical form of a k-mer (min of all rotations of fwd+rev)."""
+    rc = revcomp(kmer)
+    candidates = []
+    for x in (kmer, rc):
+        doubled = x + x
+        for i in range(len(x)):
+            candidates.append(doubled[i:i + len(x)])
+    return min(candidates)
+
+
+def discover_motifs_python(end_seqs, kmin=4, kmax=30, top_n=5):
+    """Discover enriched telomeric motifs from contig-end sequences.
+
+    Uses enrichment scoring (observed / expected) with canonical k-mer rotation.
+    Matches TACO.sh discover_motifs_python logic exactly.
 
     Args:
-        seq: DNA sequence string
-        window: Length of terminal window to extract (default 5000)
+        end_seqs: List of end-region sequence strings
+        kmin: Minimum k-mer size
+        kmax: Maximum k-mer size (capped at 30)
+        top_n: Number of top motifs to return
 
     Returns:
-        tuple: (left_end, right_end)
+        list of (motif_string, count, frequency) tuples
     """
-    left_end = seq[:window] if len(seq) >= window else seq
-    right_end = seq[-window:] if len(seq) >= window else seq
-    return left_end, right_end
+    total_bases = sum(len(s) for s in end_seqs)
+    if not total_bases:
+        return []
+
+    best = []
+    for k in range(kmin, min(kmax + 1, 31)):
+        # Count all k-mers across all end sequences
+        pool = Counter()
+        for s in end_seqs:
+            pool.update(kmer_frequencies(s, k))
+
+        # Canonicalize k-mers
+        canonical_counts = Counter()
+        for km, c in pool.items():
+            canonical_counts[canonicalize_kmer(km)] += c
+
+        # Expected count under uniform distribution
+        expected = total_bases / (4 ** k) if 4 ** k > 0 else 1
+
+        # Score by enrichment
+        for ck, c in canonical_counts.most_common(20):
+            if c < 5:
+                continue
+            enrichment = c / max(expected, 0.01)
+            if enrichment > 5:
+                freq = c / max(total_bases - k + 1, 1)
+                best.append((ck, c, freq, enrichment, k))
+
+    # Sort by enrichment descending, deduplicate
+    best.sort(key=lambda x: x[3], reverse=True)
+    seen = set()
+    result = []
+    for ck, c, freq, enrichment, k in best:
+        if ck in seen:
+            continue
+        seen.add(ck)
+        result.append((ck, c, freq))
+        if len(result) >= top_n:
+            break
+    return result
 
 
 def build_regex_for_motif(motif):
-    """Build compiled regex for forward and reverse complement.
+    """Build forward and reverse complement regex requiring >= 2 tandem repeats.
 
     Args:
-        motif: Motif string (can be degenerate like TG{1,3})
+        motif: DNA motif string (literal, not a regex pattern)
 
     Returns:
-        tuple: (compiled_fwd_regex, compiled_rev_regex)
+        tuple: (fwd_regex_string, rev_regex_string)
     """
-    try:
-        fwd_regex = re.compile(motif, re.IGNORECASE)
-    except:
-        fwd_regex = None
-
-    try:
-        rev_seq = revcomp(motif)
-        rev_regex = re.compile(rev_seq, re.IGNORECASE)
-    except:
-        rev_regex = None
-
-    return fwd_regex, rev_regex
+    rc = revcomp(motif)
+    fwd = "(" + re.escape(motif) + "){2,}"
+    rev = "(" + re.escape(rc) + "){2,}"
+    return fwd, rev
 
 
-def discover_motifs_python(seqs_dict, end_window=5000, kmer_min=4, kmer_max=30, top_n=10):
-    """Discover telomeric motifs by k-mer frequency analysis of contig ends.
+# ── End-region scoring ───────────────────────────────────────────────────────
+
+def score_end(end_seq, score_window, user_motif_patterns, family_patterns):
+    """Score a terminal sequence for telomeric content.
+
+    Matches TACO.sh score_end() exactly:
+      - Tests all user motif patterns and all MOTIF_FAMILIES patterns
+      - Selects the pattern with highest covered_bp
+      - Computes composite score with proper normalization
 
     Args:
-        seqs_dict: dict of {name: sequence}
-        end_window: Length of contig ends to analyze (default 5000)
-        kmer_min: Minimum k-mer size (default 4)
-        kmer_max: Maximum k-mer size (default 30)
-        top_n: Number of top motifs to return (default 10)
+        end_seq: Terminal sequence to score (should be score_window-sized)
+        score_window: Window size for scoring
+        user_motif_patterns: list of (label, (fwd_regex_str, rev_regex_str)) tuples
+        family_patterns: dict matching MOTIF_FAMILIES structure
 
     Returns:
-        list: Discovered motif strings
+        dict with keys: covered_bp, longest_run, density, best_family,
+                        distance_to_end, raw_score
     """
-    kmer_counts = defaultdict(int)
-
-    for name, seq in seqs_dict.items():
-        # Extract ends
-        left_end = seq[:end_window]
-        right_end = seq[-end_window:] if len(seq) > end_window else seq
-
-        # Count k-mers
-        for kmer_size in range(kmer_min, kmer_max + 1):
-            for end in [left_end, right_end]:
-                for i in range(len(end) - kmer_size + 1):
-                    kmer = end[i:i+kmer_size].upper()
-                    kmer_counts[kmer] += 1
-
-    # Sort by frequency and return top n
-    sorted_kmers = sorted(kmer_counts.items(), key=lambda x: x[1], reverse=True)
-    return [kmer for kmer, count in sorted_kmers[:top_n]]
-
-
-def discover_motifs_tidk(fasta_path, threads=1):
-    """Discover motifs using tidk if available.
-
-    Args:
-        fasta_path: Path to FASTA file
-        threads: Number of threads (default 1)
-
-    Returns:
-        list: Motif strings discovered by tidk, or empty list if tidk unavailable
-    """
-    try:
-        result = subprocess.run(
-            ["tidk", "search", "--fasta", fasta_path, "--threads", str(threads)],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        motifs = []
-        for line in result.stdout.split('\n'):
-            if line.strip() and not line.startswith('#'):
-                parts = line.split()
-                if parts:
-                    motifs.append(parts[0])
-        return motifs
-    except:
-        return []
-
-
-def score_end(end_seq, motifs_regexes, score_window=500):
-    """Score a sequence end for telomeric content.
-
-    Args:
-        end_seq: Terminal sequence to score
-        motifs_regexes: List of (fwd_regex, rev_regex) tuples
-        score_window: Window size for scoring (default 500)
-
-    Returns:
-        dict: Keys are density, longest_run, distance_to_end, covered_bp, raw_score
-    """
-    window = end_seq[:score_window] if len(end_seq) >= score_window else end_seq
-
-    best_matches = []
-    total_bp_covered = 0
-    longest_run = 0
-
-    for fwd_regex, rev_regex in motifs_regexes:
-        if fwd_regex is None:
-            continue
-
-        for match in fwd_regex.finditer(window):
-            best_matches.append((match.start(), match.end()))
-            total_bp_covered += match.end() - match.start()
-            run_length = match.end() - match.start()
-            if run_length > longest_run:
-                longest_run = run_length
-
-        if rev_regex is not None:
-            for match in rev_regex.finditer(window):
-                best_matches.append((match.start(), match.end()))
-                total_bp_covered += match.end() - match.start()
-                run_length = match.end() - match.start()
-                if run_length > longest_run:
-                    longest_run = run_length
-
-    # Merge overlapping matches
-    if best_matches:
-        best_matches.sort()
-        merged = [best_matches[0]]
-        for start, end in best_matches[1:]:
-            if start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-        total_bp_covered = sum(e - s for s, e in merged)
-
-    window_len = len(window)
-    if window_len == 0:
+    if not end_seq:
         return {
-            "density": 0.0,
-            "longest_run": 0.0,
-            "distance_to_end": 0.0,
-            "covered_bp": 0.0,
-            "raw_score": 0.0,
+            "covered_bp": 0, "longest_run": 0, "density": 0.0,
+            "best_family": "none", "distance_to_end": -1, "raw_score": 0.0,
         }
 
-    density = total_bp_covered / window_len
-    longest_run_norm = longest_run / window_len
-    distance_to_end = 1.0 - (0 if not best_matches else best_matches[-1][1]) / window_len
-    distance_to_end = max(0, min(1.0, distance_to_end))
-    covered_bp_norm = total_bp_covered / window_len
+    w = min(score_window, len(end_seq))
+    ws = end_seq[:w]
 
-    raw_score = (
-        SCORING_WEIGHTS["density"] * density +
-        SCORING_WEIGHTS["longest_run"] * longest_run_norm +
-        SCORING_WEIGHTS["distance_to_end"] * distance_to_end +
-        SCORING_WEIGHTS["covered_bp"] * covered_bp_norm
-    )
-
-    return {
-        "density": density,
-        "longest_run": longest_run_norm,
-        "distance_to_end": distance_to_end,
-        "covered_bp": covered_bp_norm,
-        "raw_score": raw_score,
+    best = {
+        "covered_bp": 0, "longest_run": 0, "density": 0.0,
+        "best_family": "none", "distance_to_end": w, "raw_score": 0.0,
     }
 
+    # Collect all patterns to test
+    all_patterns = []
+    for label, (fwd, rev) in user_motif_patterns:
+        all_patterns.append((label, fwd))
+        all_patterns.append((label, rev))
+    for fam_name, fam_data in family_patterns.items():
+        all_patterns.append((fam_name, fam_data["regex_fwd"]))
+        all_patterns.append((fam_name, fam_data["regex_rev"]))
 
-def classify_contig(left_score, right_score):
+    for label, pattern in all_patterns:
+        try:
+            covered = 0
+            longest = 0
+            min_start = w
+            for m in re.finditer(pattern, ws, re.IGNORECASE):
+                span = m.end() - m.start()
+                covered += span
+                longest = max(longest, span)
+                min_start = min(min_start, m.start())
+            density = covered / max(w, 1)
+            if covered > best["covered_bp"]:
+                best.update(
+                    covered_bp=covered,
+                    longest_run=longest,
+                    density=density,
+                    best_family=label,
+                    distance_to_end=min_start,
+                )
+        except re.error:
+            continue
+
+    # Composite score with TACO.sh normalizations
+    nl = min(best["longest_run"] / max(w * 0.3, 1), 1.0)
+    nd = max(1.0 - best["distance_to_end"] / max(w, 1), 0.0)
+    nc = min(best["covered_bp"] / max(w * 0.5, 1), 1.0)
+
+    best["raw_score"] = (
+        0.40 * best["density"] +
+        0.30 * nl +
+        0.20 * nd +
+        0.10 * nc
+    )
+    return best
+
+
+def classify_contig(left_score, right_score, strong_thr=0.25, weak_thr=0.08):
     """Classify contig based on telomere scores.
 
     Args:
-        left_score: Score of left telomere (0-1)
-        right_score: Score of right telomere (0-1)
+        left_score: Raw score dict from score_end (left terminus)
+        right_score: Raw score dict from score_end (right terminus)
+        strong_thr: Threshold for strict_t2t / single_tel_strong
+        weak_thr: Threshold for telomere_supported
 
     Returns:
-        str: Classification category
+        str: Classification tier
     """
-    if left_score >= THRESHOLDS["strict_t2t"] and right_score >= THRESHOLDS["strict_t2t"]:
+    ls = left_score["raw_score"]
+    rs = right_score["raw_score"]
+    if ls >= strong_thr and rs >= strong_thr:
         return "strict_t2t"
-    elif max(left_score, right_score) >= THRESHOLDS["single_tel_strong"]:
+    elif ls >= strong_thr or rs >= strong_thr:
         return "single_tel_strong"
-    elif max(left_score, right_score) >= THRESHOLDS["telomere_supported"]:
+    elif ls >= weak_thr or rs >= weak_thr:
         return "telomere_supported"
-    else:
-        return "none"
+    return "none"
 
+
+# ── Main detection function ──────────────────────────────────────────────────
 
 def detect_telomeres(fasta_path, mode="hybrid", user_motif=None, end_window=5000,
                      score_window=500, kmer_min=4, kmer_max=30, threads=1):
-    """Main telomere detection function.
+    """Main hybrid telomere detection matching TACO.sh logic.
+
+    Steps:
+      1. Read FASTA, uppercase all sequences
+      2. Extract contig ends at end_window size for k-mer discovery
+      3. Extract contig ends at score_window size for scoring
+      4. Discover motifs via tidk (if available) or enrichment-based python discovery
+      5. Score each contig's left and right terminus independently
+      6. Classify into strict_t2t / single_tel_strong / telomere_supported / none
 
     Args:
-        fasta_path: Path to FASTA file
-        mode: Detection mode - 'known', 'auto', 'hybrid'
-        user_motif: User-provided motif string (optional)
-        end_window: Length of terminal windows to analyze
-        score_window: Window size for scoring
+        fasta_path: Path to input FASTA
+        mode: "known", "auto", or "hybrid"
+        user_motif: Optional user-provided motif string
+        end_window: Terminal window for k-mer discovery (default 5000)
+        score_window: Scoring window size (default 500)
         kmer_min: Minimum k-mer size for discovery
         kmer_max: Maximum k-mer size for discovery
         threads: Number of threads for tidk
 
     Returns:
-        list: Dicts with contig, left_score, right_score, classification
+        list of dicts: {contig, length, left_score, right_score, classification}
     """
-    seqs = read_fasta(fasta_path)
+    if not os.path.isfile(fasta_path) or os.path.getsize(fasta_path) == 0:
+        return []
 
-    # Gather motifs based on mode
-    motifs = []
-    if mode == "known" and user_motif:
-        motifs = [user_motif]
-    elif mode == "auto":
-        motifs = discover_motifs_python(seqs, end_window, kmer_min, kmer_max)
-    elif mode == "hybrid":
-        if user_motif:
-            motifs = [user_motif]
-        discovered = discover_motifs_python(seqs, end_window, kmer_min, kmer_max, top_n=3)
-        motifs.extend(discovered)
-        for fam_name, fam_data in MOTIF_FAMILIES.items():
-            motifs.append(fam_data["regex_fwd"])
+    contigs = read_fasta(fasta_path)
+    if not contigs:
+        return []
 
-    # Build regexes
-    motifs_regexes = []
-    for motif in motifs:
-        if isinstance(motif, str):
-            fwd_regex, rev_regex = build_regex_for_motif(motif)
-            if fwd_regex:
-                motifs_regexes.append((fwd_regex, rev_regex))
+    # Extract ends for discovery (end_window) and scoring (score_window)
+    end_left_disc = []
+    end_right_disc = []
+    contig_score_ends = {}  # name -> (left_score_end, right_score_end)
+    contig_lengths = {}
 
-    # Score each contig
+    for name, seq in contigs.items():
+        contig_lengths[name] = len(seq)
+        ld, rd = extract_ends(seq, end_window)
+        end_left_disc.append(ld)
+        end_right_disc.append(rd)
+        ls, rs = extract_ends(seq, score_window)
+        contig_score_ends[name] = (ls, rs)
+
+    all_ends = end_left_disc + end_right_disc
+
+    # ── Build motif pattern list ──
+    user_motif_patterns = []  # list of (label, (fwd_regex, rev_regex))
+    discovered_motifs = []
+
+    if user_motif and mode in ("known", "hybrid"):
+        fwd, rev = build_regex_for_motif(user_motif)
+        user_motif_patterns.append(("user:" + user_motif, (fwd, rev)))
+
+    if mode in ("auto", "hybrid"):
+        # Try tidk first
+        tidk_path = shutil.which("tidk")
+        if tidk_path:
+            tf = tempfile.NamedTemporaryFile(mode="w", suffix=".fa", delete=False)
+            try:
+                for i, s in enumerate(all_ends):
+                    if s:
+                        tf.write(f">end_{i}\n{s}\n")
+                tf.close()
+                try:
+                    proc = subprocess.run(
+                        [tidk_path, "explore",
+                         "--minimum", str(kmer_min),
+                         "--maximum", str(min(kmer_max, 15)),
+                         "--fasta", tf.name],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        for line in proc.stdout.strip().split("\n"):
+                            parts = line.strip().split("\t")
+                            if len(parts) >= 2 and not parts[0].startswith("#"):
+                                try:
+                                    discovered_motifs.append(
+                                        (parts[0].strip(), int(parts[1]), 0.0))
+                                except (ValueError, IndexError):
+                                    continue
+                except Exception:
+                    pass
+            finally:
+                os.unlink(tf.name)
+
+        # Fallback to Python enrichment-based discovery
+        if not discovered_motifs:
+            discovered_motifs = discover_motifs_python(
+                all_ends, kmin=kmer_min, kmax=kmer_max, top_n=5)
+
+        # Build regex patterns for discovered motifs
+        for motif_str, cnt, freq in discovered_motifs:
+            fwd, rev = build_regex_for_motif(motif_str)
+            user_motif_patterns.append(("auto:" + motif_str, (fwd, rev)))
+
+    # Use MOTIF_FAMILIES as family_patterns dict
+    family_patterns = dict(MOTIF_FAMILIES)
+
+    # ── Score and classify each contig ──
     results = []
-    for contig_name, seq in seqs.items():
-        left_end, right_end = extract_ends(seq, end_window)
-
-        left_result = score_end(left_end, motifs_regexes, score_window)
-        right_result = score_end(right_end, motifs_regexes, score_window)
-
-        left_score = left_result["raw_score"]
-        right_score = right_result["raw_score"]
-        classification = classify_contig(left_score, right_score)
-
+    for name, seq in contigs.items():
+        left_end, right_end = contig_score_ends[name]
+        left_result = score_end(left_end, score_window,
+                                user_motif_patterns, family_patterns)
+        right_result = score_end(right_end, score_window,
+                                 user_motif_patterns, family_patterns)
+        tier = classify_contig(left_result, right_result)
         results.append({
-            "contig": contig_name,
-            "left_score": left_score,
-            "right_score": right_score,
-            "classification": classification,
+            "contig": name,
+            "length": contig_lengths[name],
+            "left_score": round(left_result["raw_score"], 4),
+            "right_score": round(right_result["raw_score"], 4),
+            "classification": tier,
         })
 
     return results
 
 
+# ── Output writers ───────────────────────────────────────────────────────────
+
 def write_detection_outputs(results, fasta_path, out_prefix):
-    """Write telomere detection outputs.
+    """Write telomere detection output files.
+
+    Writes:
+      - {out_prefix}.telomere_end_scores.tsv — per-contig scores and tier
+      - {out_prefix}.telo_metrics.tsv — tier count summary
+      - {out_prefix}.telo.fasta — contigs with any telomeric signal
+      - {out_prefix}.telo.list — backward-compatible telo list
 
     Args:
-        results: List of detection result dicts
-        fasta_path: Path to input FASTA
-        out_prefix: Prefix for output files
+        results: List of detection result dicts from detect_telomeres()
+        fasta_path: Path to input FASTA (for extracting sequences)
+        out_prefix: Output file prefix
     """
     seqs = read_fasta(fasta_path)
 
-    # Write .telomere_end_scores.tsv
+    # Write .telomere_end_scores.tsv (column name "tier" for compatibility)
     scores_path = f"{out_prefix}.telomere_end_scores.tsv"
-    with open(scores_path, 'w') as f:
-        f.write("contig\tleft_score\tright_score\tclassification\n")
-        for result in results:
-            f.write(f"{result['contig']}\t{result['left_score']:.4f}\t{result['right_score']:.4f}\t{result['classification']}\n")
+    with open(scores_path, "w", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["contig", "length", "left_score", "right_score", "tier"],
+            delimiter="\t",
+        )
+        w.writeheader()
+        for r in results:
+            w.writerow({
+                "contig": r["contig"],
+                "length": r.get("length", len(seqs.get(r["contig"], ""))),
+                "left_score": r["left_score"],
+                "right_score": r["right_score"],
+                "tier": r["classification"],
+            })
 
     # Write .telo_metrics.tsv
+    counts = Counter(r["classification"] for r in results)
     metrics_path = f"{out_prefix}.telo_metrics.tsv"
-    counts = defaultdict(int)
-    for result in results:
-        counts[result["classification"]] += 1
-
-    with open(metrics_path, 'w') as f:
-        f.write("metric\tvalue\n")
+    with open(metrics_path, "w") as f:
         f.write(f"strict_t2t\t{counts['strict_t2t']}\n")
         f.write(f"single_tel_strong\t{counts['single_tel_strong']}\n")
         f.write(f"telomere_supported\t{counts['telomere_supported']}\n")
-        f.write(f"total_contigs\t{len(results)}\n")
+        f.write(f"total_telomeric\t{sum(1 for r in results if r['classification'] != 'none')}\n")
 
-    # Write .telo.fasta and .telo.list
-    telo_seqs = {}
-    telo_list = []
-    for result in results:
-        if result["classification"] != "none":
-            contig_name = result["contig"]
-            telo_seqs[contig_name] = seqs[contig_name]
-            telo_list.append(contig_name)
-
+    # Write .telo.fasta (contigs with any telomeric signal)
+    telo_names = set(r["contig"] for r in results if r["classification"] != "none")
     telo_fasta_path = f"{out_prefix}.telo.fasta"
-    write_fasta(telo_seqs, telo_fasta_path)
+    with open(telo_fasta_path, "w") as f:
+        for name, seq_str in seqs.items():
+            if name in telo_names:
+                f.write(f">{name}\n")
+                for i in range(0, len(seq_str), 60):
+                    f.write(seq_str[i:i + 60] + "\n")
 
+    # Write backward-compatible .telo.list
+    weak_thr = THRESHOLDS["telomere_supported"]
     telo_list_path = f"{out_prefix}.telo.list"
-    with open(telo_list_path, 'w') as f:
-        for name in telo_list:
-            f.write(f"{name}\n")
+    with open(telo_list_path, "w") as f:
+        for r in results:
+            if r["classification"] != "none":
+                length = r.get("length", len(seqs.get(r["contig"], "")))
+                lp = 0 if r["left_score"] >= weak_thr else length
+                rp = length if r["right_score"] >= weak_thr else 0
+                f.write(f"{r['contig']}\t{lp}\t{rp}\t{length}\n")
 
+    print(f"[INFO] Classification: strict_t2t={counts['strict_t2t']} "
+          f"single_tel_strong={counts['single_tel_strong']} "
+          f"telomere_supported={counts['telomere_supported']}")
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
 
 def main():
     """Command-line interface for telomere detection."""
     parser = argparse.ArgumentParser(description="Hybrid telomere detection")
     parser.add_argument("--fasta", required=True, help="Input FASTA file")
-    parser.add_argument("--mode", default="hybrid", choices=["known", "auto", "hybrid"],
-                        help="Detection mode")
+    parser.add_argument("--mode", default="hybrid", choices=["known", "auto", "hybrid"])
     parser.add_argument("--out-prefix", required=True, help="Output file prefix")
-    parser.add_argument("--motif", help="User-provided motif")
-    parser.add_argument("--end-window", type=int, default=5000, help="Terminal window size")
-    parser.add_argument("--score-window", type=int, default=500, help="Scoring window size")
-    parser.add_argument("--kmer-min", type=int, default=4, help="Minimum k-mer size")
-    parser.add_argument("--kmer-max", type=int, default=30, help="Maximum k-mer size")
-    parser.add_argument("--threads", type=int, default=1, help="Number of threads")
+    parser.add_argument("--motif", default="", help="User-provided motif")
+    parser.add_argument("--end-window", type=int, default=5000)
+    parser.add_argument("--score-window", type=int, default=500)
+    parser.add_argument("--kmer-min", type=int, default=4)
+    parser.add_argument("--kmer-max", type=int, default=30)
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--strong-threshold", type=float, default=0.25)
+    parser.add_argument("--weak-threshold", type=float, default=0.08)
 
     args = parser.parse_args()
+
+    if not os.path.isfile(args.fasta) or os.path.getsize(args.fasta) == 0:
+        for suffix in [".telomere_end_scores.tsv", ".telo.list",
+                       ".telo.fasta", ".telo_metrics.tsv"]:
+            Path(args.out_prefix + suffix).touch()
+        sys.exit(0)
 
     results = detect_telomeres(
         args.fasta,
         mode=args.mode,
-        user_motif=args.motif,
+        user_motif=args.motif if args.motif else None,
         end_window=args.end_window,
         score_window=args.score_window,
         kmer_min=args.kmer_min,
@@ -388,9 +525,13 @@ def main():
         threads=args.threads,
     )
 
-    write_detection_outputs(results, args.fasta, args.out_prefix)
+    if not results:
+        for suffix in [".telomere_end_scores.tsv", ".telo.list",
+                       ".telo.fasta", ".telo_metrics.tsv"]:
+            Path(args.out_prefix + suffix).touch()
+        sys.exit(0)
 
-    print(f"Telomere detection complete. Output prefix: {args.out_prefix}")
+    write_detection_outputs(results, args.fasta, args.out_prefix)
 
 
 if __name__ == "__main__":

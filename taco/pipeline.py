@@ -11,6 +11,28 @@ from datetime import datetime
 from taco.cli import STEP_NAMES
 
 
+class TeeWriter:
+    """Write to both a file and the original stream (tee-like behaviour)."""
+
+    def __init__(self, log_fh, original_stream):
+        self.log_fh = log_fh
+        self.original = original_stream
+
+    def write(self, data):
+        if data:
+            self.original.write(data)
+            self.log_fh.write(data)
+
+    def flush(self):
+        self.original.flush()
+        self.log_fh.flush()
+
+    # Forward any attribute lookups to the original stream so that
+    # code that checks e.g. sys.stdout.isatty() still works.
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
@@ -378,12 +400,21 @@ nextgraph_options = -a 1
 
             self.log(f"===== STEP {step_num} START: {sname} =====")
             start = datetime.now()
+
+            # Tee stdout/stderr into the per-step log file
+            log_fh = open(log_file, "w")
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            sys.stdout = TeeWriter(log_fh, old_stdout)
+            sys.stderr = TeeWriter(log_fh, old_stderr)
+
             try:
                 func(self)
                 status = "0"
             except SystemExit as e:
                 status = str(e.code) if e.code else "1"
                 end = datetime.now()
+                sys.stdout, sys.stderr = old_stdout, old_stderr
+                log_fh.close()
                 self.append_step_benchmark(step_num, start, end, status, log_file)
                 self.log_error(f"Step {step_num} failed. See {log_file}")
                 self.write_benchmark_summary()
@@ -391,10 +422,20 @@ nextgraph_options = -a 1
             except Exception as e:
                 status = "1"
                 end = datetime.now()
+                sys.stdout, sys.stderr = old_stdout, old_stderr
+                log_fh.close()
                 self.append_step_benchmark(step_num, start, end, status, log_file)
                 self.log_error(f"Step {step_num} failed with exception: {e}")
                 self.write_benchmark_summary()
                 raise
+            finally:
+                # Restore streams in the normal (non-exception) path too
+                if sys.stdout is not old_stdout:
+                    sys.stdout = old_stdout
+                if sys.stderr is not old_stderr:
+                    sys.stderr = old_stderr
+                if not log_fh.closed:
+                    log_fh.close()
 
             end = datetime.now()
             self.append_step_benchmark(step_num, start, end, status, log_file)

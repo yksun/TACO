@@ -760,6 +760,7 @@ def step_09_telomere(runner):
     cols = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
     tdouble = {}
     tsingle = {}
+    tsupported = {}
 
     for fasta_path in sorted(existing_assemblies):
         asm = os.path.basename(fasta_path).replace(".result.fasta", "").replace(".fasta", "")
@@ -789,25 +790,27 @@ def step_09_telomere(runner):
 
         tdouble[asm] = counts.get("strict_t2t", 0)
         tsingle[asm] = counts.get("single_tel_strong", 0)
+        tsupported[asm] = counts.get("telomere_supported", 0)
         runner.log(f"  {asm}: {tdouble[asm]} strict_t2t, {tsingle[asm]} single_tel_strong, "
-                   f"{counts.get('telomere_supported', 0)} telomere_supported")
+                   f"{tsupported[asm]} telomere_supported")
 
-    # Build CSV matrices
+    # Build CSV matrices — metric names must match Step 14/16 for final_result.csv merge
     matrix_csv = "assemblies/assembly.telo.csv"
     with open(matrix_csv, "w", newline="") as f:
         writer = csv.writer(f)
         header = ["Metric"] + cols
         writer.writerow(header)
-        writer.writerow(["Telomere double-end contigs"] + [tdouble.get(c, 0) for c in cols])
-        writer.writerow(["Telomere single-end contigs"] + [tsingle.get(c, 0) for c in cols])
+        writer.writerow(["Telomere strict T2T contigs"] + [tdouble.get(c, 0) for c in cols])
+        writer.writerow(["Telomere single-end strong contigs"] + [tsingle.get(c, 0) for c in cols])
+        writer.writerow(["Telomere-supported contigs"] + [tdouble.get(c, 0) + tsingle.get(c, 0) + tsupported.get(c, 0) for c in cols])
     runner.log(f"Wrote {os.path.basename(matrix_csv)}")
 
     total_csv = "assemblies/total_telo.csv"
     with open(total_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Assembler", "Telomere double-end contigs", "Telomere single-end contigs"])
+        writer.writerow(["Assembler", "Telomere strict T2T contigs", "Telomere single-end strong contigs", "Telomere-supported contigs"])
         for c in cols:
-            writer.writerow([c, tdouble.get(c, 0), tsingle.get(c, 0)])
+            writer.writerow([c, tdouble.get(c, 0), tsingle.get(c, 0), tdouble.get(c, 0) + tsingle.get(c, 0) + tsupported.get(c, 0)])
     runner.log(f"Wrote {os.path.basename(total_csv)}")
 
 
