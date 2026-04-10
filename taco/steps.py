@@ -954,9 +954,19 @@ def step_10_telomere_pool(runner):
             with open("single_tel_best.fasta") as f:
                 out.write(f.read())
 
-    # Clean contained/duplicate contigs (replaces funannotate clean)
-    for src, dst in [("t2t.fasta", "t2t_clean.fasta"),
-                     ("single_tel_best.fasta", "single_tel_best_clean.fasta"),
+    # Clean contained/duplicate contigs (replaces funannotate clean).
+    # IMPORTANT: T2T contigs are NOT cleaned — the minimap2 clustering already
+    # produced one best representative per chromosome.  Running clean_contained
+    # on T2T can incorrectly remove T2T contigs that share repetitive elements
+    # with longer contigs on different chromosomes (16→15 loss observed).
+    if os.path.isfile("t2t.fasta") and os.path.getsize("t2t.fasta") > 0:
+        shutil.copy("t2t.fasta", "t2t_clean.fasta")
+        runner.log("T2T contigs preserved without clean_contained (clustering already deduplicated)")
+    else:
+        with open("t2t_clean.fasta", "w") as f:
+            pass
+
+    for src, dst in [("single_tel_best.fasta", "single_tel_best_clean.fasta"),
                      ("telomere_supported_best.fasta", "telomere_supported_best_clean.fasta")]:
         if os.path.isfile(src) and os.path.getsize(src) > 0:
             runner.log(f"Cleaning contained contigs from {src}")
@@ -1395,10 +1405,16 @@ def step_12_refine(runner):
             with open(paf, "w") as f:
                 f.write(result.stdout)
 
+            # Lower thresholds (60% coverage, 90% identity) vs TACO.sh default
+            # (95%/95%).  The original thresholds were too strict — backbone
+            # contigs representing the SAME chromosome as a T2T contig but at
+            # ~90-94% identity would slip through, causing BUSCO duplication.
+            # 60% query-coverage catches partial homologs (e.g. a backbone
+            # contig that is an incomplete version of a T2T chromosome).
             n_dropped = _filter_redundant_to_protected(
                 paf, backbone_fa, "assemblies/backbone.filtered.fa",
-                cov_thr=float(os.environ.get("PROTECT_COV", "0.95")),
-                id_thr=float(os.environ.get("PROTECT_ID", "0.95")),
+                cov_thr=float(os.environ.get("PROTECT_COV", "0.60")),
+                id_thr=float(os.environ.get("PROTECT_ID", "0.90")),
             )
             runner.log(f"Removed {n_dropped} backbone contigs redundant to protected pool")
         else:
@@ -1469,7 +1485,7 @@ def step_12_refine(runner):
             dedup_paf,
             "assemblies/backbone.telomere_rescued.fa",
             "assemblies/backbone.telomere_rescued.dedup.fa",
-            cov_thr=0.95, id_thr=0.95,
+            cov_thr=0.60, id_thr=0.90,
         )
     else:
         shutil.copy("assemblies/backbone.telomere_rescued.fa",
