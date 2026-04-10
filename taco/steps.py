@@ -845,18 +845,18 @@ def step_10_telomere_pool(runner):
                     cmd = f"merge_wrapper.py -l 1000000 {file1} {file2} --prefix merged_{base1}_{base2}"
                     runner.run_cmd(cmd, desc=f"Merging {base1} and {base2}", check=False)
 
+        # TACO.sh concatenates BOTH merged_*.fasta AND original *.telo.fasta
+        # so that contigs that did not merge are still in the pool
         merged_list = glob.glob("merged_*.fasta")
-        if merged_list:
-            with open("allmerged_telo.fasta", "w") as out:
-                for f in sorted(merged_list):
-                    with open(f) as inp:
-                        out.write(inp.read())
-        else:
-            runner.log_warn("No merged_* files produced; concatenating input telo FASTAs")
-            with open("allmerged_telo.fasta", "w") as out:
-                for f in fasta_files:
-                    with open(f) as inp:
-                        out.write(inp.read())
+        with open("allmerged_telo.fasta", "w") as out:
+            for f in sorted(merged_list):
+                with open(f) as inp:
+                    out.write(inp.read())
+            for f in sorted(fasta_files):
+                with open(f) as inp:
+                    out.write(inp.read())
+        if not merged_list:
+            runner.log_warn("No merged_* files produced; pool contains original telo FASTAs only")
 
     n_sorted = _fasta_sort_minlen("allmerged_telo.fasta", "allmerged_telo_sort.fasta",
                                    prefix="contig", minlen=500)
@@ -905,6 +905,14 @@ def step_10_telomere_pool(runner):
 
     runner.log(f"Pool classification: {len(t2t_ids)} t2t, {len(single_ids)} single, {len(supported_ids)} supported")
 
+    # Build per-contig telomere score map for clustering representative selection.
+    # Uses max(left_score, right_score) so the contig with the best telomere end wins.
+    telo_scores = {}
+    for r in pool_results:
+        ls = r.get("left_score", 0.0) or 0.0
+        rs = r.get("right_score", 0.0) or 0.0
+        telo_scores[r["contig"]] = max(ls, rs)
+
     # ===== Redundancy reduction for T2T contigs via minimap2 clustering =====
     if os.path.isfile("t2t.fasta") and os.path.getsize("t2t.fasta") > 0 and shutil.which("minimap2"):
         runner.log("Selecting best T2T representative per chromosome via minimap2 clustering")
@@ -914,7 +922,8 @@ def step_10_telomere_pool(runner):
             f.write(result.stdout)
         cluster_and_select("t2t.fasta", "t2t.self.paf", "t2t_best.fasta",
                            "t2t_cluster_summary.tsv", label="T2T",
-                           min_identity=0.95, min_coverage=0.85)
+                           min_identity=0.95, min_coverage=0.85,
+                           scores=telo_scores)
         shutil.copy("t2t_best.fasta", "t2t.fasta")
     else:
         runner.log_info("T2T clustering skipped (no T2T contigs or minimap2 not available)")
@@ -928,7 +937,8 @@ def step_10_telomere_pool(runner):
             f.write(result.stdout)
         cluster_and_select("single_tel.fasta", "single_tel.self.paf", "single_tel_best.fasta",
                            "telomere_cluster_summary.tsv", label="single-end",
-                           min_identity=0.95, min_coverage=0.85)
+                           min_identity=0.95, min_coverage=0.85,
+                           scores=telo_scores)
     elif os.path.isfile("single_tel.fasta") and os.path.getsize("single_tel.fasta") > 0:
         shutil.copy("single_tel.fasta", "single_tel_best.fasta")
     else:
@@ -1123,7 +1133,8 @@ def _auto_select_backbone(runner):
         if not os.path.isfile(fa) or os.path.getsize(fa) == 0:
             continue
 
-        busco = get_val("busco s (%)", idx)
+        busco_s = get_val("busco s (%)", idx)
+        busco_d = get_val("busco d (%)", idx)
         contigs = get_val("# contigs", idx)
         n50 = get_val("n50", idx)
         t2t = get_val("telomere strict t2t contigs", idx)
@@ -1138,24 +1149,31 @@ def _auto_select_backbone(runner):
         else:
             if contigs <= 0 or n50 <= 0:
                 continue
+            # Core formula matches TACO.sh:
+            #   BUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200
+            #   + MerquryQV*20 - contigs*30 + log10(N50)*150
+            # Enhancement: explicit BUSCO_D penalty (-500 per % duplication)
+            # prevents highly duplicated assemblies from being selected even
+            # when they have many telomeric contigs.
             score = (
-                busco * 1000
+                busco_s * 1000
                 + t2t * 300
                 + single * 150
                 + merqury_comp * 200
                 + merqury_qv * 20
                 - contigs * 30
                 + math.log10(n50) * 150
+                - busco_d * 500
             )
 
         records.append({
-            "assembler": asm, "busco_s": busco, "t2t": t2t,
-            "single_tel": single, "merqury_qv": merqury_qv,
+            "assembler": asm, "busco_s": busco_s, "busco_d": busco_d,
+            "t2t": t2t, "single_tel": single, "merqury_qv": merqury_qv,
             "merqury_comp": merqury_comp, "contigs": contigs,
             "n50": n50, "score": score,
         })
 
-        runner.log(f"  {asm}: BUSCO_S={busco} T2T={t2t} single={single} "
+        runner.log(f"  {asm}: BUSCO_S={busco_s} BUSCO_D={busco_d} T2T={t2t} single={single} "
                    f"MerquryQV={merqury_qv} MerquryComp={merqury_comp} "
                    f"contigs={contigs} N50={n50} score={score:.1f}")
 
@@ -1166,10 +1184,10 @@ def _auto_select_backbone(runner):
     # Write debug TSV
     with open(debug_tsv, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["assembler", "busco_s", "t2t", "single_tel",
+        w.writerow(["assembler", "busco_s", "busco_d", "t2t", "single_tel",
                      "merqury_qv", "merqury_comp", "contigs", "n50", "score"])
         for r in records:
-            w.writerow([r["assembler"], r["busco_s"], r["t2t"], r["single_tel"],
+            w.writerow([r["assembler"], r["busco_s"], r["busco_d"], r["t2t"], r["single_tel"],
                         r["merqury_qv"], r["merqury_comp"], r["contigs"], r["n50"], r["score"]])
 
     # Write decision file
@@ -1177,7 +1195,7 @@ def _auto_select_backbone(runner):
         f.write(f"auto_mode\t{mode}\n")
         f.write(f"selected_assembler\t{best_name or ''}\n")
         f.write(f"selected_score\t{best_score if best_score is not None else ''}\n")
-        f.write("score_formula\tBUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200 + MerquryQV*20 - contigs*30 + log10(N50)*150\n")
+        f.write("score_formula\tBUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200 + MerquryQV*20 - contigs*30 + log10(N50)*150 - BUSCO_D*500\n")
 
     return best_name
 
