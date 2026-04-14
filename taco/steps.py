@@ -814,8 +814,105 @@ def step_09_telomere(runner):
     runner.log(f"Wrote {os.path.basename(total_csv)}")
 
 
+def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
+                             max_length_ratio=1.3):
+    """Validate quickmerge output: only keep contigs that became strict_t2t
+    and pass a length sanity check.
+
+    Quickmerge can join two single-end telomere contigs from different assemblers
+    to create a complete T2T contig (left-tel from assembler A + right-tel from
+    assembler B).  However, it can also create chimeras (joining contigs from
+    different chromosomes).
+
+    Validation criteria:
+    1. Merged contig must classify as strict_t2t (telomere on BOTH ends) — this
+       proves the join actually recovered a missing telomere end.
+    2. Merged contig length must be ≤ max_length_ratio × max(input contig lengths).
+       A legitimate join overlaps substantially in the middle, so merged length
+       should be close to max(input_lengths).  A chimera concatenates two
+       chromosomes, so length ≈ sum(input_lengths), which is ~2× and fails.
+
+    Returns list of (name, sequence) tuples for validated T2T contigs.
+    """
+    if not os.path.isfile(merged_fasta) or os.path.getsize(merged_fasta) == 0:
+        return []
+
+    # Get max input contig length across all input FASTAs for this pair
+    max_input_len = 0
+    for fa in input_fastas:
+        if os.path.isfile(fa):
+            for _, seq in _read_fasta_records(fa):
+                max_input_len = max(max_input_len, len(seq))
+
+    if max_input_len == 0:
+        return []
+
+    length_threshold = int(max_input_len * max_length_ratio)
+
+    # Run telomere detection on merged output
+    try:
+        merged_results = detect_telomeres(
+            merged_fasta,
+            mode=runner.telomere_mode,
+            user_motif=runner.motif,
+            end_window=runner.telo_end_window,
+            score_window=runner.telo_score_window,
+            kmer_min=runner.telo_kmer_min,
+            kmer_max=runner.telo_kmer_max,
+            threads=runner.threads,
+        )
+    except Exception as e:
+        runner.log_warn(f"Telomere detection on merged output failed: {e}")
+        return []
+
+    # Find strict_t2t contigs that pass length filter
+    t2t_names = set()
+    for r in merged_results:
+        if r["classification"] == "strict_t2t":
+            if r["length"] <= length_threshold:
+                t2t_names.add(r["contig"])
+            else:
+                runner.log_warn(
+                    f"Rejected merged T2T '{r['contig']}' ({r['length']:,} bp) — "
+                    f"exceeds {length_threshold:,} bp ({max_length_ratio}× max input "
+                    f"{max_input_len:,} bp), likely chimera"
+                )
+
+    if not t2t_names:
+        return []
+
+    # Extract validated sequences
+    validated = []
+    for name, seq in _read_fasta_records(merged_fasta):
+        if name in t2t_names:
+            validated.append((name, seq))
+
+    return validated
+
+
 def step_10_telomere_pool(runner):
-    """Step 10 - Build optimized telomere contig pool."""
+    """Step 10 - Build optimized telomere contig pool.
+
+    TELOMERE-AWARE VALIDATED MERGE STRATEGY:
+
+    The pool is built from original assembler .telo.fasta files PLUS validated
+    quickmerge outputs.  Quickmerge can join two single-end telomere contigs
+    (left-tel from assembler A + right-tel from assembler B) to create a
+    complete T2T contig — this is valuable for recovering missing telomere ends.
+
+    However, quickmerge can also create chimeras (joining contigs from different
+    chromosomes).  To prevent chimeras from entering the pool, each quickmerge
+    output is validated:
+    1. Telomere detection must classify the merged contig as strict_t2t
+       (telomere on BOTH ends — proof the join recovered a missing end)
+    2. Merged length must be ≤ 1.3× max(input contig lengths) — a legitimate
+       join overlaps in the middle (match-mismatch-match pattern), so the
+       merged length ≈ max(inputs).  A chimera ≈ sum(inputs), which is ~2×.
+
+    Only validated T2T contigs from quickmerge enter the pool.  The existing
+    clustering then deduplicates, preferring the best representative per
+    chromosome group.
+    """
     runner.log("Step 10 - Build optimized telomere contig pool")
     os.makedirs("assemblies", exist_ok=True)
 
@@ -827,10 +924,11 @@ def step_10_telomere_pool(runner):
             runner.log_error("Still no FASTA files after generation.")
             raise RuntimeError("No FASTA files found")
 
-    if len(fasta_files) == 1:
-        runner.log_info(f"Only one telo FASTA found: {fasta_files[0]}")
-        shutil.copy(fasta_files[0], "allmerged_telo.fasta")
-    else:
+    # ===== Telomere-aware validated quickmerge =====
+    # Run quickmerge pairwise, then validate: only accept merged contigs that
+    # (a) classify as strict_t2t and (b) pass length sanity check.
+    validated_t2t_from_merge = []  # list of (name, seq) tuples
+    if len(fasta_files) > 1 and shutil.which("merge_wrapper.py"):
         for old_f in glob.glob("merged_*.fasta"):
             os.remove(old_f)
 
@@ -841,22 +939,58 @@ def step_10_telomere_pool(runner):
                 base1 = os.path.basename(file1).replace(".telo.fasta", "").replace(".fasta", "")
                 base2 = os.path.basename(file2).replace(".telo.fasta", "").replace(".fasta", "")
 
-                if shutil.which("merge_wrapper.py"):
-                    cmd = f"merge_wrapper.py -l 1000000 {file1} {file2} --prefix merged_{base1}_{base2}"
-                    runner.run_cmd(cmd, desc=f"Merging {base1} and {base2}", check=False)
+                prefix = f"merged_{base1}_{base2}"
+                cmd = f"merge_wrapper.py -l 1000000 {file1} {file2} --prefix {prefix}"
+                runner.run_cmd(cmd, desc=f"Merging {base1} and {base2}", check=False)
 
-        # TACO.sh concatenates BOTH merged_*.fasta AND original *.telo.fasta
-        # so that contigs that did not merge are still in the pool
-        merged_list = glob.glob("merged_*.fasta")
-        with open("allmerged_telo.fasta", "w") as out:
-            for f in sorted(merged_list):
-                with open(f) as inp:
-                    out.write(inp.read())
-            for f in sorted(fasta_files):
-                with open(f) as inp:
-                    out.write(inp.read())
-        if not merged_list:
-            runner.log_warn("No merged_* files produced; pool contains original telo FASTAs only")
+                # Validate: only keep merged contigs that are strict_t2t + sane length
+                merged_fa = f"{prefix}.fasta"
+                if not os.path.isfile(merged_fa):
+                    # quickmerge may output with different naming; check alternatives
+                    candidates = glob.glob(f"{prefix}*.fasta")
+                    if candidates:
+                        merged_fa = candidates[0]
+
+                if os.path.isfile(merged_fa) and os.path.getsize(merged_fa) > 0:
+                    new_t2t = _validate_quickmerge_t2t(
+                        merged_fa, [file1, file2], runner,
+                        max_length_ratio=1.3,
+                    )
+                    if new_t2t:
+                        runner.log(
+                            f"Validated {len(new_t2t)} T2T contigs from "
+                            f"quickmerge({base1} × {base2})"
+                        )
+                        validated_t2t_from_merge.extend(new_t2t)
+                    else:
+                        runner.log_info(
+                            f"No validated T2T from quickmerge({base1} × {base2}) — "
+                            f"merged contigs either not T2T or failed length check"
+                        )
+
+        if validated_t2t_from_merge:
+            runner.log(f"Total validated T2T contigs from quickmerge: {len(validated_t2t_from_merge)}")
+        else:
+            runner.log_info("No validated T2T contigs recovered from any quickmerge pair")
+    elif len(fasta_files) <= 1:
+        runner.log_info("Only one telo FASTA; skipping quickmerge")
+    else:
+        runner.log_info("merge_wrapper.py not found; skipping quickmerge")
+
+    # ===== Build pool: original .telo.fasta + validated quickmerge T2T =====
+    with open("allmerged_telo.fasta", "w") as out:
+        for f in sorted(fasta_files):
+            with open(f) as inp:
+                out.write(inp.read())
+        # Append validated T2T contigs from quickmerge (these are proven to have
+        # telomere on both ends and pass length sanity)
+        for name, seq in validated_t2t_from_merge:
+            out.write(f">{name}_qm_validated\n")
+            for k in range(0, len(seq), 60):
+                out.write(seq[k:k+60] + "\n")
+
+    n_qm = len(validated_t2t_from_merge)
+    runner.log(f"Pool: {len(fasta_files)} assembler .telo.fasta files + {n_qm} validated quickmerge T2T")
 
     n_sorted = _fasta_sort_minlen("allmerged_telo.fasta", "allmerged_telo_sort.fasta",
                                    prefix="contig", minlen=500)
@@ -905,13 +1039,126 @@ def step_10_telomere_pool(runner):
 
     runner.log(f"Pool classification: {len(t2t_ids)} t2t, {len(single_ids)} single, {len(supported_ids)} supported")
 
+    # ===== Build assembler BUSCO quality map =====
+    # Contigs from assemblers with lower BUSCO D (duplication) are preferred.
+    # This prevents contigs from high-duplication assemblers (e.g. canu D=74.9%)
+    # from winning the clustering representative selection over contigs from
+    # cleaner assemblers (e.g. peregrine D=10%).
+    asm_busco_d = {}  # assembler_name -> BUSCO D percentage
+    info_csv = os.path.join("assemblies", "assembly_info.csv")
+    if os.path.isfile(info_csv):
+        try:
+            with open(info_csv) as f:
+                reader = csv.reader(f)
+                header = next(reader, [])
+                asm_names = [h.strip() for h in header[1:]]
+                for row in reader:
+                    if not row:
+                        continue
+                    metric = row[0].strip().lower()
+                    if "busco d (%)" in metric:
+                        for i, asm in enumerate(asm_names):
+                            try:
+                                asm_busco_d[asm.lower()] = float(row[i + 1])
+                            except (IndexError, ValueError):
+                                pass
+                        break
+        except Exception as e:
+            runner.log_warn(f"Could not read BUSCO D from assembly_info.csv: {e}")
+
+    if asm_busco_d:
+        runner.log(f"Assembler BUSCO D quality map: {asm_busco_d}")
+
     # Build per-contig telomere score map for clustering representative selection.
-    # Uses max(left_score, right_score) so the contig with the best telomere end wins.
+    # Score = telomere_score * quality_weight, where quality_weight penalises
+    # contigs from high-duplication assemblers.
+    # Contigs are renamed to "contig_NNN" in the pool, but the original assembler
+    # .telo.fasta files have prefixes that indicate which assembler produced them.
+    # We track the source assembler for each contig by noting which input file
+    # contributed it.
+    contig_source_asm = {}  # contig_name -> assembler_name
+    for f_path in sorted(fasta_files):
+        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(".result.fasta", "").replace(".fasta", "")
+        asm_key = basename.lower()
+        if os.path.isfile(f_path):
+            for line in open(f_path):
+                if line.startswith(">"):
+                    # After sort/rename, contigs get sequential "contig_NNN" names.
+                    # We can't directly map those back.  Instead we'll count contigs
+                    # per assembler and assign quality based on position in the
+                    # concatenated pool.
+                    pass  # filled below via position tracking
+
+    # Track source assembler by position in concatenated pool
+    contig_order = []  # list of (assembler_key, original_name)
+    for f_path in sorted(fasta_files):
+        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(".result.fasta", "").replace(".fasta", "")
+        asm_key = basename.lower()
+        if os.path.isfile(f_path):
+            for line in open(f_path):
+                if line.startswith(">"):
+                    orig_name = line[1:].strip().split()[0]
+                    contig_order.append((asm_key, orig_name))
+
+    # After funannotate sort / _fasta_sort_minlen, contigs are renamed to
+    # "contig_001", "contig_002", etc. sorted by length descending.
+    # We need to map pool contig names back to their source assembler.
+    # Read the sorted pool and match by sequence identity to the originals.
+    # SIMPLER APPROACH: read pool_fasta, for each contig check which assembler
+    # .telo.fasta contains a sequence with the same length (approximate match).
+    # EVEN SIMPLER: read all original seqs with lengths, map pool contigs by length.
+    orig_seq_lengths = {}  # (asm_key, length) -> asm_key
+    for f_path in sorted(fasta_files):
+        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(".result.fasta", "").replace(".fasta", "")
+        asm_key = basename.lower()
+        if os.path.isfile(f_path):
+            name = None
+            seqlen = 0
+            for line in open(f_path):
+                if line.startswith(">"):
+                    if name is not None:
+                        orig_seq_lengths[(asm_key, seqlen)] = asm_key
+                    name = line[1:].strip().split()[0]
+                    seqlen = 0
+                else:
+                    seqlen += len(line.strip())
+            if name is not None:
+                orig_seq_lengths[(asm_key, seqlen)] = asm_key
+
+    # Map pool contigs to assembler by matching sequence length
+    pool_contig_asm = {}  # pool_contig_name -> asm_key
+    if os.path.isfile(pool_fasta):
+        pool_seqs_for_map = dict(_read_fasta_records(pool_fasta))
+        # Build length->asm lookup (group by length)
+        len_to_asm = {}
+        for (asm_key, slen), ak in orig_seq_lengths.items():
+            len_to_asm.setdefault(slen, []).append(ak)
+        for cname, cseq in pool_seqs_for_map.items():
+            clen = len(cseq)
+            candidates = len_to_asm.get(clen, [])
+            if candidates:
+                pool_contig_asm[cname] = candidates[0]  # first match
+
+    if pool_contig_asm:
+        # Count per assembler
+        asm_counts = {}
+        for cn, ak in pool_contig_asm.items():
+            asm_counts[ak] = asm_counts.get(ak, 0) + 1
+        runner.log(f"Pool contig source mapping: {asm_counts}")
+
     telo_scores = {}
     for r in pool_results:
         ls = r.get("left_score", 0.0) or 0.0
         rs = r.get("right_score", 0.0) or 0.0
-        telo_scores[r["contig"]] = max(ls, rs)
+        base_score = max(ls, rs)
+
+        # Apply quality weight: penalise contigs from high-D assemblers
+        cname = r["contig"]
+        asm_key = pool_contig_asm.get(cname, "")
+        busco_d = asm_busco_d.get(asm_key, 0.0)
+        # Quality weight: 1.0 for D=0%, 0.25 for D=100%
+        quality_weight = max(0.25, 1.0 - busco_d / 133.0)
+        telo_scores[cname] = base_score * quality_weight
 
     # ===== Redundancy reduction for T2T contigs via minimap2 clustering =====
     if os.path.isfile("t2t.fasta") and os.path.getsize("t2t.fasta") > 0 and shutil.which("minimap2"):
@@ -1392,6 +1639,43 @@ def step_12_refine(runner):
     backbone_fa = "assemblies/backbone.clean.fa"
     _clean_backbone_headers(asm_fa, backbone_fa)
 
+    # ---- 12C2. Chimera safety check on protected pool ----
+    # Even with Step 10's validated-merge approach, run a soft sanity check.
+    # Use the max individual contig length across ALL assembler .telo.fasta
+    # files as reference.  A legitimate T2T contig should be ≤ 1.5× this max
+    # (allowing for assembly variation and gap-resolution extensions).
+    # A chimera joining two chromosomes would be ~2× and gets caught.
+    if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
+        # Find max contig length across all original assembler outputs
+        max_individual_len = 0
+        for telo_fa in glob.glob("assemblies/*.telo.fasta"):
+            for _, seq in _read_fasta_records(telo_fa):
+                max_individual_len = max(max_individual_len, len(seq))
+
+        # Fallback to backbone if no telo files found
+        if max_individual_len == 0:
+            for _, seq in _read_fasta_records(backbone_fa):
+                max_individual_len = max(max_individual_len, len(seq))
+
+        if max_individual_len > 0:
+            chimera_threshold = int(max_individual_len * 1.5)
+
+            protected_recs = list(_read_fasta_records(protected_fasta))
+            n_before = len(protected_recs)
+            filtered_recs = [(n, s) for n, s in protected_recs if len(s) <= chimera_threshold]
+            n_removed = n_before - len(filtered_recs)
+
+            if n_removed > 0:
+                runner.log_warn(
+                    f"Chimera safety: removed {n_removed} protected contigs > "
+                    f"{chimera_threshold:,} bp (1.5× max individual contig "
+                    f"{max_individual_len:,} bp) — likely chimeras"
+                )
+                _write_fasta(filtered_recs, protected_fasta)
+            else:
+                runner.log(f"Chimera safety: all {n_before} protected contigs pass "
+                           f"(threshold {chimera_threshold:,} bp)")
+
     # ---- 12D. Remove backbone contigs redundant to protected telomere pool ----
     if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
         runner.log_info(f"Using protected telomere contigs from {protected_fasta}")
@@ -1405,16 +1689,15 @@ def step_12_refine(runner):
             with open(paf, "w") as f:
                 f.write(result.stdout)
 
-            # Lower thresholds (60% coverage, 90% identity) vs TACO.sh default
-            # (95%/95%).  The original thresholds were too strict — backbone
-            # contigs representing the SAME chromosome as a T2T contig but at
-            # ~90-94% identity would slip through, causing BUSCO duplication.
-            # 60% query-coverage catches partial homologs (e.g. a backbone
-            # contig that is an incomplete version of a T2T chromosome).
+            # Use TACO.sh default thresholds (95%/95%).  Only drop backbone
+            # contigs that are nearly identical to protected T2T contigs.
+            # Lower thresholds (60%/90%) were tried but WORSENED duplication
+            # by dropping clean backbone contigs and replacing them with dirty
+            # pool contigs from high-D assemblers.
             n_dropped = _filter_redundant_to_protected(
                 paf, backbone_fa, "assemblies/backbone.filtered.fa",
-                cov_thr=float(os.environ.get("PROTECT_COV", "0.60")),
-                id_thr=float(os.environ.get("PROTECT_ID", "0.90")),
+                cov_thr=float(os.environ.get("PROTECT_COV", "0.95")),
+                id_thr=float(os.environ.get("PROTECT_ID", "0.95")),
             )
             runner.log(f"Removed {n_dropped} backbone contigs redundant to protected pool")
         else:
@@ -1485,7 +1768,7 @@ def step_12_refine(runner):
             dedup_paf,
             "assemblies/backbone.telomere_rescued.fa",
             "assemblies/backbone.telomere_rescued.dedup.fa",
-            cov_thr=0.60, id_thr=0.90,
+            cov_thr=0.95, id_thr=0.95,
         )
     else:
         shutil.copy("assemblies/backbone.telomere_rescued.fa",
