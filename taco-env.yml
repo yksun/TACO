@@ -27,7 +27,11 @@ dependencies:
   - bwa>=0.7
   - samtools>=1.15
   # Contig merging (telomere-aware validated merge in Step 10)
+  # quickmerge provides merge_wrapper.py used by Step 10
   - quickmerge
+  # Download tools (used by pipeline.py for --external FASTA fetching)
+  - curl
+  - wget
   # Optional (Merqury k-mer QV scoring)
   - merqury
   - meryl
