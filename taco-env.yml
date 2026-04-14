@@ -26,6 +26,8 @@ dependencies:
   - seqtk>=1.3
   - bwa>=0.7
   - samtools>=1.15
+  # Contig merging (telomere-aware validated merge in Step 10)
+  - quickmerge
   # Optional (Merqury k-mer QV scoring)
   - merqury
   - meryl
