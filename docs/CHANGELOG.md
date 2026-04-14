@@ -5,6 +5,212 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.1.0] — 2026-04-14
+
+### Overview
+
+Version 1.1.0 addresses a systematic BUSCO duplication problem (D ≈ 57.5% in
+the final merged assembly) introduced by chimeric contigs from quickmerge
+entering the protected T2T pool.  The release introduces telomere-aware
+validated quickmerge in Step 10, assembler quality weighting in clustering,
+and corrects the redundancy-filter thresholds in Step 12 that had been
+inadvertently lowered.
+
+---
+
+### Step 10 — Telomere-aware validated quickmerge (`steps.py`)
+
+**Problem (root cause of high BUSCO D):** The original `allmerged_telo.fasta`
+pool was built by concatenating all pairwise quickmerge outputs together with
+the original assembler `.telo.fasta` files.  Quickmerge can join two contigs
+from different chromosomes into a single chimeric contig; if that chimera
+happens to acquire telomere signal on both ends (e.g. by being flanked by
+repeat-rich ends from either input), it classifies as `strict_t2t` and enters
+the protected pool.  When the chimera then displaces genuine backbone contigs,
+both chromosomes' gene sets appear duplicated — inflating BUSCO D.
+
+**Fix — telomere-aware validated merge:** A new `_validate_quickmerge_t2t()`
+function runs after each pairwise quickmerge call and accepts a merged contig
+into the pool only when both criteria are met:
+
+1. **Telomere proof.** The merged contig must score as `strict_t2t` (telomere
+   signal on both ends, both raw scores ≥ 0.25).  This is positive evidence
+   that the join actually rescued a missing telomere end rather than simply
+   concatenating two unrelated sequences.
+2. **Length sanity.** Merged contig length ≤ 1.3× max(input contig lengths).
+   A legitimate join of two overlapping single-end contigs that represent the
+   same chromosome (the match–mismatch–match gap-resolution pattern) produces
+   a contig close in length to the longer input.  A chimeric join of two
+   different chromosomes produces a contig ≈ sum(input lengths), i.e. roughly
+   2× — this is rejected.
+
+The pool is thus: original assembler `.telo.fasta` files + validated
+quickmerge T2T contigs (tagged `_qm_validated`).  Quickmerge's purpose of
+joining a left-telomere contig from one assembler with a right-telomere contig
+from another is fully preserved; only the chimeras are excluded.
+
+---
+
+### Step 10 — Assembler BUSCO D quality weighting for clustering (`steps.py`)
+
+**Problem:** Clustering representative selection used telomere score alone as
+the tiebreaker between contigs in the same chromosome group.  A contig from a
+high-duplication assembler (e.g. canu BUSCO D = 74.9%) could win over a contig
+from a clean assembler (e.g. peregrine BUSCO D = 10%) if it had marginally
+higher telomere scores, carrying duplicated gene content into the protected
+pool.
+
+**Fix:** Before calling `cluster_and_select`, the code now reads
+`assemblies/assembly_info.csv` to build an assembler → BUSCO D map.  Each
+contig's effective clustering score is multiplied by a quality weight derived
+from its source assembler's BUSCO D:
+
+```
+quality_weight = max(0.25,  1.0 − busco_d / 133.0)
+```
+
+A contig from peregrine (D = 10%) receives weight ≈ 0.92; one from canu
+(D = 74.9%) receives weight ≈ 0.44.  The clustering therefore strongly prefers
+representatives from lower-duplication assemblers when telomere scores are
+similar.  The assembler source is inferred by matching pool contig sequence
+lengths back to the original `.telo.fasta` files.
+
+---
+
+### Step 10 — T2T contigs no longer stripped by `_fasta_clean_contained` (`steps.py`)
+
+**Problem:** `_fasta_clean_contained` was being called on the T2T pool before
+clustering.  Because T2T contigs on different chromosomes can share repetitive
+subtelomeric elements, the 30% coverage threshold occasionally matched a T2T
+contig against a longer contig from a different chromosome and removed it.  In
+one observed run, 16 T2T contigs entering Step 10 became 15 in the protected
+pool (1 chromosome lost its T2T representative).
+
+**Fix:** `_fasta_clean_contained` is no longer called on `t2t.fasta`.  The
+minimap2 clustering (`cluster_and_select` with 95% identity / 85% query
+coverage) already deduplicates genuine same-chromosome copies; the clean step
+added no benefit and caused cross-chromosome false positives.
+
+---
+
+### Step 10 — Per-step log files (`pipeline.py`)
+
+**Problem:** All step output was written only to the terminal; there was no
+persistent per-step log for post-run debugging.
+
+**Fix:** Added `TeeWriter` class in `pipeline.py`.  The step execution loop
+now redirects both stdout and stderr through `TeeWriter` so that every step
+writes a file at `logs/step_N.log` in addition to the console.
+
+---
+
+### Step 9 — Telomere metric name consistency across steps (`steps.py`)
+
+**Problem:** Step 9 wrote rows named `"Telomere double-end contigs"`,
+`"Telomere single-end contigs"`, and `"Telomere supported contigs"` to
+`assembly_info.csv`.  Steps 12, 14, and 16 looked up `"Telomere strict T2T
+contigs"` and `"Telomere single-end strong contigs"`.  The name mismatch
+caused all telomere metrics to read as 0 in backbone scoring and final report
+generation.
+
+**Fix:** All steps now use a single consistent set of names:
+
+| Tier | Row label in `assembly_info.csv` |
+|---|---|
+| Both ends ≥ 0.25 | `Telomere strict T2T contigs` |
+| One end ≥ 0.25 | `Telomere single-end strong contigs` |
+| Any end ≥ 0.08 | `Telomere-supported contigs` |
+
+---
+
+### Step 9 — Telomere detection for all assemblers, not only hifiasm (`steps.py`)
+
+**Problem:** Hybrid telomere detection in Step 9 was running the full
+`detect_telomeres()` pipeline only on the hifiasm output.  All other
+assemblers fell through to a placeholder path and produced empty
+`.telo.fasta` files, making their telomere metrics 0 in all downstream steps.
+
+**Fix:** The detection loop now iterates over every assembler result FASTA
+present in `assemblies/` and calls `detect_telomeres()` for each.
+
+---
+
+### Step 12 — Redundancy-filter thresholds reverted to 95 % / 95 % (`steps.py`)
+
+**Problem:** In a previous edit, the `_filter_redundant_to_protected` call
+thresholds in Steps 12D and 12F were lowered from 95%/95% to 60%/90%.  The
+intent was to remove backbone contigs that partially overlapped a T2T contig,
+but the effect was the opposite: more clean backbone contigs (e.g. from
+peregrine, D = 10%) were dropped and replaced by T2T pool contigs that came
+from high-D assemblers, driving BUSCO D up rather than down.
+
+**Fix:** Both dedup passes (12D backbone-vs-protected and 12F
+rescued-vs-protected) now use `cov_thr = 0.95, id_thr = 0.95`, matching the
+original TACO.sh default.  These conservative thresholds only drop backbone
+contigs that are near-identical to a protected T2T contig; genuine backbone
+contigs from independent chromosomes are kept.  The thresholds remain
+overridable via `PROTECT_COV` and `PROTECT_ID` environment variables.
+
+---
+
+### Step 12 — BUSCO D penalty added to backbone scoring (`steps.py`)
+
+**Problem:** The smart backbone scoring formula rewarded BUSCO single-copy
+completeness but did not penalise duplication.  An assembler with high BUSCO S
+but also high BUSCO D could be selected as backbone, carrying duplicated
+content into the final assembly.
+
+**Fix:** BUSCO D is now read from `assembly_info.csv` alongside BUSCO S, and
+a penalty term is subtracted:
+
+```
+score = BUSCO_S×1000 + T2T×300 + single×150
+      + MerquryComp×200 + MerquryQV×20
+      − contigs×30 + log₁₀(N50)×150
+      − BUSCO_D×500
+```
+
+The BUSCO D value and the penalty contribution are written to
+`assemblies/selection_debug.tsv` and `assemblies/selection_decision.txt` for
+transparency.
+
+---
+
+### Step 12 — Chimera safety check on protected pool (`steps.py`)
+
+**Problem:** Even with the validated-merge approach in Step 10, an additional
+guard is warranted against any abnormally long contigs that may have entered
+the protected pool.  The earlier guard used 1.5× the median backbone contig
+length, which was too aggressive for organisms where chromosome sizes vary
+significantly (legitimate longer chromosomes would be incorrectly flagged).
+
+**Fix:** The chimera safety check now uses 1.5× the **maximum individual
+contig length across all assembler `.telo.fasta` files** as the threshold.
+Because this reference length comes from actual chromosome-scale contigs (the
+largest chromosomes observed in any assembler output), 1.5× catches genuine
+2× chimeras while leaving all legitimate T2T contigs — including those from
+larger chromosomes — untouched.
+
+---
+
+### Clustering — query-only coverage and telomere score tiebreaker (`clustering.py`)
+
+**Problem:** `parse_paf_and_cluster` computed coverage as
+`min(query_cov, target_cov)`.  When a shorter contig was fully contained
+within a longer one, the target coverage was small and the pair was not
+clustered together, leaving genuine duplicates as separate representatives.
+
+**Fix:** Coverage is now computed on the query contig only
+(`(qe − qs) / qlen`), consistent with TACO.sh.  Additionally:
+- `seq_names` parameter added so singletons (contigs with no alignments)
+  always appear as their own single-member cluster.
+- `scores` parameter added to `cluster_and_select`; when provided, the
+  cluster representative is chosen by `(telomere_score DESC, length DESC,
+  name ASC)` rather than length alone.  This is used in Step 10 with the
+  BUSCO-weighted scores described above.
+
+---
+
 ## [1.0.0] — 2026-04-08
 
 ### Overview
@@ -14,6 +220,28 @@ pipeline has been converted from a monolithic 2,620-line Bash script
 (`TACO.sh`) into a proper, installable Python package (`taco/`).
 The scientific logic is identical to v0.5.6 — what changed is how that
 logic is packaged, invoked, and maintained.
+
+### Summary of changes
+
+- **MAJOR** — Entire pipeline rewritten from Bash to a proper Python package
+  (`taco/`); `pip install -e .` registers the `taco` console-script entry point.
+- **MAJOR** — Dependency `funannotate` removed; `funannotate sort` replaced by
+  `_fasta_sort_minlen()` and `funannotate clean` by `_fasta_clean_contained()`,
+  both pure Python + minimap2.
+- **FIX** — Bash function-ordering bug (`check_single_env_requirements` called
+  before it was defined) eliminated by the Python conversion.
+- **FIX** — All embedded Python heredocs extracted into proper module functions;
+  no more `python3 <<'EOF' … EOF` patterns.
+- **FIX** — All `awk`/`sed` pipelines replaced with Python `csv`, `re`, and
+  string methods — no GNU vs BSD `awk` discrepancies.
+- **CHANGE** — Assembler steps 1–6 are now non-fatal: binary absence or
+  non-zero return code logs `[warn]` and continues to the next assembler.
+- **CHANGE** — Platform-specific assembler flags (`-pacbio-hifi`, `--nano-hq`,
+  etc.) now selected from `ASSEMBLER_PLATFORMS` dict based on `--platform`.
+- **FIX** (canu) — `openjdk>=11` added as explicit conda dependency to prevent
+  `undefined symbol: JLI_StringDup` from bioconda dev builds.
+- **FIX** — GitHub repository URL corrected from `ysun-fieldmuseum/TACO` to
+  `yksun/TACO` in README shields, setup.py, and all internal references.
 
 ---
 
