@@ -223,13 +223,19 @@ Additionally, `redundans.py` was listed in `TACO.sh`'s requirements check
    the minimap2-based fragment removal (50%/90%), and scaffolding/gap-closing
    is skipped with an informational message.
 
-**Reference-guided vs de novo mode:**  When `--fasta` (external) is provided,
-it is passed to Redundans as `-r` (reference) for both reduction and
+**Reference-guided vs de novo mode:**  When `--reference` / `-ref` is
+provided, it is passed to Redundans as `-r` for both reduction and
 scaffolding.  This enables reference-guided scaffolding where Redundans uses
 the reference chromosome structure to order and orient contigs.  For pure de
-novo runs (no `--fasta`), Redundans operates without a reference and relies
-solely on contig-vs-contig alignment (reduction) and long-read evidence
-(scaffolding).  The README documents this dual-mode behaviour.
+novo runs (no `--reference`), the reference is skipped entirely — Redundans
+uses only HiFi/long reads for scaffolding and gap closing.
+
+**CLI rename:**  `--fasta` renamed to `--reference` / `-ref` to clarify its
+role as a reference genome (not an "external" assembly).  The assembler name
+`external` is now `reference` in all CSV outputs, file paths, and comparison
+tables (`assembly_info.csv`, `selection_debug.tsv`, `final_result.csv`, etc.).
+The internal attribute is `runner.reference_fasta` (was `external_fasta`).
+The README documents this dual-mode behaviour.
 
 `taco-env.yml` now includes `redundans` from bioconda.
 

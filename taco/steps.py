@@ -249,7 +249,7 @@ def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None
 def _build_busco_csv(runner):
     """Build assembly.busco.csv from BUSCO results."""
     out_csv = os.path.join("assemblies", "assembly.busco.csv")
-    desired = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    desired = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
 
     def newest(paths):
         return max(paths, key=os.path.getmtime) if paths else None
@@ -369,7 +369,7 @@ def _build_quast_csv(runner):
     out = os.path.join("assemblies", "assembly.quast.csv")
     treport = os.path.join("quast_out", "transposed_report.tsv")
     report = os.path.join("quast_out", "report.tsv")
-    desired = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    desired = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
 
     def norm(s):
         return (s or "").lower().replace("-", "").replace("_", "").replace(".result", "").replace(".fasta", "").strip()
@@ -470,7 +470,7 @@ def _build_assembly_info(runner):
     """Build assembly_info.csv from BUSCO, QUAST, and telomere metrics."""
     os.makedirs("assemblies", exist_ok=True)
     info_csv = "assemblies/assembly_info.csv"
-    desired_header = "Metric,canu,external,flye,ipa,nextDenovo,peregrine,hifiasm"
+    desired_header = "Metric,canu,reference,flye,ipa,nextDenovo,peregrine,hifiasm"
 
     with open(info_csv, "w") as f:
         f.write(desired_header + "\n")
@@ -689,13 +689,13 @@ def step_07_normalize(runner):
             rename_and_sort_fasta(runner, dest, tmp_renamed, prefix)
             shutil.move(tmp_renamed, dest)
 
-    if runner.external_fasta and os.path.isfile(runner.external_fasta) and os.path.getsize(runner.external_fasta) > 0:
-        shutil.copy(runner.external_fasta, "./assemblies/external.result.fasta")
+    if runner.reference_fasta and os.path.isfile(runner.reference_fasta) and os.path.getsize(runner.reference_fasta) > 0:
+        shutil.copy(runner.reference_fasta, "./assemblies/reference.result.fasta")
 
 
 def step_08_busco(runner):
     """Step 8 - Run BUSCO on all assembled genomes."""
-    runner.log("Step 8 - Run BUSCO on all assembled genomes (including external)")
+    runner.log("Step 8 - Run BUSCO on all assembled genomes (including reference)")
     os.makedirs("busco", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -766,15 +766,15 @@ def step_09_telomere(runner):
         for name, src in pairs:
             if os.path.isfile(src) and os.path.getsize(src) > 0:
                 shutil.copy(src, f"./assemblies/{name}.result.fasta")
-        if runner.external_fasta and os.path.isfile(runner.external_fasta) and os.path.getsize(runner.external_fasta) > 0:
-            shutil.copy(runner.external_fasta, "./assemblies/external.result.fasta")
+        if runner.reference_fasta and os.path.isfile(runner.reference_fasta) and os.path.getsize(runner.reference_fasta) > 0:
+            shutil.copy(runner.reference_fasta, "./assemblies/reference.result.fasta")
 
     existing_assemblies = glob.glob("assemblies/*.result.fasta")
     if not existing_assemblies:
-        runner.log_error("No assemblies found in ./assemblies. Run step 7 first or supply --fasta.")
+        runner.log_error("No assemblies found in ./assemblies. Run step 7 first or supply --reference.")
         raise RuntimeError("No assemblies found")
 
-    cols = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    cols = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
     tdouble = {}
     tsingle = {}
     tsupported = {}
@@ -1319,7 +1319,7 @@ def _run_merqury_preselection(runner):
         runner.log_info(f"Running Merqury pre-selection using database: {db}")
         runner.log_version("merqury.sh", "merqury.sh")
 
-        assemblers = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+        assemblers = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
         for asm in assemblers:
             asm_fa = f"assemblies/{asm}.result.fasta"
             if not os.path.isfile(asm_fa) or os.path.getsize(asm_fa) == 0:
@@ -1335,7 +1335,7 @@ def _run_merqury_preselection(runner):
 
 def _write_merqury_csv():
     """Write assemblies/assembly.merqury.csv from Merqury output files."""
-    assemblers = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    assemblers = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
     rows = [["Metric"] + assemblers, ["Merqury QV"], ["Merqury completeness (%)"]]
 
     def parse_first_float(path):
@@ -1656,7 +1656,7 @@ def step_12_refine(runner):
 
     # Fallback: pick first available assembler
     if not assembler:
-        for asm in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm", "external"]:
+        for asm in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm", "reference"]:
             if os.path.isfile(f"assemblies/{asm}.result.fasta") and \
                os.path.getsize(f"assemblies/{asm}.result.fasta") > 0:
                 assembler = asm
@@ -1770,16 +1770,16 @@ def step_12_refine(runner):
                 # For genome assemblies with separate haplotype fragments from
                 # different assemblers, the defaults work well.  We pass
                 # --minimap2reduce for speed since minimap2 is already available.
-                # If --fasta (external) was provided, it serves as a reference
-                # FASTA and is passed to Redundans via -r for reference-guided
-                # reduction.  For pure de novo runs (no --fasta), only the
-                # contig-vs-contig reduction is performed.
+                # If --reference was provided, it is passed to Redundans
+                # via -r for reference-guided reduction.  For pure de novo
+                # runs (no --reference), only contig-vs-contig reduction
+                # is performed.
                 ext_ref = ""
-                if runner.external_fasta and os.path.isfile(runner.external_fasta) \
-                   and os.path.getsize(runner.external_fasta) > 0:
-                    ext_ref = f"-r {runner.external_fasta} "
-                    runner.log_info(f"Using external FASTA as reference for Redundans: "
-                                    f"{runner.external_fasta}")
+                if runner.reference_fasta and os.path.isfile(runner.reference_fasta) \
+                   and os.path.getsize(runner.reference_fasta) > 0:
+                    ext_ref = f"-r {runner.reference_fasta} "
+                    runner.log_info(f"Using --reference FASTA for Redundans: "
+                                    f"{runner.reference_fasta}")
 
                 red_cmd = (
                     f"redundans.py "
@@ -1938,12 +1938,11 @@ def step_12_refine(runner):
     # reduction was already performed on the backbone in step 12D Pass 2.
     #
     # Reference-guided vs de novo:
-    # - If --fasta (external) was provided, it is passed to Redundans as
-    #   -r (reference) for reference-guided scaffolding.  This allows
-    #   Redundans to use the reference chromosome structure to order and
-    #   orient contigs.
-    # - For pure de novo runs (no --fasta), scaffolding relies solely on
-    #   long-read evidence to join contigs.
+    # - If --reference was provided, it is passed to Redundans as -r for
+    #   reference-guided scaffolding.  This allows Redundans to use the
+    #   reference chromosome structure to order and orient contigs.
+    # - For pure de novo runs (no --reference), scaffolding relies solely
+    #   on long-read evidence to join contigs.
     if shutil.which("redundans.py") and os.path.isfile(raw_out) and \
        os.path.getsize(raw_out) > 0:
         runner.log_info("Running Redundans scaffolding + gap closing with long reads")
@@ -1960,15 +1959,15 @@ def step_12_refine(runner):
             elif "clr" in runner.platform.lower() or runner.platform.lower() == "pacbio":
                 mm2_preset = "map-pb"
 
-        # Build reference flag: --fasta (external) serves as reference FASTA
+        # Build reference flag: --reference serves as reference FASTA
         ext_ref_flag = ""
-        if runner.external_fasta and os.path.isfile(runner.external_fasta) \
-           and os.path.getsize(runner.external_fasta) > 0:
-            ext_ref_flag = f"-r {runner.external_fasta} "
-            runner.log_info(f"Reference-guided scaffolding using external FASTA: "
-                            f"{runner.external_fasta}")
+        if runner.reference_fasta and os.path.isfile(runner.reference_fasta) \
+           and os.path.getsize(runner.reference_fasta) > 0:
+            ext_ref_flag = f"-r {runner.reference_fasta} "
+            runner.log_info(f"Reference-guided scaffolding using --reference: "
+                            f"{runner.reference_fasta}")
         else:
-            runner.log_info("De novo scaffolding (no external reference provided)")
+            runner.log_info("De novo scaffolding (no --reference provided, using long reads only)")
 
         red_scaffold_cmd = (
             f"redundans.py "

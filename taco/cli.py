@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
     parser.add_argument('-m', '--motif', type=str, help='Telomere motif')
     parser.add_argument('--platform', choices=['pacbio-hifi', 'nanopore', 'pacbio'], default='pacbio-hifi')
-    parser.add_argument('--fasta', type=str, help='External FASTA')
+    parser.add_argument('--reference', '-ref', type=str, help='Reference FASTA for comparison and Redundans scaffolding')
     parser.add_argument('-s', '--steps', type=str, help='Steps to run')
     parser.add_argument('--assembly-only', action='store_true')
     parser.add_argument('--telomere-mode', choices=['known', 'auto', 'hybrid'], default='hybrid')

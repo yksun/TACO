@@ -118,7 +118,7 @@ taco -g 12m -t 16 \
 | `-m`, `--motif` | Telomere motif or seed motif |
 | `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio` |
 | `-s`, `--steps` | Run selected steps only (e.g., `1,3-5`) |
-| `--fasta` | External pre-assembled FASTA to include in comparison. Also used as the reference genome for Redundans reference-guided scaffolding in Step 12. When omitted, Step 12 runs in pure de novo mode (long-read-only scaffolding). |
+| `--reference`, `-ref` | Reference FASTA for comparison and Redundans scaffolding. Included as the "reference" assembler in all comparison tables. In Step 12, used as the reference genome for Redundans reference-guided reduction and scaffolding (`-r`). When omitted, Step 12 runs in pure de novo mode using only long reads for scaffolding. |
 | `--busco` | Run BUSCO (optionally specify lineage dataset) |
 | `--choose` | Manually choose the backbone assembler |
 | `--assembly-only` | Stop after assembler comparison |
@@ -220,11 +220,11 @@ TACO uses [Redundans](https://github.com/Gabaldonlab/redundans) (Pryszcz & Gabal
 
 ### Reference-Guided vs De Novo Mode
 
-The `--fasta` parameter controls whether Redundans operates in reference-guided or de novo mode:
+The `--reference` / `-ref` parameter controls whether Redundans operates in reference-guided or de novo mode:
 
-- **With `--fasta`**: The external FASTA is treated as a reference genome and passed to Redundans via `-r`. This enables reference-guided scaffolding where Redundans uses the reference chromosome structure to order and orient contigs, in addition to the long-read evidence.
+- **With `--reference`**: The reference FASTA is passed to Redundans via `-r`. This enables reference-guided reduction and scaffolding, where Redundans uses the reference chromosome structure to order and orient contigs in addition to long-read evidence.
 
-- **Without `--fasta`** (pure de novo): Scaffolding relies solely on long-read evidence to join contigs. No external reference is used. This is the standard mode for de novo genome assembly projects.
+- **Without `--reference`** (pure de novo): The reference is skipped entirely. Redundans uses only HiFi/long reads for scaffolding and gap closing. No reference sequences are involved. This is the standard mode for de novo genome assembly projects.
 
 If `redundans.py` is not installed, TACO falls back to a minimap2-based fragment removal for reduction and skips scaffolding/gap closing.
 

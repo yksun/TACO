@@ -5,7 +5,7 @@ import argparse
 import csv
 import math
 
-ASSEMBLERS = ["canu", "external", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+ASSEMBLERS = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
 
 
 def parse_assembly_info(csv_path):

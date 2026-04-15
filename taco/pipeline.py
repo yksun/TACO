@@ -45,7 +45,7 @@ class PipelineRunner:
         self.fastq = os.path.realpath(args.fastq)
         self.motif = args.motif
         self.platform = args.platform
-        self.external_fasta = args.fasta
+        self.reference_fasta = args.reference
         self.steps = args.steps
         self.assembly_only = args.assembly_only
 
@@ -222,17 +222,17 @@ class PipelineRunner:
             )
 
     # ------------------------------------------------------------------ #
-    # External FASTA resolution
+    # Reference FASTA resolution
     # ------------------------------------------------------------------ #
-    def resolve_external_fasta(self):
-        """Download / decompress --fasta if needed; update self.external_fasta."""
-        if not self.external_fasta:
+    def resolve_reference_fasta(self):
+        """Download / decompress --reference if needed; update self.reference_fasta."""
+        if not self.reference_fasta:
             return
-        src = self.external_fasta
+        src = self.reference_fasta
         # URL download
         if src.startswith("http://") or src.startswith("https://") or src.startswith("ftp://"):
-            self.log_info(f"Downloading external FASTA: {src}")
-            local = os.path.join(self.working_dir, "external_input.fasta")
+            self.log_info(f"Downloading reference FASTA: {src}")
+            local = os.path.join(self.working_dir, "reference_input.fasta")
             if shutil.which("curl"):
                 self.run_cmd(f'curl -L "{src}" -o "{local}"')
             elif shutil.which("wget"):
@@ -249,9 +249,9 @@ class PipelineRunner:
                 shutil.copyfileobj(fi, fo)
             src = out
         if not os.path.isfile(src) or os.path.getsize(src) == 0:
-            self.log_error(f"External FASTA not found or empty: {src}")
+            self.log_error(f"Reference FASTA not found or empty: {src}")
             sys.exit(1)
-        self.external_fasta = src
+        self.reference_fasta = src
 
     # ------------------------------------------------------------------ #
     # NextDenovo configuration
@@ -384,7 +384,7 @@ nextgraph_options = -a 1
         self.write_versions()
         self.write_run_metadata()
         self.init_benchmark_step_table()
-        self.resolve_external_fasta()
+        self.resolve_reference_fasta()
         self.write_nextdenovo_config()
 
         from taco.steps import STEP_FUNCTIONS
