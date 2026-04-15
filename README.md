@@ -206,17 +206,27 @@ BUSCO single-copy completeness (S%) is used instead of total completeness (C%) t
 
 ## Step 12 — Backbone Refinement with Redundans
 
-Step 12 refines the backbone assembly in several sub-steps: redundancy reduction against the protected T2T pool, Redundans-based reduction of remaining heterozygous duplicates, telomere rescue, and Redundans scaffolding + gap closing with the original long reads.
+Step 12 refines the backbone assembly through: minimap2-based redundancy reduction against the protected T2T pool, telomere rescue, final combine, and then Redundans on the full combined assembly for reduction, scaffolding, and gap closing.
 
-### Redundans Integration
+### Step 12 Sub-step Flow
 
-TACO uses [Redundans](https://github.com/Gabaldonlab/redundans) (Pryszcz & Gabaldón 2016) for three purposes in Step 12:
+1. **12D Pass 1** — strict minimap2 dedup (95%/95%) removes near-identical backbone contigs.
+2. **12D Pass 2** — minimap2 fragment removal (50%/90%) removes backbone fragments partially overlapping T2T chromosomes.
+3. **12E** — telomere rescue: backbone contigs replaced by longer telomeric versions where possible.
+4. **12F** — post-rescue dedup against T2T pool.
+5. **12G** — final combine: protected T2T contigs + surviving backbone.
+6. **12G2** — Redundans on the full combined assembly (see below).
+7. **12H** — genome-size-aware pruning (safety net).
 
-1. **Redundancy reduction** (Step 12D Pass 2) — After removing backbone contigs near-identical to T2T contigs (95%/95%), Redundans detects and removes heterozygous/duplicate contigs among the surviving backbone. Thresholds: identity >= 0.51, overlap >= 0.80 (configurable via `RED_IDENTITY` / `RED_OVERLAP` environment variables).
+### Redundans Integration (Step 12G2)
 
-2. **Long-read scaffolding** (Step 12G2) — The combined assembly (protected T2T + backbone) is scaffolded using the original sequencing reads (HiFi, ONT, or CLR). This can join fragmented backbone contigs where read evidence supports a join.
+TACO uses [Redundans](https://github.com/Gabaldonlab/redundans) (Pryszcz & Gabaldón 2016) on the full combined assembly so it can see both T2T chromosomes and backbone fragments together. Redundans runs all three of its stages in order:
 
-3. **Gap closing** (Step 12G2) — Gaps introduced during scaffolding are filled using the same long reads.
+1. **Redundancy reduction** — detects and removes heterozygous/duplicate contigs across the entire assembly. Because Redundans can see both the T2T contigs and the backbone fragments, it correctly identifies backbone fragments that are partial copies of T2T chromosomes. Thresholds: identity >= 0.51, overlap >= 0.80 (configurable via `RED_IDENTITY` / `RED_OVERLAP` environment variables).
+
+2. **Long-read scaffolding** — joins fragments using the original sequencing reads (HiFi, ONT, or CLR). The minimap2 preset is auto-selected from `--platform`.
+
+3. **Gap closing** — fills gaps introduced during scaffolding using the same long reads.
 
 ### Reference-Guided vs De Novo Mode
 
@@ -224,9 +234,9 @@ The `--reference` / `-ref` parameter controls whether Redundans operates in refe
 
 - **With `--reference`**: The reference FASTA is passed to Redundans via `-r`. This enables reference-guided reduction and scaffolding, where Redundans uses the reference chromosome structure to order and orient contigs in addition to long-read evidence.
 
-- **Without `--reference`** (pure de novo): The reference is skipped entirely. Redundans uses only HiFi/long reads for scaffolding and gap closing. No reference sequences are involved. This is the standard mode for de novo genome assembly projects.
+- **Without `--reference`** (pure de novo): The reference is skipped entirely. Redundans uses only HiFi/long reads for reduction, scaffolding, and gap closing. No reference sequences are involved. This is the standard mode for de novo genome assembly projects.
 
-If `redundans.py` is not installed, TACO falls back to a minimap2-based fragment removal for reduction and skips scaffolding/gap closing.
+If `redundans.py` is not installed, TACO keeps the minimap2-based fragment removal in 12D and skips Redundans entirely.
 
 ## Output Structure
 
