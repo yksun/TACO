@@ -2460,40 +2460,53 @@ def step_17_cleanup(runner):
     os.makedirs("temp/log", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
 
+    def _safe_move(src, dst_dir):
+        """Move src into dst_dir, overwriting any existing file of the same name."""
+        dst = os.path.join(dst_dir, os.path.basename(src))
+        if os.path.exists(dst):
+            os.remove(dst)
+        shutil.move(src, dst_dir)
+
     # Move merge intermediates
     for pattern in ["aln_summary_merged*.tsv", "anchor_summary_merged_*.txt"]:
         for f in glob.glob(pattern):
-            shutil.move(f, "temp/merge/")
+            try:
+                _safe_move(f, "temp/merge/")
+            except Exception:
+                pass
     for pattern in [".merged_*", "merged_*.delta", "merged_*.coords", "merged_*.snps",
                     "merged_*.delta.*", "merged_*.crunch", "merged_*.filter",
                     "merged_*.qdiff", "merged_*.rdiff", "merged_*.mcoords"]:
         for f in glob.glob(pattern):
-            shutil.move(f, "temp/merge/")
+            try:
+                _safe_move(f, "temp/merge/")
+            except Exception:
+                pass
 
     # Move BUSCO logs
     if os.path.isdir("busco"):
         for f in glob.glob("busco/**/*.log", recursive=True):
             try:
-                shutil.move(f, "temp/busco/")
+                _safe_move(f, "temp/busco/")
             except Exception:
                 pass
     for f in glob.glob("busco_*.log") + glob.glob("*busco*.log"):
         try:
-            shutil.move(f, "temp/busco/")
+            _safe_move(f, "temp/busco/")
         except Exception:
             pass
 
     # Move merged FASTA intermediates
     for f in glob.glob("merged_*.fasta") + glob.glob("merged_*.fa"):
         try:
-            shutil.move(f, "temp/merge/fasta/")
+            _safe_move(f, "temp/merge/fasta/")
         except Exception:
             pass
 
     # Move param files
     for f in glob.glob("param_summary_merged_*.txt"):
         try:
-            shutil.move(f, "temp/merge/param/")
+            _safe_move(f, "temp/merge/param/")
         except Exception:
             pass
 
