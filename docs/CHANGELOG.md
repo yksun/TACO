@@ -202,33 +202,39 @@ and it cannot join fragmented backbone contigs or close assembly gaps.
 Additionally, `redundans.py` was listed in `TACO.sh`'s requirements check
 (line 772) but was never actually called and was missing from `taco-env.yml`.
 
-**Fix — three-stage Redundans integration:**
+**Fix — Redundans on the full combined assembly (Step 12G2):**
 
-1. **Redundans reduction (Step 12D, Pass 2).** After the strict 95%/95%
-   minimap2 dedup, the surviving backbone contigs are passed to
-   `redundans.py --noscaffolding --nogapclosing --minimap2reduce`.  Redundans
-   detects and removes heterozygous/duplicate contigs using its internal
-   alignment + identity/overlap logic (defaults: identity ≥ 0.51,
-   overlap ≥ 0.80).  Thresholds are overridable via `RED_IDENTITY` and
-   `RED_OVERLAP` environment variables.
+Redundans runs after the final combine (protected T2T + backbone) so it can
+see both the T2T chromosomes and the surviving backbone fragments.  An earlier
+design ran Redundans reduction on the backbone alone (before the combine), but
+this produced "Nothing reduced!" because the backbone fragments are redundant
+*against the T2T contigs*, not among themselves.
 
-2. **Redundans scaffolding + gap closing (Step 12G2, after final combine).**
-   The full combined assembly (protected T2T + backbone) is passed to
-   `redundans.py --noreduction` with the original long reads (`-l`).  This
-   step joins backbone fragments using read evidence (scaffolding) and fills
-   the gaps using the same reads (gap closing).  The minimap2 preset is
-   auto-selected from `--platform` (map-hifi, map-ont, map-pb).
+Step 12 now proceeds:
 
-3. **Fallback.** If `redundans.py` is not installed, step 12D falls back to
-   the minimap2-based fragment removal (50%/90%), and scaffolding/gap-closing
-   is skipped with an informational message.
+1. **12D Pass 1** — strict minimap2 dedup (95%/95%) removes near-identical
+   backbone contigs.
+2. **12D Pass 2** — minimap2 fragment removal (50%/90%) removes backbone
+   fragments that partially overlap T2T chromosomes.
+3. **12E–12G** — telomere rescue, post-rescue dedup, final combine.
+4. **12G2 — Redundans on the full combined assembly.**  All three Redundans
+   stages run in order:
+   - **Reduction** — detects and removes heterozygous/duplicate contigs across
+     the entire assembly (identity ≥ 0.51, overlap ≥ 0.80; configurable via
+     `RED_IDENTITY` / `RED_OVERLAP` env vars).
+   - **Scaffolding** — joins fragments using the original long reads (`-l`).
+   - **Gap closing** — fills gaps created during scaffolding.
+   The minimap2 preset is auto-selected from `--platform` (map-hifi, map-ont,
+   map-pb).
+5. **12H** — genome-size-aware pruning (safety net).
+
+**Fallback:** If `redundans.py` is not installed, step 12D keeps the minimap2
+fragment removal, and Redundans scaffolding/gap-closing is skipped.
 
 **Reference-guided vs de novo mode:**  When `--reference` / `-ref` is
-provided, it is passed to Redundans as `-r` for both reduction and
-scaffolding.  This enables reference-guided scaffolding where Redundans uses
-the reference chromosome structure to order and orient contigs.  For pure de
-novo runs (no `--reference`), the reference is skipped entirely — Redundans
-uses only HiFi/long reads for scaffolding and gap closing.
+provided, it is passed to Redundans as `-r` for reference-guided reduction
+and scaffolding.  For pure de novo runs (no `--reference`), the reference
+is skipped entirely — Redundans uses only HiFi/long reads.
 
 **CLI rename:**  `--fasta` renamed to `--reference` / `-ref` to clarify its
 role as a reference genome (not an "external" assembly).  The assembler name

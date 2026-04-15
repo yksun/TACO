@@ -1752,87 +1752,32 @@ def step_12_refine(runner):
             runner.log(f"Pass 1 (strict): removed {n_dropped} backbone contigs "
                        f"redundant to protected pool (95%/95%)")
 
-            # Pass 2 — Redundans reduction: detect and remove redundant
-            # heterozygous/duplicate contigs among surviving backbone contigs.
-            # Uses Redundans (Gabaldonlab) with --noscaffolding --nogapclosing
-            # to perform only the reduction step, which is smarter than simple
-            # overlap-based filtering because it considers heterozygous pairs.
-            # Fallback: if redundans.py is not available, use the minimap2-based
-            # fragment removal as before.
-            if shutil.which("redundans.py"):
-                runner.log_info("Running Redundans reduction on backbone contigs")
-                runner.log_version("redundans.py", "redundans.py")
-                redundans_dir = "assemblies/redundans_reduce"
-                if os.path.isdir(redundans_dir):
-                    shutil.rmtree(redundans_dir)
+            # Pass 2 — minimap2-based fragment removal: drop backbone
+            # fragments that partially overlap T2T chromosomes (≥50%
+            # coverage at ≥90% identity).  Redundans runs later on the
+            # full combined assembly (12G2) where it can see both T2T
+            # and backbone contigs for smarter redundancy detection.
+            frag_paf = "assemblies/backbone_frag_vs_protected.paf"
+            cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                   f"assemblies/protected.telomere.fa assemblies/backbone.filtered.fa")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            with open(frag_paf, "w") as f:
+                f.write(result.stdout)
 
-                # Redundans reduction: identity=0.51 overlap=0.80 are defaults.
-                # For genome assemblies with separate haplotype fragments from
-                # different assemblers, the defaults work well.  We pass
-                # --minimap2reduce for speed since minimap2 is already available.
-                # If --reference was provided, it is passed to Redundans
-                # via -r for reference-guided reduction.  For pure de novo
-                # runs (no --reference), only contig-vs-contig reduction
-                # is performed.
-                ext_ref = ""
-                if runner.reference_fasta and os.path.isfile(runner.reference_fasta) \
-                   and os.path.getsize(runner.reference_fasta) > 0:
-                    ext_ref = f"-r {runner.reference_fasta} "
-                    runner.log_info(f"Using --reference FASTA for Redundans: "
-                                    f"{runner.reference_fasta}")
-
-                red_cmd = (
-                    f"redundans.py "
-                    f"-f assemblies/backbone.filtered.fa "
-                    f"{ext_ref}"
-                    f"-o {redundans_dir} "
-                    f"-t {runner.threads} "
-                    f"--noscaffolding --nogapclosing "
-                    f"--minimap2reduce "
-                    f"--identity {os.environ.get('RED_IDENTITY', '0.51')} "
-                    f"--overlap {os.environ.get('RED_OVERLAP', '0.80')} "
-                    f"--minLength 200"
-                )
-                result = subprocess.run(red_cmd, shell=True, capture_output=True, text=True)
-                runner.log(f"  redundans.py stdout: {result.stdout.strip()}")
-                if result.stderr.strip():
-                    runner.log(f"  redundans.py stderr: {result.stderr.strip()[:500]}")
-
-                # Redundans writes reduced contigs to <outdir>/contigs.reduced.fa
-                reduced_fa = os.path.join(redundans_dir, "contigs.reduced.fa")
-                if os.path.isfile(reduced_fa) and os.path.getsize(reduced_fa) > 0:
-                    before_n = len(list(_read_fasta_records("assemblies/backbone.filtered.fa")))
-                    after_recs = list(_read_fasta_records(reduced_fa))
-                    n_removed = before_n - len(after_recs)
-                    runner.log(f"Pass 2 (Redundans reduction): removed {n_removed} "
-                               f"redundant backbone contigs ({before_n} → {len(after_recs)})")
-                    shutil.copy(reduced_fa, "assemblies/backbone.filtered.fa")
-                else:
-                    runner.log_warn("Redundans reduction produced no output; keeping previous backbone")
+            n_frag = _filter_fragments_to_protected(
+                frag_paf,
+                "assemblies/backbone.filtered.fa",
+                "assemblies/backbone.filtered.defrag.fa",
+                frag_cov_thr=float(os.environ.get("FRAG_COV", "0.50")),
+                frag_id_thr=float(os.environ.get("FRAG_ID", "0.90")),
+            )
+            if n_frag > 0:
+                runner.log(f"Pass 2 (fragment): removed {n_frag} backbone "
+                           f"fragments partially covered by T2T contigs (50%/90%)")
+                shutil.copy("assemblies/backbone.filtered.defrag.fa",
+                            "assemblies/backbone.filtered.fa")
             else:
-                # Fallback: minimap2-based fragment removal (50%/90%)
-                runner.log_info("redundans.py not found; using minimap2 fragment removal fallback")
-                frag_paf = "assemblies/backbone_frag_vs_protected.paf"
-                cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-                       f"assemblies/protected.telomere.fa assemblies/backbone.filtered.fa")
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                with open(frag_paf, "w") as f:
-                    f.write(result.stdout)
-
-                n_frag = _filter_fragments_to_protected(
-                    frag_paf,
-                    "assemblies/backbone.filtered.fa",
-                    "assemblies/backbone.filtered.defrag.fa",
-                    frag_cov_thr=float(os.environ.get("FRAG_COV", "0.50")),
-                    frag_id_thr=float(os.environ.get("FRAG_ID", "0.90")),
-                )
-                if n_frag > 0:
-                    runner.log(f"Pass 2 (fragment fallback): removed {n_frag} backbone "
-                               f"fragments partially covered by T2T contigs (50%/90%)")
-                    shutil.copy("assemblies/backbone.filtered.defrag.fa",
-                                "assemblies/backbone.filtered.fa")
-                else:
-                    runner.log("Pass 2 (fragment fallback): no additional fragments removed")
+                runner.log("Pass 2 (fragment): no additional fragments removed")
         else:
             runner.log_warn("minimap2 not found; cannot filter redundant backbone contigs.")
             shutil.copy(backbone_fa, "assemblies/backbone.filtered.fa")
@@ -1928,28 +1873,29 @@ def step_12_refine(runner):
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
-    # ---- 12G2. Redundans scaffolding + gap closing ----
-    # Use the original long reads (HiFi/ONT) to scaffold backbone fragments
-    # and close gaps.  This can reduce fragmentation by joining backbone
-    # contigs that share read evidence.  Protected T2T contigs are already in
-    # the assembly — Redundans will try to scaffold them with backbone
-    # fragments where read support exists.
-    # Only the scaffolding + gap-closing steps are run (--noreduction) because
-    # reduction was already performed on the backbone in step 12D Pass 2.
+    # ---- 12G2. Redundans reduction + scaffolding + gap closing ----
+    # Run Redundans on the FULL combined assembly (T2T + backbone) so it can
+    # see both the protected chromosomes and the surviving backbone fragments.
+    # Running on backbone alone (as was tried earlier) produces "Nothing
+    # reduced!" because the redundancy is between backbone fragments and T2T
+    # contigs, not among the backbone fragments themselves.
     #
-    # Reference-guided vs de novo:
-    # - If --reference was provided, it is passed to Redundans as -r for
-    #   reference-guided scaffolding.  This allows Redundans to use the
-    #   reference chromosome structure to order and orient contigs.
-    # - For pure de novo runs (no --reference), scaffolding relies solely
-    #   on long-read evidence to join contigs.
+    # Redundans performs three steps in order:
+    #   1. Reduction — detect and remove heterozygous/duplicate contigs
+    #   2. Scaffolding — join fragments using long reads (+ reference if given)
+    #   3. Gap closing — fill gaps created during scaffolding
+    #
+    # If --reference was provided, it is passed via -r for reference-guided
+    # scaffolding.  Without --reference, Redundans uses only the long reads.
     if shutil.which("redundans.py") and os.path.isfile(raw_out) and \
        os.path.getsize(raw_out) > 0:
-        runner.log_info("Running Redundans scaffolding + gap closing with long reads")
+        runner.log_info("Running Redundans (reduction + scaffolding + gap closing) "
+                        "on full combined assembly")
+        runner.log_version("redundans.py", "redundans.py")
 
-        redundans_scaffold_dir = "assemblies/redundans_scaffold"
-        if os.path.isdir(redundans_scaffold_dir):
-            shutil.rmtree(redundans_scaffold_dir)
+        redundans_full_dir = "assemblies/redundans_full"
+        if os.path.isdir(redundans_full_dir):
+            shutil.rmtree(redundans_full_dir)
 
         # Determine minimap2 preset based on platform
         mm2_preset = "map-hifi"
@@ -1959,56 +1905,63 @@ def step_12_refine(runner):
             elif "clr" in runner.platform.lower() or runner.platform.lower() == "pacbio":
                 mm2_preset = "map-pb"
 
-        # Build reference flag: --reference serves as reference FASTA
-        ext_ref_flag = ""
+        # Build reference flag
+        ref_flag = ""
         if runner.reference_fasta and os.path.isfile(runner.reference_fasta) \
            and os.path.getsize(runner.reference_fasta) > 0:
-            ext_ref_flag = f"-r {runner.reference_fasta} "
-            runner.log_info(f"Reference-guided scaffolding using --reference: "
+            ref_flag = f"-r {runner.reference_fasta} "
+            runner.log_info(f"Reference-guided mode using --reference: "
                             f"{runner.reference_fasta}")
         else:
-            runner.log_info("De novo scaffolding (no --reference provided, using long reads only)")
+            runner.log_info("De novo mode (no --reference provided, using long reads only)")
 
-        red_scaffold_cmd = (
+        # Count input contigs for logging
+        before_recs = list(_read_fasta_records(raw_out))
+        before_n = len(before_recs)
+        before_len = sum(len(s) for _, s in before_recs)
+
+        red_full_cmd = (
             f"redundans.py "
             f"-f {raw_out} "
             f"-l {runner.fastq} "
-            f"{ext_ref_flag}"
-            f"-o {redundans_scaffold_dir} "
+            f"{ref_flag}"
+            f"-o {redundans_full_dir} "
             f"-t {runner.threads} "
-            f"--noreduction "
+            f"--minimap2reduce "
             f"-p {mm2_preset} "
+            f"--identity {os.environ.get('RED_IDENTITY', '0.51')} "
+            f"--overlap {os.environ.get('RED_OVERLAP', '0.80')} "
             f"--minLength 200"
         )
-        result = subprocess.run(red_scaffold_cmd, shell=True,
+        result = subprocess.run(red_full_cmd, shell=True,
                                 capture_output=True, text=True)
-        runner.log(f"  redundans scaffold stdout: {result.stdout.strip()}")
+        runner.log(f"  redundans stdout: {result.stdout.strip()}")
         if result.stderr.strip():
-            runner.log(f"  redundans scaffold stderr: {result.stderr.strip()[:500]}")
+            runner.log(f"  redundans stderr: {result.stderr.strip()[:500]}")
 
-        # Redundans writes final output to scaffolds.filled.fa (if gap closing ran)
-        # or scaffolds.fa (if only scaffolding), or contigs.reduced.fa (reduction only)
-        scaffolded_fa = None
+        # Redundans output priority: scaffolds.filled.fa > scaffolds.fa > contigs.reduced.fa
+        final_red_fa = None
         for candidate in [
-            os.path.join(redundans_scaffold_dir, "scaffolds.filled.fa"),
-            os.path.join(redundans_scaffold_dir, "scaffolds.fa"),
+            os.path.join(redundans_full_dir, "scaffolds.filled.fa"),
+            os.path.join(redundans_full_dir, "scaffolds.fa"),
+            os.path.join(redundans_full_dir, "contigs.reduced.fa"),
         ]:
             if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                scaffolded_fa = candidate
+                final_red_fa = candidate
                 break
 
-        if scaffolded_fa:
-            before_recs = list(_read_fasta_records(raw_out))
-            after_recs = list(_read_fasta_records(scaffolded_fa))
-            before_len = sum(len(s) for _, s in before_recs)
+        if final_red_fa:
+            after_recs = list(_read_fasta_records(final_red_fa))
+            after_n = len(after_recs)
             after_len = sum(len(s) for _, s in after_recs)
-            runner.log(f"Redundans scaffold: {len(before_recs)} → {len(after_recs)} "
-                       f"contigs/scaffolds, {before_len:,} → {after_len:,} bp")
-            shutil.copy(scaffolded_fa, raw_out)
+            runner.log(f"Redundans result: {before_n} → {after_n} contigs/scaffolds, "
+                       f"{before_len:,} → {after_len:,} bp "
+                       f"(from {os.path.basename(final_red_fa)})")
+            shutil.copy(final_red_fa, raw_out)
         else:
-            runner.log_warn("Redundans scaffolding produced no output; keeping pre-scaffold assembly")
+            runner.log_warn("Redundans produced no output; keeping pre-Redundans assembly")
     elif not shutil.which("redundans.py"):
-        runner.log_info("redundans.py not found; skipping scaffolding + gap closing")
+        runner.log_info("redundans.py not found; skipping Redundans reduction/scaffolding/gap closing")
 
     # ---- 12H. Genome-size-aware pruning ----
     # If total assembly size exceeds the expected genome size by >15%,
