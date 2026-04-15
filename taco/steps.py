@@ -21,6 +21,23 @@ from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
 
 
+def _parse_genome_size(size_str):
+    """Parse genome size string like '12m', '500k', '1.5g' to integer bp.
+
+    Returns 0 if the string cannot be parsed.
+    """
+    if not size_str:
+        return 0
+    size_str = size_str.strip().lower()
+    multipliers = {'k': 1_000, 'm': 1_000_000, 'g': 1_000_000_000}
+    try:
+        if size_str[-1] in multipliers:
+            return int(float(size_str[:-1]) * multipliers[size_str[-1]])
+        return int(float(size_str))
+    except (ValueError, IndexError):
+        return 0
+
+
 def rename_and_sort_fasta(runner, infa, outfa, prefix):
     """
     Read FASTA, sort contigs by length descending, rename as prefix_1, prefix_2, etc.
@@ -1476,11 +1493,10 @@ def _clean_backbone_headers(asm_fa, out_fa):
     _write_fasta(recs, out_fa)
 
 
-def _filter_redundant_to_protected(paf_path, backbone_fa, out_fa, cov_thr=0.95, id_thr=0.95):
-    """Remove backbone contigs that are redundant to the protected telomere pool.
+def _parse_paf_best_hits(paf_path):
+    """Parse PAF and return best (coverage, identity) per query contig.
 
-    Uses PAF from minimap2 alignment of backbone vs protected pool.
-    Keeps backbone contigs that are NOT covered >= cov_thr with identity >= id_thr.
+    Returns dict: {qname: (best_cov, best_ident)}
     """
     best = {}
     if os.path.isfile(paf_path):
@@ -1501,8 +1517,41 @@ def _filter_redundant_to_protected(paf_path, backbone_fa, out_fa, cov_thr=0.95, 
                 cur = best.get(qname, (0.0, 0.0))
                 if cov > cur[0] or (abs(cov - cur[0]) < 1e-12 and ident > cur[1]):
                     best[qname] = (cov, ident)
+    return best
 
+
+def _filter_redundant_to_protected(paf_path, backbone_fa, out_fa, cov_thr=0.95, id_thr=0.95):
+    """Remove backbone contigs that are redundant to the protected telomere pool.
+
+    Uses PAF from minimap2 alignment of backbone vs protected pool.
+    Keeps backbone contigs that are NOT covered >= cov_thr with identity >= id_thr.
+    """
+    best = _parse_paf_best_hits(paf_path)
     drop = {q for q, (cov, ident) in best.items() if cov >= cov_thr and ident >= id_thr}
+
+    recs = [(n, s) for n, s in _read_fasta_records(backbone_fa) if n not in drop]
+    _write_fasta(recs, out_fa)
+    return len(drop)
+
+
+def _filter_fragments_to_protected(paf_path, backbone_fa, out_fa,
+                                   frag_cov_thr=0.50, frag_id_thr=0.90):
+    """Second-pass fragment removal: drop backbone contigs that are partial
+    copies of protected T2T chromosomes.
+
+    The strict 95%/95% pass catches near-identical contigs.  This pass catches
+    backbone FRAGMENTS — contigs where ≥50% of their length aligns to a T2T
+    contig at ≥90% identity.  These are partial chromosome copies that carry
+    duplicated gene content but are too divergent for the strict filter.
+
+    For a genome where all chromosomes already have T2T representatives in the
+    protected pool, any backbone contig that substantially aligns to T2T is
+    redundant by definition — it represents a worse version of an already-
+    complete chromosome.
+    """
+    best = _parse_paf_best_hits(paf_path)
+    drop = {q for q, (cov, ident) in best.items()
+            if cov >= frag_cov_thr and ident >= frag_id_thr}
 
     recs = [(n, s) for n, s in _read_fasta_records(backbone_fa) if n not in drop]
     _write_fasta(recs, out_fa)
@@ -1694,12 +1743,96 @@ def step_12_refine(runner):
             # Lower thresholds (60%/90%) were tried but WORSENED duplication
             # by dropping clean backbone contigs and replacing them with dirty
             # pool contigs from high-D assemblers.
+            # Pass 1 — strict: drop near-identical contigs (95%/95%)
             n_dropped = _filter_redundant_to_protected(
                 paf, backbone_fa, "assemblies/backbone.filtered.fa",
                 cov_thr=float(os.environ.get("PROTECT_COV", "0.95")),
                 id_thr=float(os.environ.get("PROTECT_ID", "0.95")),
             )
-            runner.log(f"Removed {n_dropped} backbone contigs redundant to protected pool")
+            runner.log(f"Pass 1 (strict): removed {n_dropped} backbone contigs "
+                       f"redundant to protected pool (95%/95%)")
+
+            # Pass 2 — Redundans reduction: detect and remove redundant
+            # heterozygous/duplicate contigs among surviving backbone contigs.
+            # Uses Redundans (Gabaldonlab) with --noscaffolding --nogapclosing
+            # to perform only the reduction step, which is smarter than simple
+            # overlap-based filtering because it considers heterozygous pairs.
+            # Fallback: if redundans.py is not available, use the minimap2-based
+            # fragment removal as before.
+            if shutil.which("redundans.py"):
+                runner.log_info("Running Redundans reduction on backbone contigs")
+                runner.log_version("redundans.py", "redundans.py")
+                redundans_dir = "assemblies/redundans_reduce"
+                if os.path.isdir(redundans_dir):
+                    shutil.rmtree(redundans_dir)
+
+                # Redundans reduction: identity=0.51 overlap=0.80 are defaults.
+                # For genome assemblies with separate haplotype fragments from
+                # different assemblers, the defaults work well.  We pass
+                # --minimap2reduce for speed since minimap2 is already available.
+                # If --fasta (external) was provided, it serves as a reference
+                # FASTA and is passed to Redundans via -r for reference-guided
+                # reduction.  For pure de novo runs (no --fasta), only the
+                # contig-vs-contig reduction is performed.
+                ext_ref = ""
+                if runner.external_fasta and os.path.isfile(runner.external_fasta) \
+                   and os.path.getsize(runner.external_fasta) > 0:
+                    ext_ref = f"-r {runner.external_fasta} "
+                    runner.log_info(f"Using external FASTA as reference for Redundans: "
+                                    f"{runner.external_fasta}")
+
+                red_cmd = (
+                    f"redundans.py "
+                    f"-f assemblies/backbone.filtered.fa "
+                    f"{ext_ref}"
+                    f"-o {redundans_dir} "
+                    f"-t {runner.threads} "
+                    f"--noscaffolding --nogapclosing "
+                    f"--minimap2reduce "
+                    f"--identity {os.environ.get('RED_IDENTITY', '0.51')} "
+                    f"--overlap {os.environ.get('RED_OVERLAP', '0.80')} "
+                    f"--minLength 200"
+                )
+                result = subprocess.run(red_cmd, shell=True, capture_output=True, text=True)
+                runner.log(f"  redundans.py stdout: {result.stdout.strip()}")
+                if result.stderr.strip():
+                    runner.log(f"  redundans.py stderr: {result.stderr.strip()[:500]}")
+
+                # Redundans writes reduced contigs to <outdir>/contigs.reduced.fa
+                reduced_fa = os.path.join(redundans_dir, "contigs.reduced.fa")
+                if os.path.isfile(reduced_fa) and os.path.getsize(reduced_fa) > 0:
+                    before_n = len(list(_read_fasta_records("assemblies/backbone.filtered.fa")))
+                    after_recs = list(_read_fasta_records(reduced_fa))
+                    n_removed = before_n - len(after_recs)
+                    runner.log(f"Pass 2 (Redundans reduction): removed {n_removed} "
+                               f"redundant backbone contigs ({before_n} → {len(after_recs)})")
+                    shutil.copy(reduced_fa, "assemblies/backbone.filtered.fa")
+                else:
+                    runner.log_warn("Redundans reduction produced no output; keeping previous backbone")
+            else:
+                # Fallback: minimap2-based fragment removal (50%/90%)
+                runner.log_info("redundans.py not found; using minimap2 fragment removal fallback")
+                frag_paf = "assemblies/backbone_frag_vs_protected.paf"
+                cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                       f"assemblies/protected.telomere.fa assemblies/backbone.filtered.fa")
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                with open(frag_paf, "w") as f:
+                    f.write(result.stdout)
+
+                n_frag = _filter_fragments_to_protected(
+                    frag_paf,
+                    "assemblies/backbone.filtered.fa",
+                    "assemblies/backbone.filtered.defrag.fa",
+                    frag_cov_thr=float(os.environ.get("FRAG_COV", "0.50")),
+                    frag_id_thr=float(os.environ.get("FRAG_ID", "0.90")),
+                )
+                if n_frag > 0:
+                    runner.log(f"Pass 2 (fragment fallback): removed {n_frag} backbone "
+                               f"fragments partially covered by T2T contigs (50%/90%)")
+                    shutil.copy("assemblies/backbone.filtered.defrag.fa",
+                                "assemblies/backbone.filtered.fa")
+                else:
+                    runner.log("Pass 2 (fragment fallback): no additional fragments removed")
         else:
             runner.log_warn("minimap2 not found; cannot filter redundant backbone contigs.")
             shutil.copy(backbone_fa, "assemblies/backbone.filtered.fa")
@@ -1794,6 +1927,145 @@ def step_12_refine(runner):
         shutil.copy(asm_fa, raw_out)
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
+
+    # ---- 12G2. Redundans scaffolding + gap closing ----
+    # Use the original long reads (HiFi/ONT) to scaffold backbone fragments
+    # and close gaps.  This can reduce fragmentation by joining backbone
+    # contigs that share read evidence.  Protected T2T contigs are already in
+    # the assembly — Redundans will try to scaffold them with backbone
+    # fragments where read support exists.
+    # Only the scaffolding + gap-closing steps are run (--noreduction) because
+    # reduction was already performed on the backbone in step 12D Pass 2.
+    #
+    # Reference-guided vs de novo:
+    # - If --fasta (external) was provided, it is passed to Redundans as
+    #   -r (reference) for reference-guided scaffolding.  This allows
+    #   Redundans to use the reference chromosome structure to order and
+    #   orient contigs.
+    # - For pure de novo runs (no --fasta), scaffolding relies solely on
+    #   long-read evidence to join contigs.
+    if shutil.which("redundans.py") and os.path.isfile(raw_out) and \
+       os.path.getsize(raw_out) > 0:
+        runner.log_info("Running Redundans scaffolding + gap closing with long reads")
+
+        redundans_scaffold_dir = "assemblies/redundans_scaffold"
+        if os.path.isdir(redundans_scaffold_dir):
+            shutil.rmtree(redundans_scaffold_dir)
+
+        # Determine minimap2 preset based on platform
+        mm2_preset = "map-hifi"
+        if hasattr(runner, 'platform') and runner.platform:
+            if "nano" in runner.platform.lower():
+                mm2_preset = "map-ont"
+            elif "clr" in runner.platform.lower() or runner.platform.lower() == "pacbio":
+                mm2_preset = "map-pb"
+
+        # Build reference flag: --fasta (external) serves as reference FASTA
+        ext_ref_flag = ""
+        if runner.external_fasta and os.path.isfile(runner.external_fasta) \
+           and os.path.getsize(runner.external_fasta) > 0:
+            ext_ref_flag = f"-r {runner.external_fasta} "
+            runner.log_info(f"Reference-guided scaffolding using external FASTA: "
+                            f"{runner.external_fasta}")
+        else:
+            runner.log_info("De novo scaffolding (no external reference provided)")
+
+        red_scaffold_cmd = (
+            f"redundans.py "
+            f"-f {raw_out} "
+            f"-l {runner.fastq} "
+            f"{ext_ref_flag}"
+            f"-o {redundans_scaffold_dir} "
+            f"-t {runner.threads} "
+            f"--noreduction "
+            f"-p {mm2_preset} "
+            f"--minLength 200"
+        )
+        result = subprocess.run(red_scaffold_cmd, shell=True,
+                                capture_output=True, text=True)
+        runner.log(f"  redundans scaffold stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            runner.log(f"  redundans scaffold stderr: {result.stderr.strip()[:500]}")
+
+        # Redundans writes final output to scaffolds.filled.fa (if gap closing ran)
+        # or scaffolds.fa (if only scaffolding), or contigs.reduced.fa (reduction only)
+        scaffolded_fa = None
+        for candidate in [
+            os.path.join(redundans_scaffold_dir, "scaffolds.filled.fa"),
+            os.path.join(redundans_scaffold_dir, "scaffolds.fa"),
+        ]:
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                scaffolded_fa = candidate
+                break
+
+        if scaffolded_fa:
+            before_recs = list(_read_fasta_records(raw_out))
+            after_recs = list(_read_fasta_records(scaffolded_fa))
+            before_len = sum(len(s) for _, s in before_recs)
+            after_len = sum(len(s) for _, s in after_recs)
+            runner.log(f"Redundans scaffold: {len(before_recs)} → {len(after_recs)} "
+                       f"contigs/scaffolds, {before_len:,} → {after_len:,} bp")
+            shutil.copy(scaffolded_fa, raw_out)
+        else:
+            runner.log_warn("Redundans scaffolding produced no output; keeping pre-scaffold assembly")
+    elif not shutil.which("redundans.py"):
+        runner.log_info("redundans.py not found; skipping scaffolding + gap closing")
+
+    # ---- 12H. Genome-size-aware pruning ----
+    # If total assembly size exceeds the expected genome size by >15%,
+    # the smallest non-T2T backbone contigs (most likely redundant fragments)
+    # are removed until the assembly is within budget.
+    # This catches fragments that passed both the strict and relaxed filters
+    # but still inflate assembly size and BUSCO D.
+    expected_size = _parse_genome_size(runner.genomesize)
+    if expected_size > 0:
+        all_recs = list(_read_fasta_records(raw_out))
+        total_len = sum(len(s) for _, s in all_recs)
+        budget = int(expected_size * 1.15)  # 15% tolerance
+
+        if total_len > budget:
+            runner.log_warn(
+                f"Assembly size {total_len:,} bp exceeds expected "
+                f"{expected_size:,} bp + 15% = {budget:,} bp"
+            )
+            # Identify protected T2T contig names (they must not be removed)
+            protected_names = set()
+            if os.path.isfile(prot):
+                for name, _ in _read_fasta_records(prot):
+                    protected_names.add(name)
+
+            # Split into protected (keep unconditionally) and removable
+            keep_always = [(n, s) for n, s in all_recs if n in protected_names]
+            removable = [(n, s) for n, s in all_recs if n not in protected_names]
+
+            # Sort removable by length ascending — remove smallest first
+            # (smallest fragments are most likely to be redundant junk)
+            removable.sort(key=lambda x: len(x[1]))
+
+            keep_len = sum(len(s) for _, s in keep_always)
+            kept_backbone = []
+            running_len = keep_len
+            # Walk from largest to smallest, adding back until budget reached
+            for name, seq in reversed(removable):
+                if running_len + len(seq) <= budget:
+                    kept_backbone.append((name, seq))
+                    running_len += len(seq)
+                else:
+                    runner.log(f"  Pruning '{name}' ({len(seq):,} bp) — "
+                               f"would exceed genome-size budget")
+
+            n_pruned = len(removable) - len(kept_backbone)
+            if n_pruned > 0:
+                final_recs = keep_always + kept_backbone
+                _write_fasta(final_recs, raw_out)
+                new_total = sum(len(s) for _, s in final_recs)
+                runner.log(f"Genome-size pruning: removed {n_pruned} small backbone "
+                           f"fragments ({total_len:,} → {new_total:,} bp)")
+            else:
+                runner.log("Genome-size pruning: no contigs removed")
+        else:
+            runner.log(f"Assembly size {total_len:,} bp within budget "
+                       f"({budget:,} bp) — no pruning needed")
 
     n_sorted = _fasta_sort_minlen(raw_out,
                                    f"merged_{assembler}_sort.fa",

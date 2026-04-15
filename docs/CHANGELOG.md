@@ -193,6 +193,48 @@ larger chromosomes — untouched.
 
 ---
 
+### Step 12 — Redundans integration for reduction, scaffolding, and gap closing (`steps.py`, `taco-env.yml`)
+
+**Problem:** The custom minimap2-based fragment removal (Pass 2 at 50%/90%)
+only catches backbone contigs that partially align to a protected T2T contig.
+It misses redundant heterozygous pairs among the backbone contigs themselves,
+and it cannot join fragmented backbone contigs or close assembly gaps.
+Additionally, `redundans.py` was listed in `TACO.sh`'s requirements check
+(line 772) but was never actually called and was missing from `taco-env.yml`.
+
+**Fix — three-stage Redundans integration:**
+
+1. **Redundans reduction (Step 12D, Pass 2).** After the strict 95%/95%
+   minimap2 dedup, the surviving backbone contigs are passed to
+   `redundans.py --noscaffolding --nogapclosing --minimap2reduce`.  Redundans
+   detects and removes heterozygous/duplicate contigs using its internal
+   alignment + identity/overlap logic (defaults: identity ≥ 0.51,
+   overlap ≥ 0.80).  Thresholds are overridable via `RED_IDENTITY` and
+   `RED_OVERLAP` environment variables.
+
+2. **Redundans scaffolding + gap closing (Step 12G2, after final combine).**
+   The full combined assembly (protected T2T + backbone) is passed to
+   `redundans.py --noreduction` with the original long reads (`-l`).  This
+   step joins backbone fragments using read evidence (scaffolding) and fills
+   the gaps using the same reads (gap closing).  The minimap2 preset is
+   auto-selected from `--platform` (map-hifi, map-ont, map-pb).
+
+3. **Fallback.** If `redundans.py` is not installed, step 12D falls back to
+   the minimap2-based fragment removal (50%/90%), and scaffolding/gap-closing
+   is skipped with an informational message.
+
+**Reference-guided vs de novo mode:**  When `--fasta` (external) is provided,
+it is passed to Redundans as `-r` (reference) for both reduction and
+scaffolding.  This enables reference-guided scaffolding where Redundans uses
+the reference chromosome structure to order and orient contigs.  For pure de
+novo runs (no `--fasta`), Redundans operates without a reference and relies
+solely on contig-vs-contig alignment (reduction) and long-read evidence
+(scaffolding).  The README documents this dual-mode behaviour.
+
+`taco-env.yml` now includes `redundans` from bioconda.
+
+---
+
 ### Clustering — query-only coverage and telomere score tiebreaker (`clustering.py`)
 
 **Problem:** `parse_paf_and_cluster` computed coverage as

@@ -118,7 +118,7 @@ taco -g 12m -t 16 \
 | `-m`, `--motif` | Telomere motif or seed motif |
 | `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio` |
 | `-s`, `--steps` | Run selected steps only (e.g., `1,3-5`) |
-| `--fasta` | External pre-assembled FASTA to include in comparison |
+| `--fasta` | External pre-assembled FASTA to include in comparison. Also used as the reference genome for Redundans reference-guided scaffolding in Step 12. When omitted, Step 12 runs in pure de novo mode (long-read-only scaffolding). |
 | `--busco` | Run BUSCO (optionally specify lineage dataset) |
 | `--choose` | Manually choose the backbone assembler |
 | `--assembly-only` | Stop after assembler comparison |
@@ -203,6 +203,30 @@ BUSCO single-copy completeness (S%) is used instead of total completeness (C%) t
 ### N50-only Mode
 
 `--auto-mode n50` selects the assembly with the highest N50. This reproduces legacy behavior but may favor contiguous assemblies that lack completeness.
+
+## Step 12 — Backbone Refinement with Redundans
+
+Step 12 refines the backbone assembly in several sub-steps: redundancy reduction against the protected T2T pool, Redundans-based reduction of remaining heterozygous duplicates, telomere rescue, and Redundans scaffolding + gap closing with the original long reads.
+
+### Redundans Integration
+
+TACO uses [Redundans](https://github.com/Gabaldonlab/redundans) (Pryszcz & Gabaldón 2016) for three purposes in Step 12:
+
+1. **Redundancy reduction** (Step 12D Pass 2) — After removing backbone contigs near-identical to T2T contigs (95%/95%), Redundans detects and removes heterozygous/duplicate contigs among the surviving backbone. Thresholds: identity >= 0.51, overlap >= 0.80 (configurable via `RED_IDENTITY` / `RED_OVERLAP` environment variables).
+
+2. **Long-read scaffolding** (Step 12G2) — The combined assembly (protected T2T + backbone) is scaffolded using the original sequencing reads (HiFi, ONT, or CLR). This can join fragmented backbone contigs where read evidence supports a join.
+
+3. **Gap closing** (Step 12G2) — Gaps introduced during scaffolding are filled using the same long reads.
+
+### Reference-Guided vs De Novo Mode
+
+The `--fasta` parameter controls whether Redundans operates in reference-guided or de novo mode:
+
+- **With `--fasta`**: The external FASTA is treated as a reference genome and passed to Redundans via `-r`. This enables reference-guided scaffolding where Redundans uses the reference chromosome structure to order and orient contigs, in addition to the long-read evidence.
+
+- **Without `--fasta`** (pure de novo): Scaffolding relies solely on long-read evidence to join contigs. No external reference is used. This is the standard mode for de novo genome assembly projects.
+
+If `redundans.py` is not installed, TACO falls back to a minimap2-based fragment removal for reduction and skips scaffolding/gap closing.
 
 ## Output Structure
 
