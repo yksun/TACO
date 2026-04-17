@@ -154,6 +154,43 @@ TACO supports three sequencing platforms. Each assembler receives platform-appro
 
 Incompatible assemblers are automatically skipped with a warning. IPA and hifiasm only support PacBio HiFi reads. Peregrine does not support Nanopore reads.
 
+### Platform-Specific Assembler Flags
+
+Each assembler receives the appropriate read-type flag automatically:
+
+| Assembler | HiFi | Nanopore | CLR |
+|---|---|---|---|
+| Canu | `-pacbio-hifi` | `-nanopore` | `-pacbio` |
+| Flye | `--pacbio-hifi` | `--nano-hq` (Q20+) | `--pacbio-raw` |
+| Hifiasm | default mode | skipped | skipped |
+| IPA | default mode | skipped | skipped |
+| Peregrine | default mode | skipped | default mode |
+| NextDenovo | via config file | via config file | via config file |
+
+For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` in the environment.
+
+### Platform-Specific Polishing Strategy
+
+| Platform | Polishing Tool | Notes |
+|---|---|---|
+| HiFi | Skipped (NextPolish2 if installed) | HiFi reads are ~Q40+ accuracy; polishing has minimal benefit |
+| Nanopore | Medaka (Racon fallback) | Neural-network polisher; set `MEDAKA_MODEL` for non-default chemistry |
+| CLR | Racon | Standard error-correction for CLR reads |
+
+### Combined Platform × Taxon Strategy Overview
+
+| Component | Fungal | Plant | Vertebrate/Animal | Insect/Other |
+|---|---|---|---|---|
+| **Telomere motifs** | TTAGGG + TG1-3 + Candida | TTTAGGG | TTAGGG | TTAGG (insect) / all (other) |
+| **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
+| **Backbone T2T weight** | 350 (high) | 200 (reduced) | 200 (reduced) | 300 (default) |
+| **BUSCO D penalty** | 600 (strict) | 300 (relaxed) | 500 (default) | 500 (default) |
+| **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2% (default) |
+| **purge_dups mode** | single-round | two-round + polyploid warning | two-round | single-round |
+| **Polishing (HiFi)** | skip | skip | skip | skip |
+| **Polishing (ONT)** | Medaka → Racon | Medaka → Racon | Medaka → Racon | Medaka → Racon |
+| **Polishing (CLR)** | Racon | Racon | Racon | Racon |
+
 ## Pipeline Steps
 
 | Step | Description |
@@ -212,19 +249,51 @@ Contigs are classified into three tiers based on their end scores: **strict T2T*
 
 ## Assembly Selection Strategy
 
-When `--choose` is not provided, TACO automatically selects the backbone assembly for refinement.
+When `--choose` is not provided, TACO automatically selects the backbone assembly for refinement. The scoring formula adapts its weights based on `--taxon` to match the biological characteristics of each organism group.
 
 ### Smart Scoring (default)
 
-TACO ranks assemblies using a composite score that prioritizes biological completeness and chromosome-end support:
+TACO ranks assemblies using a composite score:
 
 ```
-score = BUSCO_S * 1000 + T2T * 300 + single_tel * 150
-      + MerquryComp * 200 + MerquryQV * 20
-      - contigs * 30 + log10(N50) * 150
+score = BUSCO_S × w_busco_s + T2T × w_t2t + single_tel × w_single
+      + MerquryComp × 200 + MerquryQV × 20
+      - contigs × w_contigs + log10(N50) × w_n50
+      - BUSCO_D × w_busco_d
 ```
 
-BUSCO single-copy completeness (S%) is used instead of total completeness (C%) to avoid rewarding highly duplicated assemblies. Telomere metrics contribute meaningfully but do not dominate, since the telomere pool can rescue missing ends during refinement. Merqury metrics are included when available.
+BUSCO single-copy completeness (S%) is used instead of total completeness (C%) to avoid rewarding highly duplicated assemblies. BUSCO duplication (D%) is explicitly penalised. The weights are tuned per taxon as described below.
+
+### Taxon-Specific Scoring Strategies
+
+**Fungal** (`--taxon fungal`): Fungal genomes are typically small (10–60 Mb) with well-defined chromosomes. TACO uses strict BUSCO duplicate penalty (`w_busco_d = 600`) because duplicated assemblies are almost always artefactual in haploid fungi. T2T contigs are weighted heavily (`w_t2t = 350`) since telomere rescue is highly effective for small genomes where individual T2T chromosomes can be resolved. The contig-count penalty remains moderate (`w_contigs = 30`) because most fungal genomes have few chromosomes.
+
+**Plant** (`--taxon plant`): Plant genomes vary enormously in size and ploidy. TACO relaxes the BUSCO duplicate penalty (`w_busco_d = 300`) because polyploidy naturally inflates D% even in correct assemblies. The contig-count penalty is increased (`w_contigs = 50`) to discourage fragmented assemblies in these often large genomes. T2T weight is reduced (`w_t2t = 200`) because long repetitive arrays near telomeres can produce false-positive signals, and interstitial telomeric repeats (ITRs) are common in plants.
+
+**Vertebrate / Animal** (`--taxon vertebrate` or `--taxon animal`): Vertebrate genomes are large (1–3+ Gb) and repeat-rich. TACO increases the N50 weight (`w_n50 = 200`) to favour contiguous assemblies and moderates the contig-count penalty (`w_contigs = 40`). T2T weight is reduced (`w_t2t = 200`) because interstitial telomeric repeats are frequent in vertebrates and can inflate telomere counts. BUSCO duplicate penalty stays at the default (`w_busco_d = 500`).
+
+**Insect / Other** (`--taxon insect` or `--taxon other`): These taxa use the balanced default weights: `w_busco_s = 1000`, `w_t2t = 300`, `w_single = 150`, `w_contigs = 30`, `w_n50 = 150`, `w_busco_d = 500`. This is appropriate when the biological characteristics of the target organism are not well characterised.
+
+| Weight | Fungal | Plant | Vertebrate/Animal | Insect/Other |
+|---|---|---|---|---|
+| `w_busco_s` | 1000 | 1000 | 1000 | 1000 |
+| `w_t2t` | 350 | 200 | 200 | 300 |
+| `w_single` | 150 | 150 | 150 | 150 |
+| `w_contigs` | 30 | 50 | 40 | 30 |
+| `w_n50` | 150 | 150 | 200 | 150 |
+| `w_busco_d` | 600 | 300 | 500 | 500 |
+
+### Taxon-Specific Telomere Detection Windows
+
+The default telomere score window also varies by taxon to match typical telomere array lengths: fungi use 300 bp (fungal telomere arrays are short, often 50–300 bp), plants and vertebrates use 1000 bp (longer repeat arrays), and other taxa use 500 bp (balanced default).
+
+### Taxon-Specific BUSCO Trial Thresholds (Step 12F)
+
+When validating rescue candidates via BUSCO trial, the maximum acceptable C% drop and M% rise depend on taxon: fungi use strict thresholds (2% C-drop, 0.3% M-rise) appropriate for haploid genomes with stable BUSCO profiles; plants use relaxed thresholds (4% C-drop, 1.0% M-rise) because polyploidy causes natural BUSCO variability; vertebrates use moderate thresholds (3% C-drop, 0.5% M-rise). All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP` and `STEP12_MAX_BUSCO_M_RISE` environment variables.
+
+### Taxon-Specific purge_dups Behaviour (Step 12H)
+
+purge_dups uses single-round purging for fungal, insect, and other genomes to avoid over-purging small or simple genomes. For vertebrate, animal, and plant genomes, two-round purging (`-2` flag) is used for more thorough cleanup of larger, more complex genomes. A warning is emitted for plant genomes because purge_dups may incorrectly collapse homeologous sequences in polyploid species — use `--no-purge-dups` if this is a concern.
 
 ### N50-only Mode
 
