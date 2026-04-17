@@ -535,10 +535,42 @@ def step_01_canu(runner):
 
     cmd = (f"canu -p canu -d hicanu genomeSize={runner.genomesize} "
            f"maxThreads={runner.threads} {canu_flag} {runner.fastq}")
-    result = runner.run_cmd(cmd, desc="Running canu", check=False)
+
+    # Run canu with stderr/stdout captured so we can report the actual error.
+    # Canu dev builds from bioconda frequently fail with broken Java (JLI_StringDup).
+    runner.log(f"Running canu")
+    runner.log(f"$ {cmd}")
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        runner.log_warn("Step 1: canu failed. Skipping. Other assemblers will continue. "
-                        "Check logs/step_1.log for details.")
+        # Log captured stderr/stdout for diagnosis
+        err_snippet = (result.stderr or "").strip()
+        out_snippet = (result.stdout or "").strip()
+        if err_snippet:
+            # Show first ~20 lines of stderr
+            err_lines = err_snippet.split("\n")[:20]
+            for line in err_lines:
+                runner.log_warn(f"  canu stderr: {line}")
+        if out_snippet and not err_snippet:
+            out_lines = out_snippet.split("\n")[:10]
+            for line in out_lines:
+                runner.log_warn(f"  canu stdout: {line}")
+
+        # Detect common failure modes and give actionable guidance
+        combined = (err_snippet + out_snippet).lower()
+        if "jli_stringdup" in combined or "undefined symbol" in combined:
+            runner.log_warn("This is the known bioconda canu Java runtime bug. "
+                            "Fix: install a stable canu binary from "
+                            "https://github.com/marbl/canu/releases "
+                            "(not from conda) and place it on PATH.")
+        elif "java" in combined and ("error" in combined or "exception" in combined):
+            runner.log_warn("Canu Java runtime error. Try: "
+                            "conda install -c conda-forge 'openjdk>=17' "
+                            "or install canu from GitHub releases.")
+        elif "no reads" in combined or "no input" in combined:
+            runner.log_warn("Canu could not find input reads. "
+                            f"Check that {runner.fastq} exists and is readable.")
+
+        runner.log_warn("Step 1: canu failed. Skipping. Other assemblers will continue.")
 
 
 def step_02_nextdenovo(runner):
