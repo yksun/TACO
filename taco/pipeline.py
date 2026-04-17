@@ -193,18 +193,34 @@ class PipelineRunner:
     # ------------------------------------------------------------------ #
     def log_version(self, label, cmd):
         """Try to capture the version of *cmd* and return the first line."""
-        for flag in ["--version", "-V", "-v", "version"]:
+        # Some tools (seqtk, bwa) print usage on stderr when given any flag
+        # and exit non-zero.  We try common flags in order, accept output from
+        # any, and fall back to capturing the first useful stderr line.
+        for flag in ["--version", "-V", "-v", "version", ""]:
             try:
                 r = subprocess.run(
-                    f"{cmd} {flag}",
+                    f"{cmd} {flag}".strip(),
                     shell=True,
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
-                out = (r.stdout or r.stderr or "").strip()
-                if out:
-                    return out.split("\n")[0]
+                out = (r.stdout or "").strip()
+                err = (r.stderr or "").strip()
+                # Prefer stdout, fall back to stderr
+                text = out or err
+                if text:
+                    first = text.split("\n")[0]
+                    # Skip lines that are just "Usage:" or "unrecognized command"
+                    if "unrecognized command" in first or first.startswith("Usage"):
+                        # Try to find a version-like line
+                        for line in text.split("\n"):
+                            if any(kw in line.lower() for kw in
+                                   ["version", "v0.", "v1.", "v2.", "v3."]):
+                                return line.strip()
+                        # Return first non-empty line as fallback
+                        return first
+                    return first
             except Exception:
                 pass
         return "unknown"
@@ -223,7 +239,8 @@ class PipelineRunner:
         tools = [
             "canu", "nextDenovo", "pg_asm", "ipa", "flye", "hifiasm",
             "seqtk", "busco", "minimap2", "bwa", "samtools",
-            "merge_wrapper.py", "python3",
+            "merge_wrapper.py", "python3", "purge_dups", "racon",
+            "medaka", "merqury.sh",
         ]
         for t in tools:
             if shutil.which(t) or shutil.which(t.replace(".py", "")):

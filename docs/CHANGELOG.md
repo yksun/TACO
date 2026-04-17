@@ -50,6 +50,10 @@ is an optional override.
 - **New** output files: `single_tel.replaced.debug.tsv` (all hits),
   `single_tel.candidates.tsv` (plausible candidates),
   `rescue_rejection_summary.txt`, `rescue_trial_summary.tsv`.
+- **New** provenance GFF3: `final.merged.provenance.gff3` documents the
+  source assembler, role (t2t_pool / backbone / rescue_donor), original
+  contig name, and replacement class for every contig in the final assembly.
+  Moved to `final_results/` during cleanup.
 - Structural screening thresholds: identity >= 0.85, aligned_bp >= 8000,
   cov_backbone >= 0.60, cov_donor >= 0.50, extension >= 1000,
   terminal touch window = 500 bp.  Configurable via environment variables.
@@ -111,6 +115,14 @@ is an optional override.
   after replacement.
 - **New** suspicious size-drop check: candidates causing >30% size drop
   are rejected.
+
+### Version detection improvements
+
+- **Improved** `version.txt` generation: better handling of tools that print
+  usage/help to stderr (e.g., seqtk, bwa).  Searches for version-like lines
+  in stderr when stdout is empty.
+- **New** `purge_dups`, `racon`, `medaka`, and `merqury.sh` added to the
+  version.txt tool list.
 
 ### Configurability improvements
 

@@ -352,6 +352,10 @@ After the rescued/combined assembly is produced, TACO runs purge_dups by default
 
 TACO is designed for producing a best primary-style chromosome-level assembly, not a fully phased diploid or polyploid reconstruction. For strongly diploid or polyploid genomes, telomere-bearing contigs from different haplotypes may appear as rescue donors, and purge_dups may collapse alternative haplotigs. This is acceptable when the goal is a cleaned primary reference assembly.
 
+### Provenance GFF3
+
+TACO writes a GFF3 annotation file (`final.merged.provenance.gff3`) alongside the final assembly. Each contig gets one GFF3 record spanning its full length, with attributes documenting where it came from: `source_assembler` (which assembler originally produced it), `role` (t2t_pool, backbone, or rescue_donor), `original_name` (name before the sort/rename step), and `replacement_class` (for rescue donors: fill_missing_end, replace_non_telo_backbone, replace_single_with_better, or replace_protected_t2t). This makes it straightforward to trace which regions of the final chromosome-level assembly came from which assembler and why.
+
 ## Output Structure
 
 ```
@@ -364,12 +368,13 @@ project_directory/
 │   ├── single_tel.replaced.debug.tsv    # All rescue alignment hits
 │   ├── single_tel.candidates.tsv        # Plausible rescue candidates
 │   ├── rescue_rejection_summary.txt     # Rejection reasons
-│   ├── rescue_trial_summary.tsv         # BUSCO trial results
+│   ├── rescue_trial_summary.tsv         # BUSCO trial results (with replacement_class, D%)
 │   ├── final_merge.raw.fasta            # Pre-purge combined assembly
 │   └── *.busco/                         # BUSCO results per assembly
 ├── final_results/
 │   ├── final_result.csv                 # Final comparison report
 │   ├── final_assembly.fasta             # Refined assembly (full mode)
+│   ├── final.merged.provenance.gff3     # GFF3 provenance: source assembler per contig
 │   └── assembly_only_result.csv         # Comparison summary (assembly-only)
 ├── telomere_pool/                       # Telomere pool intermediates
 ├── quast_results/                       # QUAST output
