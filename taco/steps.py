@@ -1452,6 +1452,28 @@ def _auto_select_backbone(runner):
     best_score = None
     records = []
 
+    # Taxon-aware scoring weights (defined outside loop so they're accessible
+    # for the decision file regardless of which assemblers were scored).
+    taxon = getattr(runner, 'taxon', 'other')
+    w_busco_s = 1000
+    w_t2t = 300
+    w_single = 150
+    w_contigs = 30
+    w_n50 = 150
+    w_busco_d = 500
+
+    if taxon == "fungal":
+        w_busco_d = 600  # penalize duplication more strongly
+        w_t2t = 350      # telomere rescue is strong for small genomes
+    elif taxon == "plant":
+        w_contigs = 50   # penalize fragmentation more
+        w_busco_d = 300  # relax D penalty (polyploidy inflates D)
+        w_t2t = 200      # reduce telomere weight (false signals from repeats)
+    elif taxon in ("vertebrate", "animal"):
+        w_contigs = 40   # penalize fragmentation moderately
+        w_n50 = 200      # stronger contiguity preference
+        w_t2t = 200      # reduce telomere weight (ITRs common)
+
     for idx, asm in enumerate(header[1:], start=1):
         asm = asm.strip()
         if not asm:
@@ -1476,34 +1498,6 @@ def _auto_select_backbone(runner):
         else:
             if contigs <= 0 or n50 <= 0:
                 continue
-
-            # Taxon-aware scoring weights
-            # - Fungi (small genomes): stronger telomere rescue weight,
-            #   high BUSCO_D penalty (duplicated assemblies look falsely good)
-            # - Plants: stronger fragmentation penalty, moderate BUSCO_D
-            #   (polyploidy can inflate D naturally)
-            # - Vertebrate/animal: stronger contiguity preference,
-            #   conservative telomere weight (large repeat-rich chromosomes)
-            # - Insect/other: balanced defaults
-            taxon = getattr(runner, 'taxon', 'other')
-            w_busco_s = 1000
-            w_t2t = 300
-            w_single = 150
-            w_contigs = 30
-            w_n50 = 150
-            w_busco_d = 500
-
-            if taxon == "fungal":
-                w_busco_d = 600  # penalize duplication more strongly
-                w_t2t = 350      # telomere rescue is strong for small genomes
-            elif taxon == "plant":
-                w_contigs = 50   # penalize fragmentation more
-                w_busco_d = 300  # relax D penalty (polyploidy inflates D)
-                w_t2t = 200      # reduce telomere weight (false signals from repeats)
-            elif taxon in ("vertebrate", "animal"):
-                w_contigs = 40   # penalize fragmentation moderately
-                w_n50 = 200      # stronger contiguity preference
-                w_t2t = 200      # reduce telomere weight (ITRs common)
 
             score = (
                 busco_s * w_busco_s
@@ -1545,7 +1539,12 @@ def _auto_select_backbone(runner):
         f.write(f"auto_mode\t{mode}\n")
         f.write(f"selected_assembler\t{best_name or ''}\n")
         f.write(f"selected_score\t{best_score if best_score is not None else ''}\n")
-        f.write("score_formula\tBUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200 + MerquryQV*20 - contigs*30 + log10(N50)*150 - BUSCO_D*500\n")
+        # Note: MerquryComp and MerquryQV contribute 0 when Merqury is not enabled
+        has_merqury = any(r["merqury_qv"] > 0 or r["merqury_comp"] > 0 for r in records)
+        if has_merqury:
+            f.write(f"score_formula\tBUSCO_S*{w_busco_s} + T2T*{w_t2t} + single*{w_single} + MerquryComp*200 + MerquryQV*20 - contigs*{w_contigs} + log10(N50)*{w_n50} - BUSCO_D*{w_busco_d} (taxon={taxon})\n")
+        else:
+            f.write(f"score_formula\tBUSCO_S*{w_busco_s} + T2T*{w_t2t} + single*{w_single} - contigs*{w_contigs} + log10(N50)*{w_n50} - BUSCO_D*{w_busco_d} (taxon={taxon}, Merqury not available)\n")
 
     return best_name
 
@@ -2255,11 +2254,14 @@ def step_12_refine(runner):
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
-    # ---- 12A. Optional Merqury pre-selection ----
+    # ---- 12A. Merqury QV scoring (optional, auto-detected if installed) ----
     if runner.merqury_enable:
+        db_src = runner.merqury_db or "(auto-detected)"
+        runner.log_info(f"Merqury enabled (db: {db_src})")
         _run_merqury_preselection(runner)
     else:
-        runner.log_info("Merqury disabled for this run")
+        runner.log_info("Merqury scoring not available (install merqury + provide .meryl db, "
+                        "or use --merqury/--merqury-db to enable)")
 
     _write_merqury_csv()
     _build_assembly_info(runner)

@@ -86,11 +86,36 @@ class PipelineRunner:
         self.busco_lineage = args.busco if args.busco else "ascomycota_odb10"
         self.run_busco = args.busco is not None
 
-        # Merqury
-        self.merqury_enable = args.merqury
+        # Merqury — auto-detect if installed and a .meryl database is found.
+        # Explicitly disabled with --no-merqury; explicitly enabled with
+        # --merqury or --merqury-db.  Otherwise, auto-enable when merqury.sh
+        # is on PATH and a .meryl directory is discoverable.
         self.merqury_db = getattr(args, 'merqury_db', None)
-        if args.merqury_db:
+        if getattr(args, 'no_merqury', False):
+            self.merqury_enable = False
+        elif args.merqury or self.merqury_db:
             self.merqury_enable = True
+        else:
+            # Auto-detect: check if merqury.sh is installed and a .meryl db exists
+            import shutil as _shutil
+            merqury_bin = _shutil.which("merqury.sh")
+            auto_db = None
+            if merqury_bin:
+                for cand in ["reads.meryl", "meryl/reads.meryl",
+                             "merqury/reads.meryl"]:
+                    if os.path.isdir(cand):
+                        auto_db = cand
+                        break
+                if auto_db is None:
+                    import glob as _glob
+                    found = _glob.glob("*.meryl")
+                    if found:
+                        auto_db = found[0]
+            if merqury_bin and auto_db:
+                self.merqury_enable = True
+                self.merqury_db = auto_db
+            else:
+                self.merqury_enable = False
 
         # Derived paths
         fastq_name = os.path.basename(self.fastq)

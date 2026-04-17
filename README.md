@@ -97,7 +97,9 @@ taco -g 12m -t 16 \
   --assembly-only
 ```
 
-**With Merqury QV scoring:**
+**With Merqury QV scoring (optional, auto-detected if installed):**
+
+Merqury is automatically enabled when `merqury.sh` is on PATH and a `.meryl` database is found in the working directory. You can also specify the database explicitly:
 
 ```bash
 taco -g 12m -t 16 \
@@ -132,9 +134,9 @@ taco -g 12m -t 16 \
 | `--choose` | Manually choose the backbone assembler |
 | `--assembly-only` | Stop after assembler comparison |
 | `--auto-mode` | Backbone selection mode: `smart` (default) or `n50` |
-| `--merqury` | Enable Merqury with auto-detected `.meryl` database |
+| `--merqury` | Force-enable Merqury (auto-detected if `merqury.sh` + `.meryl` db found) |
 | `--merqury-db` | Enable Merqury with a specific `.meryl` database path |
-| `--no-merqury` | Disable Merqury even if available |
+| `--no-merqury` | Disable Merqury even if installed and auto-detected |
 | `--no-purge-dups` | Skip purge_dups after refinement |
 | `--no-polish` | Skip automatic polishing after refinement |
 
@@ -253,16 +255,16 @@ When `--choose` is not provided, TACO automatically selects the backbone assembl
 
 ### Smart Scoring (default)
 
-TACO ranks assemblies using a composite score:
+TACO ranks assemblies using a composite score. Merqury QV and completeness are included when available (optional — auto-detected if `merqury.sh` is installed and a `.meryl` database is found; otherwise these terms contribute 0):
 
 ```
 score = BUSCO_S × w_busco_s + T2T × w_t2t + single_tel × w_single
-      + MerquryComp × 200 + MerquryQV × 20
+      + MerquryComp × 200 + MerquryQV × 20      ← optional, 0 if Merqury not available
       - contigs × w_contigs + log10(N50) × w_n50
       - BUSCO_D × w_busco_d
 ```
 
-BUSCO single-copy completeness (S%) is used instead of total completeness (C%) to avoid rewarding highly duplicated assemblies. BUSCO duplication (D%) is explicitly penalised. The weights are tuned per taxon as described below.
+BUSCO single-copy completeness (S%) is used instead of total completeness (C%) to avoid rewarding highly duplicated assemblies. BUSCO duplication (D%) is explicitly penalised. When Merqury is available, its k-mer-based QV and completeness provide an independent quality signal that helps distinguish assemblies with similar BUSCO scores. The weights are tuned per taxon as described below.
 
 ### Taxon-Specific Scoring Strategies
 
@@ -305,7 +307,7 @@ Step 12 adopts a T2T-first assembly philosophy: T2T contigs from all assemblers 
 
 ### Step 12 Sub-step Flow
 
-1. **12A** — optional Merqury pre-selection.
+1. **12A** — Merqury QV scoring (optional; auto-detected if installed, or enabled with `--merqury`/`--merqury-db`).
 2. **12B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
 3. **12C** — prepare cleaned backbone + chimera safety check on protected pool.
 4. **12D** — T2T-first foundation building:
