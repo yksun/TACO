@@ -239,8 +239,8 @@ class PipelineRunner:
         tools = [
             "canu", "nextDenovo", "pg_asm", "ipa", "flye", "hifiasm",
             "seqtk", "busco", "minimap2", "bwa", "samtools",
-            "merge_wrapper.py", "python3", "purge_dups", "racon",
-            "medaka", "merqury.sh",
+            "merge_wrapper.py", "python3", "purge_dups", "nextPolish2",
+            "yak", "racon", "medaka", "merqury.sh",
         ]
         for t in tools:
             if shutil.which(t) or shutil.which(t.replace(".py", "")):

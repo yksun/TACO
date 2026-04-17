@@ -32,6 +32,8 @@ dependencies:
   # Post-assembly haplotig/duplicate purging (Step 12)
   - purge_dups
   # Polishing (auto-selected by --platform in Step 12)
+  - nextpolish2
+  - yak
   - racon
   - medaka
   # Download tools (used by pipeline.py for --external FASTA fetching)

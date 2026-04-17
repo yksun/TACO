@@ -67,8 +67,9 @@ is an optional override.
   Emits a warning for plant genomes (potential polyploid risk).
 - **New** automatic polishing runs by default after purge_dups (skip with
   `--no-polish`).  Platform-aware strategy:
-  - `--platform pacbio-hifi`: polishing skipped (HiFi reads are already
-    ~Q40+ accuracy); NextPolish2 used only if installed.
+  - `--platform pacbio-hifi`: NextPolish2 (k-mer-based polishing via yak
+    k-mer databases at k=21 and k=31).  Safe and effective for HiFi data.
+    Requires `nextpolish2` + `yak` installed; warns if missing.
   - `--platform nanopore`: Medaka (neural-network polisher) preferred;
     falls back to Racon if Medaka is not installed.
   - `--platform pacbio` (CLR): Racon.
@@ -151,6 +152,7 @@ is an optional override.
 
 - Removed `redundans` from `taco-env.yml`.
 - Added `purge_dups`, `racon`, and `medaka` to `taco-env.yml`.
+- Added `nextpolish2` and `yak` to `taco-env.yml` for default HiFi polishing.
 
 ### Taxon-aware score windows
 

@@ -147,7 +147,7 @@ Use `--assembly-only` when the goal is assembler benchmarking and comparison wit
 
 ## Sequencing Platform Support
 
-TACO supports three sequencing platforms. Each assembler receives platform-appropriate flags automatically. The platform also determines the default polishing strategy: HiFi assemblies skip polishing by default (already ~Q40+ accuracy; NextPolish2 used only if installed), Nanopore assemblies use Medaka (neural-network polisher; falls back to Racon), and CLR assemblies use Racon.
+TACO supports three sequencing platforms. Each assembler receives platform-appropriate flags automatically. The platform also determines the default polishing strategy: HiFi assemblies are polished with NextPolish2 by default (k-mer-based, safe for high-accuracy reads; requires `yak` for k-mer database construction), Nanopore assemblies use Medaka (neural-network polisher; falls back to Racon), and CLR assemblies use Racon.
 
 | Platform | `--platform` | Assemblers Used | Notes |
 |---|---|---|---|
@@ -176,7 +176,7 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 
 | Platform | Polishing Tool | Notes |
 |---|---|---|
-| HiFi | Skipped (NextPolish2 if installed) | HiFi reads are ~Q40+ accuracy; polishing has minimal benefit |
+| HiFi | NextPolish2 (yak k-mer based) | K-mer polishing corrects residual errors safely; requires `nextpolish2` + `yak` |
 | Nanopore | Medaka (Racon fallback) | Neural-network polisher; set `MEDAKA_MODEL` for non-default chemistry |
 | CLR | Racon | Standard error-correction for CLR reads |
 
@@ -337,7 +337,7 @@ Duplicate non-telomeric backbone contigs are aggressively removed (with taxon-aw
 6. **12F** — BUSCO trial validation: for each telomere-verified candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). Maximum accepted rescues are also taxon-aware (fungi: 20, plant: 8, vertebrate: 10, other: 15). An additional safety check rejects `replace_single_with_better` candidates if the replacement loses telomere evidence at either end.
 7. **12G** — final combine: T2T foundation + telomere-rescued backbone gap-fill.
 8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
-9. **12I** — automatic polishing: skip for HiFi (NextPolish2 if installed), Medaka for ONT (Racon fallback), Racon for CLR (skip with `--no-polish`).
+9. **12I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
 10. **12J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
 
 ### BUSCO Trial Validation
@@ -346,7 +346,7 @@ TACO validates each telomere rescue candidate by building a trial assembly where
 
 ### Post-Refinement Stack
 
-After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups behaviour is taxon-aware: vertebrate, animal, and plant genomes use two-round purging (`-2` flag) for more thorough cleanup of larger, more complex genomes, while fungal and insect genomes use single-round to avoid over-purging. A warning is emitted for plant genomes due to polyploid risk. This is followed by automatic polishing selected from `--platform`: HiFi assemblies skip polishing by default (already ~Q40+ accuracy; NextPolish2 applied only if installed), Nanopore assemblies use Medaka (falls back to Racon if Medaka is not installed), and CLR assemblies use Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish` respectively.
+After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups behaviour is taxon-aware: vertebrate, animal, and plant genomes use two-round purging (`-2` flag) for more thorough cleanup of larger, more complex genomes, while fungal and insect genomes use single-round to avoid over-purging. A warning is emitted for plant genomes due to polyploid risk. This is followed by automatic polishing selected from `--platform`: HiFi assemblies are polished with NextPolish2 by default (builds yak k-mer databases at k=21 and k=31 from HiFi reads, then applies k-mer-based correction — safe and effective for high-accuracy reads), Nanopore assemblies use Medaka (falls back to Racon if Medaka is not installed), and CLR assemblies use Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish` respectively.
 
 ### Diploid and Polyploid Note
 
@@ -420,7 +420,7 @@ TACO/
 
 **Telomere motif appears incorrect:** Do not force `--motif` unless the telomere repeat is biologically known for your species. Use `--taxon` to select the appropriate preset instead. TACO's built-in motif families cover canonical TTAGGG, budding yeast TG1-3, Candida, plant TTTAGGG, and insect TTAGG repeats.
 
-**purge_dups or polishing not running:** These tools must be installed in the conda environment. Use `conda install -c bioconda purge_dups racon medaka` or skip with `--no-purge-dups` / `--no-polish`. For Nanopore polishing, Medaka is preferred; if unavailable, Racon is used as fallback.
+**purge_dups or polishing not running:** These tools must be installed in the conda environment. Use `conda install -c bioconda purge_dups nextpolish2 yak racon medaka` or skip with `--no-purge-dups` / `--no-polish`. For HiFi polishing, NextPolish2 and yak are both required. For Nanopore polishing, Medaka is preferred; if unavailable, Racon is used as fallback.
 
 **`TACO.sh: command not found`:** Add the TACO directory to your PATH or run with the full path.
 

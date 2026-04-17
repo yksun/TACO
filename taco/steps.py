@@ -2241,9 +2241,9 @@ def _run_polishing(runner, input_fa, output_fa):
     """Run platform-appropriate polishing on the assembly.
 
     Platform selection logic:
-      - HiFi: Skip polishing by default (HiFi reads are ~Q40+, polishing has
-        minimal benefit and can introduce errors). If NextPolish2 is installed,
-        run it as an optional refinement.
+      - HiFi: NextPolish2 by default (k-mer-based, safe for HiFi assemblies).
+        Requires yak for k-mer database construction.  Falls back to skip if
+        NextPolish2 or yak is not installed.
       - ONT:  Medaka (preferred, neural-network-based) → Racon (fallback)
       - CLR:  Racon (standard for CLR polishing)
 
@@ -2252,33 +2252,70 @@ def _run_polishing(runner, input_fa, output_fa):
     platform = runner.platform or "pacbio-hifi"
 
     if platform == "pacbio-hifi":
-        # HiFi assemblies are already high-accuracy (~Q40+).
-        # Polishing is optional and may not improve quality.
+        # NextPolish2 uses yak k-mer databases (k=21 and k=31) to polish
+        # HiFi assemblies.  This is the recommended approach: k-mer-based
+        # polishing is safe for HiFi data and corrects residual errors
+        # without the risk of introducing new ones from read-alignment.
         np2_bin = shutil.which("nextPolish2") or shutil.which("nextpolish2")
-        if np2_bin:
-            runner.log_info("Polishing HiFi assembly with NextPolish2 (optional refinement)")
+        yak_bin = shutil.which("yak")
+
+        if np2_bin and yak_bin:
+            runner.log_info("Polishing HiFi assembly with NextPolish2")
             polish_dir = "assemblies/polish_work"
             os.makedirs(polish_dir, exist_ok=True)
 
-            bam = os.path.join(polish_dir, "reads.sorted.bam")
-            cmd = (f"minimap2 -ax map-hifi -t {runner.threads} {input_fa} {runner.fastq} "
-                   f"| samtools sort -@ {runner.threads} -o {bam}")
-            subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            subprocess.run(f"samtools index {bam}", shell=True,
-                           capture_output=True, text=True)
+            k21_yak = os.path.join(polish_dir, "k21.yak")
+            k31_yak = os.path.join(polish_dir, "k31.yak")
 
-            cmd = f"{np2_bin} {input_fa} {bam} > {output_fa}"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            if os.path.isfile(output_fa) and os.path.getsize(output_fa) > 0:
-                runner.log("NextPolish2 polishing complete")
-                return True
-            else:
-                runner.log_warn("NextPolish2 produced no output")
+            # Build yak k-mer databases from HiFi reads
+            runner.log_info("Building yak k-mer databases (k=21, k=31)...")
+            for ksize, yak_out in [(21, k21_yak), (31, k31_yak)]:
+                if os.path.isfile(yak_out) and os.path.getsize(yak_out) > 0:
+                    runner.log(f"  Reusing existing {yak_out}")
+                    continue
+                cmd = (f"{yak_bin} count -k {ksize} -b 37 "
+                       f"-t {runner.threads} -o {yak_out} {runner.fastq}")
+                result = subprocess.run(cmd, shell=True, capture_output=True,
+                                        text=True)
+                if result.returncode != 0:
+                    runner.log_warn(f"yak count k={ksize} failed: "
+                                    f"{(result.stderr or '').strip()[:200]}")
+                    runner.log_info("Falling back: skipping HiFi polishing")
+                    shutil.copy(input_fa, output_fa)
+                    return False
+                runner.log(f"  Built {yak_out}")
+
+            # Run NextPolish2
+            cmd = (f"{np2_bin} -t {runner.threads} "
+                   f"{input_fa} {k21_yak} {k31_yak}")
+            runner.log_info(f"Running: {np2_bin} -t {runner.threads} ...")
+            result = subprocess.run(cmd, shell=True, capture_output=True,
+                                    text=True)
+
+            if result.returncode == 0 and result.stdout.strip():
+                with open(output_fa, "w") as f:
+                    f.write(result.stdout)
+                if os.path.getsize(output_fa) > 0:
+                    runner.log("NextPolish2 polishing complete")
+                    return True
+
+            # If NextPolish2 wrote nothing or failed, log and fall back
+            err_msg = (result.stderr or "").strip()[:300]
+            runner.log_warn(f"NextPolish2 failed or produced no output"
+                            f"{': ' + err_msg if err_msg else ''}")
+            shutil.copy(input_fa, output_fa)
+            return False
         else:
-            runner.log_info("HiFi assembly: polishing skipped (HiFi reads are already "
-                            "high-accuracy; install NextPolish2 for optional refinement)")
-        shutil.copy(input_fa, output_fa)
-        return False
+            missing = []
+            if not np2_bin:
+                missing.append("nextPolish2")
+            if not yak_bin:
+                missing.append("yak")
+            runner.log_warn(f"HiFi polishing requires {' and '.join(missing)}; "
+                            f"install via conda (nextpolish2, yak) or skip with "
+                            f"--no-polish")
+            shutil.copy(input_fa, output_fa)
+            return False
 
     if platform == "nanopore":
         # Medaka is preferred for ONT — neural-network-based, better accuracy
