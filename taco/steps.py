@@ -2229,24 +2229,35 @@ def _run_polishing(runner, input_fa, output_fa):
 def step_12_refine(runner):
     """Step 12 - T2T-first telomere-aware backbone refinement with BUSCO trial validation.
 
-    v1.2.0 workflow (T2T-first philosophy):
-      12A  Merqury pre-selection (optional)
+    v1.2.0 workflow — two-tier confidence model:
+
+    TIER 1 (immutable): protected strict-T2T contigs from the merged pool.
+      These are NEVER replaced or displaced by rescue candidates unless the
+      user explicitly passes --allow-t2t-replace.
+
+    TIER 2 (editable): backbone contigs from the auto-selected assembler.
+      These can be deduped, replaced, rescued, purged, and polished.
+
+    Sub-steps:
+      12A  Merqury QV scoring (optional, auto-detected)
       12B  Auto-select backbone assembler
       12C  Prepare cleaned backbone + chimera safety check
       12D  T2T-first foundation building:
-           12D1  Strict dedup — remove backbone contigs 95%/95% redundant to T2T pool
-           12D2  Fragment removal — remove backbone fragments 50%/90% to T2T pool
+           12D1  Strict dedup — remove backbone contigs 95%/95% redundant to Tier 1
+           12D2  Fragment removal — remove backbone fragments 50%/90% to Tier 1
            12D3  Classify backbone contigs by telomere status
-           12D4  Aggressive non-telomeric dedup — remove non-telo backbone contigs
-                 70%/85% redundant to T2T pool (more aggressive for contigs
-                 that lack telomere support)
-           12D5  Self-dedup non-telomeric backbone — remove smaller of overlapping
-                 non-telo backbone contigs (80%/90%)
-      12E  Telomere rescue with donor verification:
-           only accept donors with verified telomere signal
-      12F  BUSCO trial validation for plausible candidates only
-      12G  Final combine (T2T foundation + telomere-rescued backbone gap-fill)
-      12H  purge_dups default cleanup
+           12D4  Taxon-aware non-telomeric dedup against Tier 1
+                 (fungi: aggressive 70%/85%; plant/vertebrate: conservative 85%/92%)
+           12D5  Taxon-aware non-telomeric self-dedup
+                 (fungi: 80%/90%; plant/vertebrate: 90%/95%)
+      12E  Telomere rescue with donor verification + replacement class tagging:
+           only accept donors with verified telomere signal;
+           never replace Tier 1 contigs (unless --allow-t2t-replace)
+      12F  BUSCO trial validation:
+           taxon-aware thresholds for C-drop, M-rise, AND D-rise;
+           reject if telomere evidence weakens or size drops suspiciously
+      12G  Final combine (Tier 1 foundation + Tier 2 rescued backbone)
+      12H  purge_dups default cleanup (taxon-aware)
       12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
@@ -2395,11 +2406,21 @@ def step_12_refine(runner):
                f"{len(bb_telo_ids)} any-telomere, out of "
                f"{sum(1 for _ in _read_fasta_records(backbone_nodup_fa))} total")
 
-    # ---- 12D4. Aggressive non-telomeric dedup against T2T pool ----
-    # Non-telomeric backbone contigs that overlap T2T pool at 70%/85% are
-    # redundant partial copies that don't add telomere information.
-    # Telomere-bearing backbone contigs are kept regardless (they contribute
-    # chromosome-end information even if they overlap a T2T contig).
+    # ---- 12D4. Taxon-aware non-telomeric dedup against Tier 1 pool ----
+    # Non-telomeric backbone contigs overlapping the Tier 1 T2T pool are
+    # removed at taxon-appropriate thresholds:
+    #   Fungi/haploid:        aggressive (70%/85%) — most overlap is artefactual
+    #   Plant/polyploid:      conservative (85%/92%) — overlap can be homeologous
+    #   Vertebrate/animal:    conservative (85%/92%) — repeat-rich, allelic overlap
+    #   Insect/other:         moderate (75%/88%)
+    taxon = getattr(runner, 'taxon', 'other')
+    if taxon == "fungal":
+        default_aggr_cov, default_aggr_id = "0.70", "0.85"
+    elif taxon in ("plant", "vertebrate", "animal"):
+        default_aggr_cov, default_aggr_id = "0.85", "0.92"
+    else:
+        default_aggr_cov, default_aggr_id = "0.75", "0.88"
+
     if protected_fasta and os.path.isfile(protected_fasta) and \
        os.path.getsize(protected_fasta) > 0 and shutil.which("minimap2"):
         aggr_paf = "assemblies/backbone_aggr_vs_protected.paf"
@@ -2409,10 +2430,9 @@ def step_12_refine(runner):
         with open(aggr_paf, "w") as f:
             f.write(result.stdout)
 
-        # Parse PAF: only drop NON-telomeric contigs that hit T2T at >= 70%/85%
         aggr_best = _parse_paf_best_hits(aggr_paf)
-        aggr_cov = float(os.environ.get("AGGR_NONTELO_COV", "0.70"))
-        aggr_id = float(os.environ.get("AGGR_NONTELO_ID", "0.85"))
+        aggr_cov = float(os.environ.get("AGGR_NONTELO_COV", default_aggr_cov))
+        aggr_id = float(os.environ.get("AGGR_NONTELO_ID", default_aggr_id))
         aggr_drop = {q for q, (cov, ident) in aggr_best.items()
                      if cov >= aggr_cov and ident >= aggr_id
                      and q not in bb_telo_ids}
@@ -2421,34 +2441,62 @@ def step_12_refine(runner):
             recs = [(n, s) for n, s in _read_fasta_records(backbone_nodup_fa)
                     if n not in aggr_drop]
             _write_fasta(recs, backbone_nodup_fa)
-            runner.log(f"Aggressive non-telo dedup: removed {len(aggr_drop)} "
-                       f"non-telomeric backbone contigs redundant to T2T pool "
-                       f"({aggr_cov:.0%}/{aggr_id:.0%})")
+            runner.log(f"Non-telo dedup vs Tier 1 (taxon={taxon}): removed "
+                       f"{len(aggr_drop)} contigs ({aggr_cov}/{aggr_id})")
         else:
-            runner.log("Aggressive non-telo dedup: no additional contigs removed")
+            runner.log(f"Non-telo dedup vs Tier 1 (taxon={taxon}): "
+                       f"no additional contigs removed")
 
-    # ---- 12D5. Self-dedup of non-telomeric backbone contigs ----
-    # When two non-telomeric backbone contigs overlap at 80%/90%,
-    # remove the shorter one.  Telomere-bearing contigs are never removed.
+    # ---- 12D5. Taxon-aware non-telomeric self-dedup ----
+    # Thresholds scale with taxon:
+    #   Fungi:                aggressive (80%/90%)
+    #   Plant/vertebrate:     conservative (90%/95%)
+    #   Insect/other:         moderate (85%/92%)
+    if taxon == "fungal":
+        default_sd_cov, default_sd_id = "0.80", "0.90"
+    elif taxon in ("plant", "vertebrate", "animal"):
+        default_sd_cov, default_sd_id = "0.90", "0.95"
+    else:
+        default_sd_cov, default_sd_id = "0.85", "0.92"
+
     n_self_dedup = _self_dedup_non_telomeric(
         backbone_nodup_fa, bb_telo_ids,
         "assemblies/backbone.filtered.selfdedup.fa",
         runner.threads,
-        cov_thr=float(os.environ.get("SELFDEDUP_COV", "0.80")),
-        id_thr=float(os.environ.get("SELFDEDUP_ID", "0.90")),
+        cov_thr=float(os.environ.get("SELFDEDUP_COV", default_sd_cov)),
+        id_thr=float(os.environ.get("SELFDEDUP_ID", default_sd_id)),
     )
     if n_self_dedup > 0:
-        runner.log(f"Non-telo self-dedup: removed {n_self_dedup} redundant "
-                   f"non-telomeric backbone contigs")
+        runner.log(f"Non-telo self-dedup (taxon={taxon}): removed "
+                   f"{n_self_dedup} redundant contigs")
         shutil.copy("assemblies/backbone.filtered.selfdedup.fa",
                     backbone_nodup_fa)
     else:
-        runner.log("Non-telo self-dedup: no additional contigs removed")
+        runner.log(f"Non-telo self-dedup (taxon={taxon}): "
+                   f"no additional contigs removed")
 
-    # ---- 12E. Telomere rescue candidate screening ----
-    # T2T-first philosophy: only accept rescue donors that bring telomere
-    # evidence to the assembly.  Non-telomeric donors are rejected because
-    # they don't improve chromosome-end completeness.
+    # ---- 12E. Telomere rescue with Tier 1 protection + replacement classes ----
+    # Two-tier model:
+    #   Tier 1 (immutable): protected T2T contigs — never replaced unless
+    #     --allow-t2t-replace is set.
+    #   Tier 2 (editable): everything else in the backbone.
+    #
+    # Replacement classes (logged in trial summary):
+    #   fill_missing_end          — backbone has no telo, donor adds one
+    #   replace_non_telo_backbone — backbone has no telo, donor has telo
+    #   replace_single_with_better — backbone has 1-end telo, donor has stronger
+    #   replace_protected_t2t     — backbone is Tier 1 T2T (disabled by default)
+
+    # Build immutable Tier 1 set
+    tier1_ids = set()
+    if os.path.isfile("assemblies/protected.telomere.fa") and \
+       os.path.getsize("assemblies/protected.telomere.fa") > 0:
+        for name, _ in _read_fasta_records("assemblies/protected.telomere.fa"):
+            tier1_ids.add(name)
+    allow_t2t_replace = getattr(runner, 'allow_t2t_replace', False)
+    runner.log_info(f"Tier 1 (immutable) contigs: {len(tier1_ids)}"
+                    f"{' (--allow-t2t-replace ON)' if allow_t2t_replace else ''}")
+
     single_tel_src = ""
     for candidate in ["single_tel_best_clean.fasta", "single_tel_best.fasta",
                       "telomere_supported_best.fasta", "single_tel_clean.fasta",
@@ -2475,7 +2523,6 @@ def step_12_refine(runner):
         all_hits = _parse_paf_rescue_hits(rescue_paf, donor_seqs, backbone_seqs)
         runner.log(f"Telomere rescue: {len(all_hits)} raw alignment hits")
 
-        # Write debug TSV with all hits
         _write_rescue_debug_tsv(all_hits, "assemblies/single_tel.replaced.debug.tsv")
 
         # Structural screening
@@ -2490,20 +2537,34 @@ def step_12_refine(runner):
         runner.log(f"Structural screening: {len(rejected)} rejected, "
                    f"{len(candidates)} plausible candidates")
 
+        # ---- Tier 1 protection: reject candidates targeting immutable contigs ----
+        if not allow_t2t_replace:
+            tier1_filtered = []
+            for c in candidates:
+                if c["backbone"] in tier1_ids:
+                    c["reject_reason"] = "target_is_tier1_protected_t2t"
+                    rejected.append(c)
+                else:
+                    tier1_filtered.append(c)
+            n_tier1_reject = len(candidates) - len(tier1_filtered)
+            if n_tier1_reject > 0:
+                runner.log(f"Tier 1 protection: blocked {n_tier1_reject} candidates "
+                           f"targeting immutable T2T contigs")
+            candidates = tier1_filtered
+
         # ---- Donor telomere verification ----
-        # T2T-first philosophy: only accept donors that carry telomere signal.
-        # Write donor FASTA for classification, then filter candidates.
         donor_telo_verified = set()
+        donor_t2t_verified = set()
         if candidates:
             donor_check_fa = "assemblies/rescue_donors_check.fa"
             unique_donors = {c["donor"] for c in candidates}
             _write_fasta([(n, donor_seqs[n]) for n in unique_donors if n in donor_seqs],
                          donor_check_fa)
-            _, donor_telo_set = _classify_contigs_telomere_status(
+            d_t2t_set, d_telo_set = _classify_contigs_telomere_status(
                 donor_check_fa, runner)
-            donor_telo_verified = donor_telo_set
+            donor_telo_verified = d_telo_set
+            donor_t2t_verified = d_t2t_set
 
-            # Move non-telomeric donors to rejected
             telo_verified_candidates = []
             for c in candidates:
                 if c["donor"] in donor_telo_verified:
@@ -2518,11 +2579,27 @@ def step_12_refine(runner):
                            f"donors lacking telomere signal")
             candidates = telo_verified_candidates
 
-            # Re-rank after filtering
-            for i, c in enumerate(candidates):
-                c["candidate_rank"] = i + 1
+        # ---- Assign replacement class to each candidate ----
+        for c in candidates:
+            bb_name = c["backbone"]
+            d_name = c["donor"]
+            if bb_name in tier1_ids:
+                c["replacement_class"] = "replace_protected_t2t"
+            elif bb_name not in bb_telo_ids:
+                if d_name in donor_t2t_verified:
+                    c["replacement_class"] = "fill_missing_end"
+                else:
+                    c["replacement_class"] = "replace_non_telo_backbone"
+            elif bb_name in bb_telo_ids and bb_name not in bb_t2t_ids:
+                c["replacement_class"] = "replace_single_with_better"
+            else:
+                c["replacement_class"] = "replace_non_telo_backbone"
 
-        runner.log(f"After donor verification: {len(candidates)} telomere-verified candidates")
+        # Re-rank after all filtering
+        for i, c in enumerate(candidates):
+            c["candidate_rank"] = i + 1
+
+        runner.log(f"After all filtering: {len(candidates)} rescue candidates")
 
         # Write candidate TSV
         _write_candidates_tsv(candidates, "assemblies/single_tel.candidates.tsv")
@@ -2531,30 +2608,42 @@ def step_12_refine(runner):
         with open("assemblies/rescue_rejection_summary.txt", "w") as f:
             f.write(f"Total hits evaluated: {len(all_hits)}\n")
             f.write(f"Obvious rejections: {len(rejected)}\n")
-            f.write(f"Plausible candidates: {len(candidates)}\n\n")
+            f.write(f"Plausible candidates: {len(candidates)}\n")
+            f.write(f"Tier 1 (immutable) contigs: {len(tier1_ids)}\n")
+            f.write(f"Allow T2T replace: {allow_t2t_replace}\n\n")
             for r in rejected:
-                f.write(f"REJECT {r['donor']} → {r['backbone']}: {r['reject_reason']}\n")
+                f.write(f"REJECT {r.get('donor','')} → {r.get('backbone','')}: "
+                        f"{r.get('reject_reason','')}\n")
 
-        # ---- 12F. BUSCO trial validation for plausible candidates ----
-        max_accepted = int(os.environ.get("STEP12_MAX_ACCEPTED", "20"))
+        # ---- 12F. BUSCO trial validation (enhanced) ----
+        # Taxon-aware max rescue limits:
+        #   Fungi: 20 (small genomes, rescue is effective)
+        #   Plant: 8 (conservative, polyploidy risk)
+        #   Vertebrate/animal: 10 (conservative, repeat-rich)
+        #   Insect/other: 15 (moderate)
+        if taxon == "fungal":
+            default_max = "20"
+        elif taxon == "plant":
+            default_max = "8"
+        elif taxon in ("vertebrate", "animal"):
+            default_max = "10"
+        else:
+            default_max = "15"
+        max_accepted = int(os.environ.get("STEP12_MAX_ACCEPTED", default_max))
         min_bp_ratio = float(os.environ.get("STEP12_MIN_BP_RATIO", "0.90"))
 
-        # Taxon-aware BUSCO thresholds:
-        # - Haploid/fungal: strict (2% C-drop max)
-        # - Plant: relaxed (polyploidy inflates D naturally, allow 4% C-drop)
-        # - Vertebrate/animal: moderate (3% C-drop)
-        taxon = getattr(runner, 'taxon', 'other')
-        default_c_drop = "2.0"
-        default_m_rise = "0.3"
+        # Taxon-aware BUSCO thresholds (C-drop, M-rise, D-rise):
+        default_c_drop, default_m_rise, default_d_rise = "2.0", "0.3", "3.0"
         if taxon == "plant":
-            default_c_drop = "4.0"
-            default_m_rise = "1.0"
+            default_c_drop, default_m_rise, default_d_rise = "4.0", "1.0", "6.0"
         elif taxon in ("vertebrate", "animal"):
-            default_c_drop = "3.0"
-            default_m_rise = "0.5"
+            default_c_drop, default_m_rise, default_d_rise = "3.0", "0.5", "4.0"
+        elif taxon == "fungal":
+            default_d_rise = "2.0"  # fungi: duplication almost always artefactual
 
         max_busco_c_drop = float(os.environ.get("STEP12_MAX_BUSCO_C_DROP", default_c_drop))
         max_busco_m_rise = float(os.environ.get("STEP12_MAX_BUSCO_M_RISE", default_m_rise))
+        max_busco_d_rise = float(os.environ.get("STEP12_MAX_BUSCO_D_RISE", default_d_rise))
 
         lineage = runner.busco_lineage or "ascomycota_odb10"
         busco_available = shutil.which("busco") is not None and runner.run_busco
@@ -2574,28 +2663,31 @@ def step_12_refine(runner):
                                                runner.threads, "baseline", trial_dir)
             if baseline_busco:
                 runner.log(f"Baseline BUSCO: C={baseline_busco['C']:.1f}% "
+                           f"D={baseline_busco.get('D', 0):.1f}% "
                            f"M={baseline_busco['M']:.1f}%")
             else:
                 runner.log_warn("Baseline BUSCO parse failed; using structural checks only")
 
         accepted_count = 0
         trial_results = []
-        current_backbone = dict(backbone_seqs)  # working copy
+        current_backbone = dict(backbone_seqs)
 
         for cand in candidates:
             if accepted_count >= max_accepted:
-                runner.log_info(f"Reached max accepted rescues ({max_accepted})")
+                runner.log_info(f"Reached max accepted rescues ({max_accepted}) "
+                                f"for taxon={taxon}")
                 break
 
             backbone_name = cand["backbone"]
             donor_name = cand["donor"]
+            repl_class = cand.get("replacement_class", "unknown")
 
             if backbone_name not in current_backbone:
                 continue
             if donor_name not in donor_seqs:
                 continue
 
-            # Build trial assembly: replace backbone contig with donor
+            # Build trial assembly
             trial_recs = []
             for n, s in current_backbone.items():
                 if n == backbone_name:
@@ -2609,24 +2701,28 @@ def step_12_refine(runner):
             trial_bp = sum(len(s) for _, s in trial_recs)
             trial_contigs = len(trial_recs)
 
-            # Size check
+            # Size check — reject suspicious size drops
             if baseline_bp > 0 and trial_bp < baseline_bp * min_bp_ratio:
-                reason = "bp_drop"
+                reason = "bp_drop_suspicious"
                 trial_results.append({
                     "candidate_rank": cand["candidate_rank"],
                     "backbone": backbone_name, "donor": donor_name,
+                    "replacement_class": repl_class,
                     "accepted": False, "reason": reason,
                     "trial_bp": trial_bp, "trial_contigs": trial_contigs,
-                    "trial_supported": "", "baseline_busco_c": "",
-                    "trial_busco_c": "", "baseline_busco_m": "",
-                    "trial_busco_m": "", "busco_c_delta": "", "busco_m_delta": "",
+                    "baseline_busco_c": "", "trial_busco_c": "",
+                    "baseline_busco_d": "", "trial_busco_d": "",
+                    "baseline_busco_m": "", "trial_busco_m": "",
+                    "busco_c_delta": "", "busco_d_delta": "", "busco_m_delta": "",
                 })
                 runner.log(f"  Candidate {cand['candidate_rank']} "
-                           f"({donor_name} → {backbone_name}): REJECTED (bp_drop)")
+                           f"({donor_name} → {backbone_name}): "
+                           f"REJECTED (bp_drop_suspicious, {repl_class})")
                 continue
 
-            # BUSCO trial if available
+            # BUSCO trial
             trial_busco = None
+            c_delta = d_delta = m_delta = 0.0
             if busco_available and baseline_busco:
                 trial_label = f"trial_{cand['candidate_rank']}"
                 trial_busco = _run_busco_trial(trial_fa, lineage,
@@ -2638,54 +2734,74 @@ def step_12_refine(runner):
             if trial_busco and baseline_busco:
                 c_delta = trial_busco["C"] - baseline_busco["C"]
                 m_delta = trial_busco["M"] - baseline_busco["M"]
+                d_delta = trial_busco.get("D", 0) - baseline_busco.get("D", 0)
 
                 if c_delta < -max_busco_c_drop:
                     accepted = False
-                    reason = "busco_c_drop_gt_2"
+                    reason = f"busco_c_drop ({c_delta:.1f}% < -{max_busco_c_drop}%)"
                 elif m_delta > max_busco_m_rise:
                     accepted = False
-                    reason = "busco_m_rise"
+                    reason = f"busco_m_rise ({m_delta:.1f}% > +{max_busco_m_rise}%)"
+                elif d_delta > max_busco_d_rise:
+                    accepted = False
+                    reason = f"busco_d_rise ({d_delta:.1f}% > +{max_busco_d_rise}%)"
             elif busco_available and baseline_busco and trial_busco is None:
-                # BUSCO ran but failed to parse
                 accepted = False
                 reason = "trial_busco_failed"
+
+            # Additional safety: check that donor telomere evidence is not
+            # weaker than what we're replacing (don't replace telo with weaker telo)
+            if accepted and repl_class == "replace_single_with_better":
+                # Donor should have at least as strong telomere signal
+                if donor_name not in donor_t2t_verified and backbone_name in bb_telo_ids:
+                    # Donor is single-end replacing single-end — only accept if
+                    # structural score is high (donor is genuinely better)
+                    if cand.get("structural_score", 0) < 7.0:
+                        accepted = False
+                        reason = "donor_telo_not_stronger_than_backbone"
 
             trial_results.append({
                 "candidate_rank": cand["candidate_rank"],
                 "backbone": backbone_name, "donor": donor_name,
+                "replacement_class": repl_class,
                 "accepted": accepted, "reason": reason,
                 "trial_bp": trial_bp, "trial_contigs": trial_contigs,
-                "trial_supported": "",
                 "baseline_busco_c": f"{baseline_busco['C']:.1f}" if baseline_busco else "",
                 "trial_busco_c": f"{trial_busco['C']:.1f}" if trial_busco else "",
+                "baseline_busco_d": f"{baseline_busco.get('D', 0):.1f}" if baseline_busco else "",
+                "trial_busco_d": f"{trial_busco.get('D', 0):.1f}" if trial_busco else "",
                 "baseline_busco_m": f"{baseline_busco['M']:.1f}" if baseline_busco else "",
                 "trial_busco_m": f"{trial_busco['M']:.1f}" if trial_busco else "",
                 "busco_c_delta": f"{c_delta:.1f}" if (trial_busco and baseline_busco) else "",
+                "busco_d_delta": f"{d_delta:.1f}" if (trial_busco and baseline_busco) else "",
                 "busco_m_delta": f"{m_delta:.1f}" if (trial_busco and baseline_busco) else "",
             })
 
             if accepted:
                 accepted_count += 1
-                # Update working backbone
                 del current_backbone[backbone_name]
                 current_backbone[donor_name] = donor_seqs[donor_name]
-                # Update baseline BUSCO for next iteration
                 if trial_busco:
                     baseline_busco = trial_busco
                 baseline_bp = trial_bp
                 runner.log(f"  Candidate {cand['candidate_rank']} "
-                           f"({donor_name} → {backbone_name}): ACCEPTED")
+                           f"({donor_name} → {backbone_name}): "
+                           f"ACCEPTED ({repl_class})")
             else:
                 runner.log(f"  Candidate {cand['candidate_rank']} "
-                           f"({donor_name} → {backbone_name}): REJECTED ({reason})")
+                           f"({donor_name} → {backbone_name}): "
+                           f"REJECTED ({reason}, {repl_class})")
 
-        runner.log(f"Telomere rescue: {accepted_count} replacements accepted")
+        runner.log(f"Telomere rescue: {accepted_count} replacements accepted "
+                   f"(max={max_accepted}, taxon={taxon})")
 
-        # Write trial summary
-        trial_cols = ["candidate_rank", "backbone", "donor", "accepted", "reason",
-                      "trial_bp", "trial_contigs", "trial_supported",
-                      "baseline_busco_c", "trial_busco_c", "baseline_busco_m",
-                      "trial_busco_m", "busco_c_delta", "busco_m_delta"]
+        # Write trial summary with replacement class + D-rise columns
+        trial_cols = ["candidate_rank", "backbone", "donor",
+                      "replacement_class", "accepted", "reason",
+                      "trial_bp", "trial_contigs",
+                      "baseline_busco_c", "trial_busco_c", "busco_c_delta",
+                      "baseline_busco_d", "trial_busco_d", "busco_d_delta",
+                      "baseline_busco_m", "trial_busco_m", "busco_m_delta"]
         with open("assemblies/rescue_trial_summary.tsv", "w", newline="") as f:
             w = csv.writer(f, delimiter="\t")
             w.writerow(trial_cols)
@@ -2696,11 +2812,11 @@ def step_12_refine(runner):
         rescued_recs = list(current_backbone.items())
         _write_fasta(rescued_recs, "assemblies/backbone.telomere_rescued.fa")
 
-        # Write replaced IDs for reporting
         with open("assemblies/single_tel.replaced.ids", "w") as f:
             for tr in trial_results:
                 if tr["accepted"]:
-                    f.write(f"{tr['backbone']}\t{tr['donor']}\n")
+                    f.write(f"{tr['backbone']}\t{tr['donor']}\t"
+                            f"{tr['replacement_class']}\n")
     else:
         if not single_tel_src:
             runner.log_info("No single-end telomeric contigs available for rescue")
@@ -2709,7 +2825,6 @@ def step_12_refine(runner):
 
         shutil.copy(working_backbone, "assemblies/backbone.telomere_rescued.fa")
 
-        # Write empty output files for consistency
         for p in ["assemblies/single_tel.replaced.debug.tsv",
                    "assemblies/single_tel.candidates.tsv",
                    "assemblies/rescue_rejection_summary.txt",

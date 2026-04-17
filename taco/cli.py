@@ -74,6 +74,10 @@ def parse_args():
     parser.add_argument('--no-merqury', action='store_true')
     parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
     parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')
+    parser.add_argument('--allow-t2t-replace', action='store_true',
+                        help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
+                             'Disabled by default for safety. Use only if you have strong reason to '
+                             'believe a donor is a better T2T contig than the existing one.')
     parser.add_argument('--version', action='version', version='TACO v1.2.0')
     
     args = parser.parse_args()

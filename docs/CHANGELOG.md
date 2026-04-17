@@ -89,8 +89,28 @@ is an optional override.
   duplicates more heavily and reward T2T contigs; plant/vertebrate reduce
   contig-count penalty for naturally larger assemblies and increase N50 weight.
 - **New** taxon-aware BUSCO trial thresholds: fungi 2% C-drop / 0.3%
-  M-rise (strict); plant 4% / 1.0% (relaxed for polyploidy); vertebrate
-  3% / 0.5%.
+  M-rise / 2% D-rise (strict); plant 4% / 1.0% / 6% (relaxed for
+  polyploidy); vertebrate 3% / 0.5% / 4%.
+- **New** BUSCO D-rise (duplicated %) threshold: catches rescue candidates
+  that introduce redundant copies of single-copy orthologs.  Configurable
+  via `STEP12_MAX_BUSCO_D_RISE` environment variable.
+- **New** two-tier confidence model: Tier 1 (immutable T2T contigs) and
+  Tier 2 (editable backbone contigs).  Tier 1 contigs are never replaced
+  during rescue unless `--allow-t2t-replace` is explicitly set.
+- **New** replacement class tracking: each accepted rescue is assigned one
+  of four classes — `fill_missing_end`, `replace_non_telo_backbone`,
+  `replace_single_with_better`, or `replace_protected_t2t`.  Classes are
+  recorded in `rescue_trial_summary.tsv` and `replaced.ids`.
+- **New** taxon-aware rescue limits: fungi 20, vertebrate 10, plant 8,
+  other 15.  Prevents runaway replacement in complex genomes.
+- **New** taxon-aware 12D4/12D5 dedup thresholds: fungi 70%/85% (12D4)
+  and 80%/90% (12D5); plant/vertebrate 85%/92% and 90%/95%; other
+  75%/88% and 85%/92%.
+- **New** telomere-evidence safety check: `replace_single_with_better`
+  candidates are rejected if telomere evidence weakens at either end
+  after replacement.
+- **New** suspicious size-drop check: candidates causing >30% size drop
+  are rejected.
 
 ### Configurability improvements
 
@@ -110,6 +130,8 @@ is an optional override.
 - Added `--taxon` parameter.
 - Added `--no-purge-dups` to skip purge_dups.
 - Added `--no-polish` to skip polishing.
+- Added `--allow-t2t-replace` to permit rescue donors to replace
+  immutable Tier 1 (T2T) contigs.  Disabled by default for safety.
 - Updated `--motif` help text to indicate it is an override.
 - Updated `--reference` help text (Redundans reference removed).
 

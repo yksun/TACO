@@ -139,6 +139,7 @@ taco -g 12m -t 16 \
 | `--no-merqury` | Disable Merqury even if installed and auto-detected |
 | `--no-purge-dups` | Skip purge_dups after refinement |
 | `--no-polish` | Skip automatic polishing after refinement |
+| `--allow-t2t-replace` | Allow rescue donors to replace immutable Tier 1 (T2T) contigs. Disabled by default for safety |
 
 ### Assembly-Only Mode
 
@@ -291,7 +292,18 @@ The default telomere score window also varies by taxon to match typical telomere
 
 ### Taxon-Specific BUSCO Trial Thresholds (Step 12F)
 
-When validating rescue candidates via BUSCO trial, the maximum acceptable C% drop and M% rise depend on taxon: fungi use strict thresholds (2% C-drop, 0.3% M-rise) appropriate for haploid genomes with stable BUSCO profiles; plants use relaxed thresholds (4% C-drop, 1.0% M-rise) because polyploidy causes natural BUSCO variability; vertebrates use moderate thresholds (3% C-drop, 0.5% M-rise). All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP` and `STEP12_MAX_BUSCO_M_RISE` environment variables.
+When validating rescue candidates via BUSCO trial, the maximum acceptable C% drop, M% rise, and D% rise depend on taxon:
+
+- **Fungi**: strict thresholds (2% C-drop, 0.3% M-rise, 2% D-rise) — haploid genomes with stable BUSCO profiles.
+- **Plant**: relaxed thresholds (4% C-drop, 1.0% M-rise, 6% D-rise) — polyploidy causes natural BUSCO variability.
+- **Vertebrate**: moderate thresholds (3% C-drop, 0.5% M-rise, 4% D-rise).
+- **Other**: balanced defaults (2.5% C-drop, 0.5% M-rise, 3% D-rise).
+
+A D-rise (duplicated BUSCO increase) check catches cases where a rescue introduces redundant copies of single-copy orthologs — a sign of retained haplotigs or mis-joined contigs. All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP`, `STEP12_MAX_BUSCO_M_RISE`, and `STEP12_MAX_BUSCO_D_RISE` environment variables.
+
+### Taxon-Specific Rescue Limits (Step 12F)
+
+The maximum number of accepted rescue candidates per run is taxon-aware: fungi allow up to 20 rescues (many small chromosomes), vertebrates 10, plants 8 (conservative due to polyploidy risk), and other taxa 15. This prevents runaway replacement in complex genomes.
 
 ### Taxon-Specific purge_dups Behaviour (Step 12H)
 
@@ -303,7 +315,12 @@ purge_dups uses single-round purging for fungal, insect, and other genomes to av
 
 ## Step 12 — T2T-First Telomere-Aware Backbone Refinement
 
-Step 12 adopts a T2T-first assembly philosophy: T2T contigs from all assemblers form the primary foundation, while backbone contigs serve as gap-fill for chromosomal regions not covered by T2T contigs. Duplicate non-telomeric backbone contigs are aggressively removed, and rescue donors must carry verified telomere signal.
+Step 12 adopts a T2T-first assembly philosophy with a **two-tier confidence model**:
+
+- **Tier 1 (Immutable)**: T2T contigs — contigs with verified telomere signal at both ends. These are treated as protected chromosomal anchors and are never replaced during rescue, unless `--allow-t2t-replace` is explicitly set. This protects the highest-confidence contigs from accidental degradation.
+- **Tier 2 (Editable)**: Backbone contigs — gap-fill contigs that cover chromosomal regions not represented by T2T contigs. These may be replaced by telomere-bearing rescue donors if the replacement passes BUSCO trial validation.
+
+Duplicate non-telomeric backbone contigs are aggressively removed (with taxon-aware thresholds), and rescue donors must carry verified telomere signal.
 
 ### Step 12 Sub-step Flow
 
@@ -314,10 +331,10 @@ Step 12 adopts a T2T-first assembly philosophy: T2T contigs from all assemblers 
    - **12D1** strict dedup (95%/95%): remove backbone contigs near-identical to T2T pool.
    - **12D2** fragment removal (50%/90%): remove backbone fragments partially overlapping T2T chromosomes.
    - **12D3** backbone telomere classification: run telomere detection on remaining backbone contigs to identify which carry telomere signal.
-   - **12D4** aggressive non-telomeric dedup (70%/85%): backbone contigs lacking telomere support that overlap the T2T pool are removed more aggressively than telomere-bearing contigs.
-   - **12D5** non-telomeric self-dedup (80%/90%): when two non-telomeric backbone contigs overlap, the shorter one is removed. Telomere-bearing contigs are always kept.
-5. **12E** — telomere rescue with donor verification: align donor pool to backbone, compute structural metrics, then verify each donor carries telomere signal. Non-telomeric donors are rejected regardless of alignment quality.
-6. **12F** — BUSCO trial validation: for each telomere-verified candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop, plant: 4%, vertebrate: 3%).
+   - **12D4** aggressive non-telomeric dedup (taxon-aware): backbone contigs lacking telomere support that overlap the T2T pool are removed. Thresholds: fungi 70%/85%, plant/vertebrate 85%/92%, other 75%/88%.
+   - **12D5** non-telomeric self-dedup (taxon-aware): when two non-telomeric backbone contigs overlap, the shorter one is removed. Thresholds: fungi 80%/90%, plant/vertebrate 90%/95%, other 85%/92%. Telomere-bearing contigs are always kept.
+5. **12E** — telomere rescue with two-tier protection: align donor pool to backbone, compute structural metrics, verify each donor carries telomere signal, and classify each replacement. Tier 1 (T2T) contigs are immutable by default — candidates targeting them are rejected unless `--allow-t2t-replace` is set. Each accepted candidate is assigned a **replacement class**: `fill_missing_end`, `replace_non_telo_backbone`, `replace_single_with_better`, or `replace_protected_t2t`.
+6. **12F** — BUSCO trial validation: for each telomere-verified candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). Maximum accepted rescues are also taxon-aware (fungi: 20, plant: 8, vertebrate: 10, other: 15). An additional safety check rejects `replace_single_with_better` candidates if the replacement loses telomere evidence at either end.
 7. **12G** — final combine: T2T foundation + telomere-rescued backbone gap-fill.
 8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
 9. **12I** — automatic polishing: skip for HiFi (NextPolish2 if installed), Medaka for ONT (Racon fallback), Racon for CLR (skip with `--no-polish`).
@@ -325,7 +342,7 @@ Step 12 adopts a T2T-first assembly philosophy: T2T contigs from all assemblers 
 
 ### BUSCO Trial Validation
 
-TACO validates each telomere rescue candidate by building a trial assembly where one backbone contig is replaced by one donor contig, then running BUSCO with the same lineage selected by the user. Rejection thresholds are taxon-aware: fungi use strict thresholds (2% C-drop max), plants use relaxed thresholds (4% C-drop, accounting for polyploidy), and vertebrates use moderate thresholds (3% C-drop). This greedy, sequential approach ensures that each accepted rescue improves or maintains assembly quality.
+TACO validates each telomere rescue candidate by building a trial assembly where one backbone contig is replaced by one donor contig, then running BUSCO with the same lineage selected by the user. Rejection is triggered by three independent BUSCO metrics: C% drop (completeness loss), M% rise (missing gene increase), and D% rise (duplicated BUSCO increase, catching retained haplotigs). Rejection thresholds are taxon-aware: fungi use strict thresholds (2% C-drop, 2% D-rise), plants use relaxed thresholds (4% C-drop, 6% D-rise, accounting for polyploidy), and vertebrates use moderate thresholds (3% C-drop, 4% D-rise). An additional safety check rejects `replace_single_with_better` candidates if telomere evidence weakens at either end after replacement (suspicious size drops >30% also trigger rejection). This greedy, sequential approach ensures that each accepted rescue improves or maintains assembly quality. The trial summary TSV includes `replacement_class` and `D` (duplicated %) columns for full traceability.
 
 ### Post-Refinement Stack
 

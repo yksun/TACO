@@ -72,6 +72,7 @@ class PipelineRunner:
         # Post-refinement options
         self.no_purge_dups = getattr(args, 'no_purge_dups', False)
         self.no_polish = getattr(args, 'no_polish', False)
+        self.allow_t2t_replace = getattr(args, 'allow_t2t_replace', False)
 
         # Backbone selection
         self.auto_mode = args.auto_mode
