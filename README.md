@@ -190,7 +190,7 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 | **BUSCO D penalty** | 600 (strict) | 300 (relaxed) | 500 (default) | 500 (default) |
 | **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2% (default) |
 | **purge_dups mode** | single-round | two-round + polyploid warning | two-round | single-round |
-| **Polishing (HiFi)** | skip | skip | skip | skip |
+| **Polishing (HiFi)** | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) |
 | **Polishing (ONT)** | Medaka → Racon | Medaka → Racon | Medaka → Racon | Medaka → Racon |
 | **Polishing (CLR)** | Racon | Racon | Racon | Racon |
 
