@@ -12,7 +12,7 @@ dependencies:
   # If canu still fails (e.g. you get a dev build), install the stable binary
   # from https://github.com/marbl/canu/releases and place it on PATH.
   - openjdk>=11
-  - canu>=2.2
+  - canu=2.2
   - nextdenovo>=2.5
   - flye>=2.9
   - hifiasm>=0.19
