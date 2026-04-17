@@ -49,13 +49,16 @@ def expand_steps(step_str):
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.0.0 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.2.0 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
-    parser.add_argument('-m', '--motif', type=str, help='Telomere motif')
+    parser.add_argument('-m', '--motif', type=str,
+                        help='Telomere motif override (optional; usually not needed — use --taxon instead)')
+    parser.add_argument('--taxon', choices=['vertebrate', 'animal', 'plant', 'insect', 'fungal', 'other'],
+                        default='other', help='Taxonomy preset for telomere motif priors (default: other)')
     parser.add_argument('--platform', choices=['pacbio-hifi', 'nanopore', 'pacbio'], default='pacbio-hifi')
-    parser.add_argument('--reference', '-ref', type=str, help='Reference FASTA for comparison and Redundans scaffolding')
+    parser.add_argument('--reference', '-ref', type=str, help='Reference FASTA for comparison')
     parser.add_argument('-s', '--steps', type=str, help='Steps to run')
     parser.add_argument('--assembly-only', action='store_true')
     parser.add_argument('--telomere-mode', choices=['known', 'auto', 'hybrid'], default='hybrid')
@@ -69,7 +72,9 @@ def parse_args():
     parser.add_argument('--merqury', action='store_true')
     parser.add_argument('--merqury-db', type=str)
     parser.add_argument('--no-merqury', action='store_true')
-    parser.add_argument('--version', action='version', version='TACO v1.0.0')
+    parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
+    parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')
+    parser.add_argument('--version', action='version', version='TACO v1.2.0')
     
     args = parser.parse_args()
     

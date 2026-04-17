@@ -52,6 +52,63 @@ THRESHOLDS = {
 }
 
 
+# ── Taxon-aware telomere presets ────────────────────────────────────────────
+# Each preset defines which motif families to prioritize and default behavior.
+# --motif overrides these priors when the user knows the exact repeat.
+TAXON_PRESETS = {
+    "vertebrate": {
+        "primary_families": ["canonical"],
+        "description": "TTAGGG — highly conserved in vertebrates",
+    },
+    "animal": {
+        "primary_families": ["canonical"],
+        "description": "TTAGGG — strongest prior for vertebrates, less certain for distant metazoans",
+    },
+    "plant": {
+        "primary_families": ["plant"],
+        "description": "TTTAGGG — common plant telomere repeat",
+    },
+    "insect": {
+        "primary_families": ["insect"],
+        "description": "TTAGG — common insect telomere repeat",
+    },
+    "fungal": {
+        "primary_families": ["canonical", "budding_yeast", "candida"],
+        "description": "Diverse fungal telomeres — uses all built-in families",
+    },
+    "other": {
+        "primary_families": ["canonical", "budding_yeast", "candida", "plant", "insect"],
+        "description": "Unknown taxon — uses all motif families plus de novo discovery",
+    },
+}
+
+
+# Extended MOTIF_FAMILIES with plant and insect entries
+MOTIF_FAMILIES["plant"] = {
+    "forward": ["TTTAGGG"],
+    "regex_fwd": r"(TTTAGGG){2,}",
+    "regex_rev": r"(CCCTAAA){2,}",
+}
+MOTIF_FAMILIES["insect"] = {
+    "forward": ["TTAGG"],
+    "regex_fwd": r"(TTAGG){2,}",
+    "regex_rev": r"(CCTAA){2,}",
+}
+
+
+def get_taxon_families(taxon="other"):
+    """Return the list of motif family names to use for a given taxon preset.
+
+    Args:
+        taxon: One of 'vertebrate', 'animal', 'plant', 'insect', 'fungal', 'other'
+
+    Returns:
+        list of str: Motif family keys from MOTIF_FAMILIES
+    """
+    preset = TAXON_PRESETS.get(taxon, TAXON_PRESETS["other"])
+    return [f for f in preset["primary_families"] if f in MOTIF_FAMILIES]
+
+
 # ── Core utility functions ───────────────────────────────────────────────────
 
 def revcomp(seq):
@@ -298,7 +355,8 @@ def classify_contig(left_score, right_score, strong_thr=0.25, weak_thr=0.08):
 # ── Main detection function ──────────────────────────────────────────────────
 
 def detect_telomeres(fasta_path, mode="hybrid", user_motif=None, end_window=5000,
-                     score_window=500, kmer_min=4, kmer_max=30, threads=1):
+                     score_window=500, kmer_min=4, kmer_max=30, threads=1,
+                     taxon="other"):
     """Main hybrid telomere detection matching TACO.sh logic.
 
     Steps:
@@ -318,6 +376,7 @@ def detect_telomeres(fasta_path, mode="hybrid", user_motif=None, end_window=5000
         kmer_min: Minimum k-mer size for discovery
         kmer_max: Maximum k-mer size for discovery
         threads: Number of threads for tidk
+        taxon: Taxon preset for motif family selection (default "other")
 
     Returns:
         list of dicts: {contig, length, left_score, right_score, classification}
@@ -395,8 +454,15 @@ def detect_telomeres(fasta_path, mode="hybrid", user_motif=None, end_window=5000
             fwd, rev = build_regex_for_motif(motif_str)
             user_motif_patterns.append(("auto:" + motif_str, (fwd, rev)))
 
-    # Use MOTIF_FAMILIES as family_patterns dict
-    family_patterns = dict(MOTIF_FAMILIES)
+    # Use taxon-aware subset of MOTIF_FAMILIES as family_patterns
+    # When user provides --motif + --telomere-mode known, family patterns
+    # are still loaded but scoring is dominated by the user pattern.
+    # For taxon-aware mode, only load families relevant to the taxon.
+    taxon_fams = get_taxon_families(taxon)
+    if taxon_fams:
+        family_patterns = {k: v for k, v in MOTIF_FAMILIES.items() if k in taxon_fams}
+    else:
+        family_patterns = dict(MOTIF_FAMILIES)
 
     # ── Score and classify each contig ──
     results = []

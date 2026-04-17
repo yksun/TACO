@@ -5,6 +5,134 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.0] — 2026-04-15
+
+### Overview
+
+Version 1.2.0 is a major refactor of Step 12 adopting a T2T-first assembly
+philosophy.  T2T contigs from all assemblers form the primary foundation;
+backbone contigs serve as gap-fill.  Redundans is removed from the pipeline.
+Step 12 now performs telomere-aware rescue with donor telomere verification,
+BUSCO trial validation, aggressive dedup of non-telomeric backbone contigs,
+and self-dedup.  purge_dups replaces Redundans (taxon-aware, ploidy-safe),
+and platform-aware polishing (skip for HiFi, Medaka for ONT, Racon for CLR)
+is default.  Telomere detection is taxon-aware via `--taxon`, and `--motif`
+is an optional override.
+
+---
+
+### Step 12 — T2T-first telomere-aware refinement with BUSCO trial validation
+
+- **Removed** Redundans from the default Step 12 workflow and from `taco-env.yml`.
+- **New** T2T-first assembly philosophy: T2T contigs from all assemblers
+  form the primary foundation.  Backbone contigs serve as gap-fill only
+  for chromosomal regions not covered by T2T contigs.
+- **New** backbone telomere classification (12D3): after initial dedup, all
+  remaining backbone contigs are classified by telomere status.  Contigs with
+  telomere signal are protected from aggressive dedup.
+- **New** aggressive non-telomeric dedup (12D4): backbone contigs lacking
+  telomere support that overlap the T2T pool at 70%/85% are removed.  Configurable
+  via `AGGR_NONTELO_COV` and `AGGR_NONTELO_ID` environment variables.
+- **New** non-telomeric self-dedup (12D5): when two non-telomeric backbone contigs
+  overlap at 80%/90%, the shorter one is removed.  Telomere-bearing contigs
+  are always kept.  Configurable via `SELFDEDUP_COV` and `SELFDEDUP_ID`.
+- **New** donor telomere verification: rescue candidates must carry verified
+  telomere signal.  Non-telomeric donors are rejected regardless of structural
+  alignment quality, enforcing the T2T-first principle.
+- **New** structural rescue candidate screening with detailed per-hit metrics:
+  identity, aligned bp, backbone/donor coverage, extension, terminal touch,
+  length gain, and composite structural score.
+- **New** BUSCO trial validation: each plausible candidate is tested by building
+  a trial assembly and running BUSCO.  Rejection thresholds are taxon-aware.
+- **New** telomere-aware genome-size pruning (12J): telomere-bearing contigs
+  are never pruned, only non-telomeric fragments are removed when assembly
+  exceeds the genome size budget.
+- **New** output files: `single_tel.replaced.debug.tsv` (all hits),
+  `single_tel.candidates.tsv` (plausible candidates),
+  `rescue_rejection_summary.txt`, `rescue_trial_summary.tsv`.
+- Structural screening thresholds: identity >= 0.85, aligned_bp >= 8000,
+  cov_backbone >= 0.60, cov_donor >= 0.50, extension >= 1000,
+  terminal touch window = 500 bp.  Configurable via environment variables.
+
+### Post-refinement stack
+
+- **New** purge_dups runs by default after final combine (skip with
+  `--no-purge-dups`).  Replaces Redundans for haplotig/overlap cleanup.
+  Taxon-aware: uses `-2` (two-round) for vertebrate/animal/plant only;
+  single-round for fungal/insect/other to avoid over-purging small genomes.
+  Emits a warning for plant genomes (potential polyploid risk).
+- **New** automatic polishing runs by default after purge_dups (skip with
+  `--no-polish`).  Platform-aware strategy:
+  - `--platform pacbio-hifi`: polishing skipped (HiFi reads are already
+    ~Q40+ accuracy); NextPolish2 used only if installed.
+  - `--platform nanopore`: Medaka (neural-network polisher) preferred;
+    falls back to Racon if Medaka is not installed.
+  - `--platform pacbio` (CLR): Racon.
+
+### Taxon-aware telomere detection
+
+- **New** `--taxon` CLI flag: `vertebrate`, `animal`, `plant`, `insect`,
+  `fungal`, or `other` (default).  Sets motif-family priors automatically.
+- **New** motif families: plant (TTTAGGG) and insect (TTAGG) added to
+  `telomere_detect.py`.
+- `--motif` is now documented as an optional override, not the recommended
+  default.  For fungi and unknown taxa, forcing `--motif` may miss true
+  telomeres.
+
+### Assembler platform compatibility
+
+- **Fixed** hifiasm: now correctly skipped for `--platform nanopore` and
+  `--platform pacbio` (CLR).  hifiasm only supports HiFi reads as primary
+  input.  Previously the pipeline attempted to run hifiasm with an `--ont`
+  flag that does not exist.
+- **New** taxon-aware backbone scoring weights: fungi penalise BUSCO
+  duplicates more heavily and reward T2T contigs; plant/vertebrate reduce
+  contig-count penalty for naturally larger assemblies and increase N50 weight.
+- **New** taxon-aware BUSCO trial thresholds: fungi 2% C-drop / 0.3%
+  M-rise (strict); plant 4% / 1.0% (relaxed for polyploidy); vertebrate
+  3% / 0.5%.
+
+### Configurability improvements
+
+- **New** `FLYE_ONT_FLAG` environment variable: override Flye read-type flag
+  for ONT reads (default `--nano-hq` for Q20+ data; set to `--nano-raw`
+  for older pre-Q20 ONT reads).
+- **New** `MEDAKA_MODEL` environment variable: override Medaka polishing
+  model (default `r1041_e82_400bps_sup_v4.3.0` for R10.4.1 SUP; set to
+  `r941_min_sup_g507` for older R9.4.1 data).
+- **New** `AGGR_NONTELO_COV`, `AGGR_NONTELO_ID`: thresholds for aggressive
+  non-telomeric dedup (default 0.70/0.85).
+- **New** `SELFDEDUP_COV`, `SELFDEDUP_ID`: thresholds for non-telomeric
+  self-dedup (default 0.80/0.90).
+
+### CLI changes
+
+- Added `--taxon` parameter.
+- Added `--no-purge-dups` to skip purge_dups.
+- Added `--no-polish` to skip polishing.
+- Updated `--motif` help text to indicate it is an override.
+- Updated `--reference` help text (Redundans reference removed).
+
+### Environment changes
+
+- Removed `redundans` from `taco-env.yml`.
+- Added `purge_dups`, `racon`, and `medaka` to `taco-env.yml`.
+
+### Taxon-aware score windows
+
+- Default telomere score window is now set by taxon: 300 bp for fungi
+  (short telomere arrays), 1000 bp for plant/vertebrate (longer arrays),
+  500 bp for others.
+
+### Version bumps
+
+- `__init__.py`: 1.1.0 → 1.2.0
+- `setup.py`: 1.1.0 → 1.2.0
+- `pipeline.py`: TACO-1.0.0 → TACO-1.2.0
+- `cli.py`: version string updated to v1.2.0
+
+---
+
 ## [1.1.0] — 2026-04-14
 
 ### Overview

@@ -36,7 +36,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.0.0"
+    PIPELINE_NAME = "TACO-1.2.0"
 
     def __init__(self, args):
         # Core parameters
@@ -44,17 +44,34 @@ class PipelineRunner:
         self.threads = args.threads
         self.fastq = os.path.realpath(args.fastq)
         self.motif = args.motif
+        self.taxon = getattr(args, 'taxon', 'other')
         self.platform = args.platform
         self.reference_fasta = args.reference
         self.steps = args.steps
         self.assembly_only = args.assembly_only
 
-        # Telomere parameters
+        # Telomere parameters — taxon-aware defaults
+        # Fungi: smaller windows (telomere arrays are short, 50-300 bp)
+        # Plants/vertebrates: larger windows (telomere arrays can span 5-20 kb)
         self.telomere_mode = getattr(args, 'telomere_mode', 'hybrid')
         self.telo_end_window = getattr(args, 'telo_end_window', 5000)
-        self.telo_score_window = getattr(args, 'telo_score_window', 500)
         self.telo_kmer_min = getattr(args, 'telo_kmer_min', 4)
         self.telo_kmer_max = getattr(args, 'telo_kmer_max', 30)
+
+        # Score window: user override takes precedence; otherwise taxon-aware
+        user_score_window = getattr(args, 'telo_score_window', None)
+        if user_score_window is not None and user_score_window != 500:
+            self.telo_score_window = user_score_window
+        elif self.taxon == "fungal":
+            self.telo_score_window = 300   # fungal telomere arrays are short
+        elif self.taxon in ("plant", "vertebrate", "animal"):
+            self.telo_score_window = 1000  # longer arrays in these taxa
+        else:
+            self.telo_score_window = 500   # balanced default
+
+        # Post-refinement options
+        self.no_purge_dups = getattr(args, 'no_purge_dups', False)
+        self.no_polish = getattr(args, 'no_polish', False)
 
         # Backbone selection
         self.auto_mode = args.auto_mode

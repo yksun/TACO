@@ -623,7 +623,14 @@ def step_05_flye(runner):
         _assembler_skip(runner, 5, "flye", "binary not found. Install via: conda install -c bioconda flye")
         return
 
-    flag_map = {"pacbio-hifi": "--pacbio-hifi", "nanopore": "--nano-hq", "pacbio": "--pacbio-raw"}
+    # Flye read-type flags per platform
+    # --nano-hq: ONT reads basecalled with Guppy5+/Dorado (Q20+) — default for
+    #   modern ONT data.  For older pre-Q20 ONT reads, users should set
+    #   FLYE_ONT_FLAG=--nano-raw in the environment.
+    # --pacbio-raw: PacBio CLR (continuous long reads, higher error rate)
+    # --pacbio-hifi: PacBio CCS/HiFi reads
+    ont_flag = os.environ.get("FLYE_ONT_FLAG", "--nano-hq")
+    flag_map = {"pacbio-hifi": "--pacbio-hifi", "nanopore": ont_flag, "pacbio": "--pacbio-raw"}
     flye_flag = flag_map.get(runner.platform, "--pacbio-hifi")
 
     runner.log_version("flye", "flye")
@@ -634,8 +641,23 @@ def step_05_flye(runner):
 
 
 def step_06_hifiasm(runner):
-    """Step 6 - Assembly using Hifiasm (non-fatal)."""
+    """Step 6 - Assembly using Hifiasm (non-fatal; HiFi only).
+
+    hifiasm is designed for PacBio HiFi reads. It does not natively support
+    ONT or PacBio CLR reads as primary input. For those platforms, use Flye,
+    Canu, or NextDenovo instead.
+    """
     runner.log("Step 6 - Assembly of the genome using Hifiasm")
+
+    # hifiasm only supports PacBio HiFi as primary input
+    if runner.platform == "nanopore":
+        _assembler_skip(runner, 6, "hifiasm",
+                        "does not support Nanopore reads as primary input")
+        return
+    if runner.platform == "pacbio":
+        _assembler_skip(runner, 6, "hifiasm",
+                        "does not support PacBio CLR reads as primary input")
+        return
 
     if not shutil.which("hifiasm"):
         _assembler_skip(runner, 6, "hifiasm", "binary not found. Install via: conda install -c bioconda hifiasm")
@@ -644,14 +666,10 @@ def step_06_hifiasm(runner):
     os.makedirs("hifiasm", exist_ok=True)
     runner.log_version("hifiasm", "hifiasm")
 
-    # Platform-specific flags for hifiasm
-    platform_flag = ""
-    if runner.platform == "nanopore":
-        platform_flag = "--ont"
-    elif runner.platform == "pacbio":
-        platform_flag = ""  # hifiasm uses default mode for CLR (less common)
+    # HiFi-only: use default mode (diploid-aware); add -l0 for known haploids
+    hifiasm_flags = ""
 
-    cmd = f"cd hifiasm && hifiasm -o hifiasm.asm -t {runner.threads} {platform_flag} {runner.fastq} 2> hifiasm.log"
+    cmd = f"cd hifiasm && hifiasm -o hifiasm.asm -t {runner.threads} {hifiasm_flags} {runner.fastq} 2> hifiasm.log"
     result = runner.run_cmd(cmd, desc="Running hifiasm", check=False)
     if result.returncode != 0:
         runner.log_warn("Step 6: hifiasm failed. Skipping. Check logs/step_6.log for details.")
@@ -794,6 +812,7 @@ def step_09_telomere(runner):
                 kmer_min=runner.telo_kmer_min,
                 kmer_max=runner.telo_kmer_max,
                 threads=runner.threads,
+                taxon=getattr(runner, 'taxon', 'other'),
             )
             write_detection_outputs(results, fasta_path, out_prefix)
         except Exception as e:
@@ -877,6 +896,7 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
             kmer_min=runner.telo_kmer_min,
             kmer_max=runner.telo_kmer_max,
             threads=runner.threads,
+            taxon=getattr(runner, 'taxon', 'other'),
         )
     except Exception as e:
         runner.log_warn(f"Telomere detection on merged output failed: {e}")
@@ -1026,6 +1046,7 @@ def step_10_telomere_pool(runner):
             kmer_min=runner.telo_kmer_min,
             kmer_max=runner.telo_kmer_max,
             threads=runner.threads,
+            taxon=getattr(runner, 'taxon', 'other'),
         )
         write_detection_outputs(pool_results, pool_fasta, "allmerged")
     except Exception as e:
@@ -1423,21 +1444,44 @@ def _auto_select_backbone(runner):
         else:
             if contigs <= 0 or n50 <= 0:
                 continue
-            # Core formula matches TACO.sh:
-            #   BUSCO_S*1000 + T2T*300 + single*150 + MerquryComp*200
-            #   + MerquryQV*20 - contigs*30 + log10(N50)*150
-            # Enhancement: explicit BUSCO_D penalty (-500 per % duplication)
-            # prevents highly duplicated assemblies from being selected even
-            # when they have many telomeric contigs.
+
+            # Taxon-aware scoring weights
+            # - Fungi (small genomes): stronger telomere rescue weight,
+            #   high BUSCO_D penalty (duplicated assemblies look falsely good)
+            # - Plants: stronger fragmentation penalty, moderate BUSCO_D
+            #   (polyploidy can inflate D naturally)
+            # - Vertebrate/animal: stronger contiguity preference,
+            #   conservative telomere weight (large repeat-rich chromosomes)
+            # - Insect/other: balanced defaults
+            taxon = getattr(runner, 'taxon', 'other')
+            w_busco_s = 1000
+            w_t2t = 300
+            w_single = 150
+            w_contigs = 30
+            w_n50 = 150
+            w_busco_d = 500
+
+            if taxon == "fungal":
+                w_busco_d = 600  # penalize duplication more strongly
+                w_t2t = 350      # telomere rescue is strong for small genomes
+            elif taxon == "plant":
+                w_contigs = 50   # penalize fragmentation more
+                w_busco_d = 300  # relax D penalty (polyploidy inflates D)
+                w_t2t = 200      # reduce telomere weight (false signals from repeats)
+            elif taxon in ("vertebrate", "animal"):
+                w_contigs = 40   # penalize fragmentation moderately
+                w_n50 = 200      # stronger contiguity preference
+                w_t2t = 200      # reduce telomere weight (ITRs common)
+
             score = (
-                busco_s * 1000
-                + t2t * 300
-                + single * 150
+                busco_s * w_busco_s
+                + t2t * w_t2t
+                + single * w_single
                 + merqury_comp * 200
                 + merqury_qv * 20
-                - contigs * 30
-                + math.log10(n50) * 150
-                - busco_d * 500
+                - contigs * w_contigs
+                + math.log10(n50) * w_n50
+                - busco_d * w_busco_d
             )
 
         records.append({
@@ -1570,6 +1614,114 @@ def _name_dedup_fasta(protected_fa, input_fa, output_fa):
     return len(protected_ids)
 
 
+def _classify_contigs_telomere_status(fasta_path, runner):
+    """Run telomere detection on contigs and return sets of telomere-bearing IDs.
+
+    Returns (t2t_ids, telo_ids) where:
+      - t2t_ids: contigs classified as strict_t2t
+      - telo_ids: contigs with ANY telomere signal (strict_t2t, single_tel_strong,
+        or telomere_supported)
+    """
+    t2t_ids = set()
+    telo_ids = set()
+
+    if not os.path.isfile(fasta_path) or os.path.getsize(fasta_path) == 0:
+        return t2t_ids, telo_ids
+
+    try:
+        results = detect_telomeres(
+            fasta_path,
+            mode=runner.telomere_mode,
+            user_motif=runner.motif,
+            end_window=runner.telo_end_window,
+            score_window=runner.telo_score_window,
+            kmer_min=runner.telo_kmer_min,
+            kmer_max=runner.telo_kmer_max,
+            threads=runner.threads,
+            taxon=getattr(runner, 'taxon', 'other'),
+        )
+        for r in results:
+            cls = r.get("classification", "")
+            name = r.get("contig", "")
+            if cls == "strict_t2t":
+                t2t_ids.add(name)
+                telo_ids.add(name)
+            elif cls in ("single_tel_strong", "telomere_supported"):
+                telo_ids.add(name)
+    except Exception:
+        pass
+
+    return t2t_ids, telo_ids
+
+
+def _self_dedup_non_telomeric(fasta_path, telo_ids, out_path, threads,
+                               cov_thr=0.80, id_thr=0.90):
+    """Remove non-telomeric backbone contigs that are redundant to each other.
+
+    When two non-telomeric contigs overlap at >= cov_thr / id_thr, the shorter
+    one is removed.  Telomere-bearing contigs (in telo_ids) are always kept.
+    """
+    if not os.path.isfile(fasta_path) or os.path.getsize(fasta_path) == 0:
+        _write_fasta([], out_path)
+        return 0
+
+    if not shutil.which("minimap2"):
+        shutil.copy(fasta_path, out_path)
+        return 0
+
+    # Self-align
+    paf_path = fasta_path + ".self.paf"
+    cmd = f"minimap2 -x asm20 -D -P -t {threads} {fasta_path} {fasta_path}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    with open(paf_path, "w") as f:
+        f.write(result.stdout)
+
+    # Parse PAF: for each pair of non-telomeric contigs, mark shorter as drop
+    seq_lens = {}
+    for n, s in _read_fasta_records(fasta_path):
+        seq_lens[n] = len(s)
+
+    drop = set()
+    with open(paf_path) as f:
+        for ln in f:
+            if not ln.strip():
+                continue
+            p = ln.rstrip().split("\t")
+            if len(p) < 12:
+                continue
+            qname, qlen = p[0], int(p[1])
+            qs, qe = int(p[2]), int(p[3])
+            tname, tlen = p[5], int(p[6])
+            ts, te = int(p[7]), int(p[8])
+            matches, alnlen = int(p[9]), int(p[10])
+
+            if qname == tname:
+                continue
+            if qname in telo_ids or tname in telo_ids:
+                continue  # never remove telomere-bearing contigs
+            if alnlen <= 0:
+                continue
+
+            ident = matches / max(1, alnlen)
+            cov_q = (qe - qs) / max(1, qlen)
+
+            if cov_q >= cov_thr and ident >= id_thr:
+                # Shorter contig is the redundant one
+                if qlen <= tlen:
+                    drop.add(qname)
+                else:
+                    drop.add(tname)
+
+    recs = [(n, s) for n, s in _read_fasta_records(fasta_path) if n not in drop]
+    _write_fasta(recs, out_path)
+
+    # Cleanup
+    if os.path.isfile(paf_path):
+        os.remove(paf_path)
+
+    return len(drop)
+
+
 def _telomere_rescue(single_fa, backbone_fa, paf_path, out_ids, out_fa,
                      min_ident=0.90, min_cov=0.80, min_ext=500):
     """Replace backbone contigs with telomeric single-end contigs when they extend the backbone.
@@ -1626,9 +1778,448 @@ def _telomere_rescue(single_fa, backbone_fa, paf_path, out_ids, out_fa,
     return len(replaced)
 
 
+def _parse_paf_rescue_hits(paf_path, donor_seqs, backbone_seqs, terminal_window=500):
+    """Parse PAF for telomere rescue candidate screening with detailed metrics.
+
+    Returns list of dicts with per-hit metrics for structural screening.
+    """
+    hits = []
+    if not os.path.isfile(paf_path):
+        return hits
+
+    with open(paf_path) as f:
+        for ln in f:
+            if not ln.strip() or ln.startswith("#"):
+                continue
+            p = ln.rstrip().split("\t")
+            if len(p) < 12:
+                continue
+            qname, qlen = p[0], int(p[1])
+            qs, qe = int(p[2]), int(p[3])
+            strand = p[4]
+            tname, tlen = p[5], int(p[6])
+            ts, te = int(p[7]), int(p[8])
+            matches, alnlen = int(p[9]), int(p[10])
+
+            if qname not in donor_seqs or tname not in backbone_seqs:
+                continue
+            if alnlen <= 0 or qlen <= 0 or tlen <= 0:
+                continue
+
+            ident = matches / max(1, alnlen)
+            cov_backbone = (te - ts) / max(1, tlen)
+            cov_donor = (qe - qs) / max(1, qlen)
+            ext = max(qs, qlen - qe)  # donor extension beyond alignment
+            len_gain = qlen - tlen
+            touches_left = ts <= terminal_window
+            touches_right = (tlen - te) <= terminal_window
+
+            hits.append({
+                "donor": qname,
+                "backbone": tname,
+                "donor_len": qlen,
+                "backbone_len": tlen,
+                "ident": ident,
+                "aligned_bp": alnlen,
+                "cov_backbone": cov_backbone,
+                "cov_donor": cov_donor,
+                "ext": ext,
+                "len_gain": len_gain,
+                "touches_left": touches_left,
+                "touches_right": touches_right,
+                "strand": strand,
+            })
+    return hits
+
+
+def _screen_rescue_candidates(hits, min_ident=0.85, min_aligned_bp=8000,
+                               min_cov_backbone=0.60, min_cov_donor=0.50,
+                               min_ext=1000):
+    """Split hits into obvious rejections and plausible candidates.
+
+    Returns (rejected, candidates) where each is a list of dicts with
+    added 'reject_reason' or 'structural_score' fields.
+    """
+    rejected = []
+    candidates = []
+
+    # Keep only the best hit per (donor, backbone) pair
+    best_per_pair = {}
+    for h in hits:
+        key = (h["donor"], h["backbone"])
+        cur = best_per_pair.get(key)
+        if cur is None or h["cov_backbone"] > cur["cov_backbone"]:
+            best_per_pair[key] = h
+
+    for h in best_per_pair.values():
+        reasons = []
+        if h["ident"] < min_ident:
+            reasons.append(f"ident={h['ident']:.4f}<{min_ident}")
+        if h["aligned_bp"] < min_aligned_bp:
+            reasons.append(f"aligned_bp={h['aligned_bp']}<{min_aligned_bp}")
+        if h["cov_backbone"] < min_cov_backbone:
+            reasons.append(f"cov_bb={h['cov_backbone']:.4f}<{min_cov_backbone}")
+        if h["cov_donor"] < min_cov_donor:
+            reasons.append(f"cov_donor={h['cov_donor']:.4f}<{min_cov_donor}")
+        if h["ext"] < min_ext:
+            reasons.append(f"ext={h['ext']}<{min_ext}")
+        if not h["touches_left"] and not h["touches_right"]:
+            reasons.append("no_terminal_touch")
+
+        if reasons:
+            h["reject_reason"] = "; ".join(reasons)
+            rejected.append(h)
+        else:
+            # Composite structural score for ranking
+            score = (
+                h["cov_backbone"] * 3.0 +
+                h["cov_donor"] * 2.0 +
+                h["ident"] * 2.0 +
+                min(h["ext"] / 5000.0, 1.0) * 1.5 +
+                (1.0 if h["touches_left"] or h["touches_right"] else 0.0) +
+                (0.5 if h["touches_left"] and h["touches_right"] else 0.0) +
+                max(min(h["len_gain"] / 10000.0, 0.5), -0.3)
+            )
+            h["structural_score"] = score
+            candidates.append(h)
+
+    # Rank candidates by structural score descending
+    candidates.sort(key=lambda x: x["structural_score"], reverse=True)
+    for i, c in enumerate(candidates):
+        c["candidate_rank"] = i + 1
+
+    return rejected, candidates
+
+
+def _write_rescue_debug_tsv(hits, path):
+    """Write all evaluated hits to debug TSV."""
+    cols = ["donor", "backbone", "ident", "aligned_bp", "cov_backbone",
+            "cov_donor", "ext", "len_gain", "touches_left", "touches_right"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(cols)
+        for h in hits:
+            w.writerow([
+                h["donor"], h["backbone"],
+                f"{h['ident']:.4f}", h["aligned_bp"],
+                f"{h['cov_backbone']:.4f}", f"{h['cov_donor']:.4f}",
+                h["ext"], h["len_gain"],
+                h["touches_left"], h["touches_right"],
+            ])
+
+
+def _write_candidates_tsv(candidates, path):
+    """Write plausible rescue candidates to TSV."""
+    cols = ["candidate_rank", "backbone", "donor", "ident", "aligned_bp",
+            "cov_backbone", "cov_donor", "ext", "len_gain",
+            "touches_left", "touches_right", "structural_score"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(cols)
+        for c in candidates:
+            w.writerow([
+                c["candidate_rank"], c["backbone"], c["donor"],
+                f"{c['ident']:.4f}", c["aligned_bp"],
+                f"{c['cov_backbone']:.4f}", f"{c['cov_donor']:.4f}",
+                c["ext"], c["len_gain"],
+                c["touches_left"], c["touches_right"],
+                f"{c['structural_score']:.4f}",
+            ])
+
+
+def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir):
+    """Run BUSCO on a trial assembly and return parsed metrics dict or None."""
+    busco_bin = shutil.which("busco")
+    if not busco_bin:
+        return None
+
+    trial_out = os.path.join(out_dir, trial_label)
+    if os.path.isdir(trial_out):
+        shutil.rmtree(trial_out)
+
+    cmd = (f"busco -o {trial_label} -i {trial_fa} -l {lineage} "
+           f"-m genome -c {threads} --out_path {out_dir} --offline")
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    # Parse BUSCO summary
+    for root_dir in [trial_out, os.path.join(out_dir, f"run_{trial_label}")]:
+        if not os.path.isdir(root_dir):
+            continue
+        # Try JSON
+        for jf in sorted(glob.glob(os.path.join(root_dir, "**", "short_summary*.json"),
+                                    recursive=True), key=os.path.getmtime, reverse=True):
+            try:
+                with open(jf) as f:
+                    data = json.load(f)
+                per = data.get("percentages") or {}
+                if per:
+                    return {k: float(per.get(k, 0)) for k in "CSDFM"}
+            except Exception:
+                continue
+        # Try TXT
+        for tf in sorted(glob.glob(os.path.join(root_dir, "**", "short_summary*.txt"),
+                                    recursive=True), key=os.path.getmtime, reverse=True):
+            try:
+                txt = open(tf, errors="ignore").read()
+                m = re.search(r"C:(\d+(?:\.\d+)?)%.*?S:(\d+(?:\.\d+)?)%.*?"
+                              r"D:(\d+(?:\.\d+)?)%.*?F:(\d+(?:\.\d+)?)%.*?"
+                              r"M:(\d+(?:\.\d+)?)%", txt, re.S)
+                if m:
+                    return {"C": float(m.group(1)), "S": float(m.group(2)),
+                            "D": float(m.group(3)), "F": float(m.group(4)),
+                            "M": float(m.group(5))}
+            except Exception:
+                continue
+    return None
+
+
+def _run_purge_dups(runner, input_fa, output_fa):
+    """Run purge_dups on the assembly to remove haplotigs and overlaps.
+
+    purge_dups is designed for haploid/primary assembly deduplication.
+    For polyploid genomes (e.g. plants with --taxon plant), exercise caution
+    as purge_dups may incorrectly collapse homeologous sequences.
+
+    Returns True if purge_dups ran successfully, False otherwise.
+    """
+    # Check all required tools
+    for tool in ["purge_dups", "pbcstat", "calcuts", "split_fa", "get_seqs"]:
+        if not shutil.which(tool):
+            runner.log_warn(f"{tool} not found; skipping purge_dups pipeline")
+            shutil.copy(input_fa, output_fa)
+            return False
+
+    # Taxon-aware warning for polyploid-prone taxa
+    taxon = getattr(runner, 'taxon', 'other')
+    if taxon == "plant":
+        runner.log_warn("purge_dups may collapse homeologous sequences in polyploid plants. "
+                        "Use --no-purge-dups if this is a polyploid genome.")
+
+    runner.log_info("Running purge_dups for haplotig/overlap cleanup")
+    pd_dir = "assemblies/purge_dups_work"
+    if os.path.isdir(pd_dir):
+        shutil.rmtree(pd_dir)
+    os.makedirs(pd_dir, exist_ok=True)
+
+    # Step 1: Align reads to assembly with platform-appropriate preset
+    mm2_preset = "map-hifi"
+    if runner.platform == "nanopore":
+        mm2_preset = "map-ont"
+    elif runner.platform == "pacbio":
+        mm2_preset = "map-pb"
+
+    paf = os.path.join(pd_dir, "reads_vs_asm.paf.gz")
+    cmd = (f"minimap2 -x {mm2_preset} -t {runner.threads} {input_fa} {runner.fastq} "
+           f"| gzip -c > {paf}")
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if not os.path.isfile(paf) or os.path.getsize(paf) == 0:
+        runner.log_warn("purge_dups: read alignment produced no output; skipping")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    # Step 2: Calculate coverage stats
+    stat_file = os.path.join(pd_dir, "PB.stat")
+    cutoff_file = os.path.join(pd_dir, "cutoffs")
+    cmd = f"pbcstat {paf} -O {pd_dir}"
+    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if not os.path.isfile(stat_file) or os.path.getsize(stat_file) == 0:
+        runner.log_warn("purge_dups pbcstat failed; skipping")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    cmd = f"calcuts {stat_file} > {cutoff_file}"
+    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if not os.path.isfile(cutoff_file) or os.path.getsize(cutoff_file) == 0:
+        runner.log_warn("purge_dups calcuts failed; skipping")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    # Step 3: Self-alignment for duplicate detection
+    split_fa = os.path.join(pd_dir, "asm.split.fa")
+    cmd = f"split_fa {input_fa} > {split_fa}"
+    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if not os.path.isfile(split_fa) or os.path.getsize(split_fa) == 0:
+        runner.log_warn("purge_dups split_fa failed; skipping")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    self_paf = os.path.join(pd_dir, "self_aln.paf.gz")
+    cmd = (f"minimap2 -x asm5 -t {runner.threads} -DP {split_fa} {split_fa} "
+           f"| gzip -c > {self_paf}")
+    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    # Step 4: Purge duplicates
+    # Note: -2 flag enables two-round purging (more aggressive).
+    # Use single-round for fungi/small genomes; two-round for vertebrates/plants.
+    base_cov = os.path.join(pd_dir, "PB.base.cov")
+    dups_bed = os.path.join(pd_dir, "dups.bed")
+    purge_flag = ""
+    if taxon in ("vertebrate", "animal", "plant"):
+        purge_flag = "-2"  # two-round for larger, more complex genomes
+    cmd = f"purge_dups {purge_flag} -c {base_cov} -T {cutoff_file} {self_paf} > {dups_bed}"
+    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if not os.path.isfile(dups_bed) or os.path.getsize(dups_bed) == 0:
+        runner.log_warn("purge_dups produced no dups.bed; skipping")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    # Step 5: Get purged sequences
+    # get_seqs writes purged.fa and hap.fa in its working directory.
+    # Use absolute path for input FASTA since we set cwd=pd_dir.
+    abs_input = os.path.abspath(input_fa)
+    cmd = f"get_seqs -e {dups_bed} {abs_input}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                            cwd=pd_dir)
+
+    purged_fa = os.path.join(pd_dir, "purged.fa")
+    hap_fa = os.path.join(pd_dir, "hap.fa")
+
+    if os.path.isfile(purged_fa) and os.path.getsize(purged_fa) > 0:
+        before_recs = list(_read_fasta_records(input_fa))
+        after_recs = list(_read_fasta_records(purged_fa))
+        before_bp = sum(len(s) for _, s in before_recs)
+        after_bp = sum(len(s) for _, s in after_recs)
+        hap_n = len(list(_read_fasta_records(hap_fa))) if os.path.isfile(hap_fa) else 0
+        runner.log(f"purge_dups: {len(before_recs)} → {len(after_recs)} contigs "
+                   f"({hap_n} haplotigs removed), "
+                   f"{before_bp:,} → {after_bp:,} bp")
+        shutil.copy(purged_fa, output_fa)
+        return True
+    else:
+        runner.log_warn("purge_dups produced no purged.fa; keeping original assembly")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+
+def _run_polishing(runner, input_fa, output_fa):
+    """Run platform-appropriate polishing on the assembly.
+
+    Platform selection logic:
+      - HiFi: Skip polishing by default (HiFi reads are ~Q40+, polishing has
+        minimal benefit and can introduce errors). If NextPolish2 is installed,
+        run it as an optional refinement.
+      - ONT:  Medaka (preferred, neural-network-based) → Racon (fallback)
+      - CLR:  Racon (standard for CLR polishing)
+
+    Returns True if polishing ran successfully.
+    """
+    platform = runner.platform or "pacbio-hifi"
+
+    if platform == "pacbio-hifi":
+        # HiFi assemblies are already high-accuracy (~Q40+).
+        # Polishing is optional and may not improve quality.
+        np2_bin = shutil.which("nextPolish2") or shutil.which("nextpolish2")
+        if np2_bin:
+            runner.log_info("Polishing HiFi assembly with NextPolish2 (optional refinement)")
+            polish_dir = "assemblies/polish_work"
+            os.makedirs(polish_dir, exist_ok=True)
+
+            bam = os.path.join(polish_dir, "reads.sorted.bam")
+            cmd = (f"minimap2 -ax map-hifi -t {runner.threads} {input_fa} {runner.fastq} "
+                   f"| samtools sort -@ {runner.threads} -o {bam}")
+            subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            subprocess.run(f"samtools index {bam}", shell=True,
+                           capture_output=True, text=True)
+
+            cmd = f"{np2_bin} {input_fa} {bam} > {output_fa}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if os.path.isfile(output_fa) and os.path.getsize(output_fa) > 0:
+                runner.log("NextPolish2 polishing complete")
+                return True
+            else:
+                runner.log_warn("NextPolish2 produced no output")
+        else:
+            runner.log_info("HiFi assembly: polishing skipped (HiFi reads are already "
+                            "high-accuracy; install NextPolish2 for optional refinement)")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    if platform == "nanopore":
+        # Medaka is preferred for ONT — neural-network-based, better accuracy
+        medaka_bin = shutil.which("medaka_consensus") or shutil.which("medaka")
+        if medaka_bin:
+            runner.log_info("Polishing ONT assembly with Medaka")
+            polish_dir = "assemblies/polish_work"
+            os.makedirs(polish_dir, exist_ok=True)
+            medaka_out = os.path.join(polish_dir, "medaka_out")
+
+            # Medaka model can be overridden via MEDAKA_MODEL env var.
+            # Default: r1041_e82_400bps_sup_v4.3.0 (R10.4.1 chemistry, SUP basecalling)
+            # For older R9.4.1 data, set MEDAKA_MODEL=r941_min_sup_g507
+            medaka_model = os.environ.get("MEDAKA_MODEL", "r1041_e82_400bps_sup_v4.3.0")
+            cmd = (f"medaka_consensus -i {runner.fastq} -d {input_fa} "
+                   f"-o {medaka_out} -t {runner.threads} -m {medaka_model}")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+            medaka_fa = os.path.join(medaka_out, "consensus.fasta")
+            if os.path.isfile(medaka_fa) and os.path.getsize(medaka_fa) > 0:
+                shutil.copy(medaka_fa, output_fa)
+                runner.log("Medaka polishing complete")
+                return True
+            else:
+                runner.log_warn("Medaka produced no output; falling back to Racon")
+
+    # Racon path: default for CLR, fallback for ONT
+    racon_bin = shutil.which("racon")
+    if not racon_bin:
+        runner.log_warn("racon not found; skipping polishing")
+        shutil.copy(input_fa, output_fa)
+        return False
+
+    runner.log_info(f"Polishing with Racon ({platform} reads)")
+    mm2_preset = "map-ont" if platform == "nanopore" else "map-pb"
+
+    polish_dir = "assemblies/polish_work"
+    os.makedirs(polish_dir, exist_ok=True)
+    overlap_paf = os.path.join(polish_dir, "reads_vs_asm.paf")
+    cmd = (f"minimap2 -x {mm2_preset} -t {runner.threads} {input_fa} {runner.fastq} "
+           f"> {overlap_paf}")
+    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    # Racon outputs polished FASTA to stdout
+    cmd = f"racon -t {runner.threads} {runner.fastq} {overlap_paf} {input_fa}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.stdout.strip():
+        with open(output_fa, "w") as f:
+            f.write(result.stdout)
+        if os.path.getsize(output_fa) > 0:
+            runner.log("Racon polishing complete")
+            return True
+
+    runner.log_warn("Racon produced no output; keeping unpolished assembly")
+    shutil.copy(input_fa, output_fa)
+    return False
+
+
 def step_12_refine(runner):
-    """Step 12 - Final assembly refinement with optimized telomere-end replacement."""
-    runner.log("Step 12 - Final assembly refinement with optimized telomere-end replacement")
+    """Step 12 - T2T-first telomere-aware backbone refinement with BUSCO trial validation.
+
+    v1.2.0 workflow (T2T-first philosophy):
+      12A  Merqury pre-selection (optional)
+      12B  Auto-select backbone assembler
+      12C  Prepare cleaned backbone + chimera safety check
+      12D  T2T-first foundation building:
+           12D1  Strict dedup — remove backbone contigs 95%/95% redundant to T2T pool
+           12D2  Fragment removal — remove backbone fragments 50%/90% to T2T pool
+           12D3  Classify backbone contigs by telomere status
+           12D4  Aggressive non-telomeric dedup — remove non-telo backbone contigs
+                 70%/85% redundant to T2T pool (more aggressive for contigs
+                 that lack telomere support)
+           12D5  Self-dedup non-telomeric backbone — remove smaller of overlapping
+                 non-telo backbone contigs (80%/90%)
+      12E  Telomere rescue with donor verification:
+           only accept donors with verified telomere signal
+      12F  BUSCO trial validation for plausible candidates only
+      12G  Final combine (T2T foundation + telomere-rescued backbone gap-fill)
+      12H  purge_dups default cleanup
+      12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
+      12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
+    """
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.2.0)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -1638,23 +2229,19 @@ def step_12_refine(runner):
     else:
         runner.log_info("Merqury disabled for this run")
 
-    # Always write Merqury summary CSV
     _write_merqury_csv()
-
-    # Build assembly info (combines BUSCO + QUAST + telomere + Merqury)
     _build_assembly_info(runner)
 
     # ---- 12B. Auto-select backbone assembler ----
     assembler = runner.assembler
     if not assembler:
-        runner.log_info(f"Selection criteria: BUSCO + telomere + Merqury + contiguity + N50")
+        runner.log_info("Selection criteria: BUSCO + telomere + Merqury + contiguity + N50")
         assembler = _auto_select_backbone(runner)
         if assembler:
             runner.log_info(f"Auto-selected assembler: {assembler}")
         else:
             runner.log_warn("Auto-selection failed; using first available assembler as fallback")
 
-    # Fallback: pick first available assembler
     if not assembler:
         for asm in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm", "reference"]:
             if os.path.isfile(f"assemblies/{asm}.result.fasta") and \
@@ -1668,7 +2255,7 @@ def step_12_refine(runner):
 
     asm_fa = f"assemblies/{assembler}.result.fasta"
     if not os.path.isfile(asm_fa) or os.path.getsize(asm_fa) == 0:
-        runner.log_error(f"Selected assembler '{assembler}' does not have valid FASTA at {asm_fa}")
+        runner.log_error(f"Selected assembler '{assembler}' has no valid FASTA at {asm_fa}")
         raise RuntimeError("Invalid assembler selection")
 
     # Read protected telomere pool from Step 10
@@ -1681,51 +2268,37 @@ def step_12_refine(runner):
             with open("protected_telomere_mode.txt") as f:
                 protected_mode = f.read().strip()
 
-    runner.log_info(f"Protected mode for final refinement: {protected_mode}")
-    runner.log_info(f"Selected backbone assembly: {asm_fa}")
+    runner.log_info(f"Protected mode: {protected_mode}")
+    runner.log_info(f"Selected backbone: {asm_fa}")
 
-    # ---- 12C. Prepare cleaned backbone ----
+    # ---- 12C. Prepare cleaned backbone + chimera safety ----
     backbone_fa = "assemblies/backbone.clean.fa"
     _clean_backbone_headers(asm_fa, backbone_fa)
 
-    # ---- 12C2. Chimera safety check on protected pool ----
-    # Even with Step 10's validated-merge approach, run a soft sanity check.
-    # Use the max individual contig length across ALL assembler .telo.fasta
-    # files as reference.  A legitimate T2T contig should be ≤ 1.5× this max
-    # (allowing for assembly variation and gap-resolution extensions).
-    # A chimera joining two chromosomes would be ~2× and gets caught.
     if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
-        # Find max contig length across all original assembler outputs
         max_individual_len = 0
         for telo_fa in glob.glob("assemblies/*.telo.fasta"):
             for _, seq in _read_fasta_records(telo_fa):
                 max_individual_len = max(max_individual_len, len(seq))
-
-        # Fallback to backbone if no telo files found
         if max_individual_len == 0:
             for _, seq in _read_fasta_records(backbone_fa):
                 max_individual_len = max(max_individual_len, len(seq))
 
         if max_individual_len > 0:
             chimera_threshold = int(max_individual_len * 1.5)
-
             protected_recs = list(_read_fasta_records(protected_fasta))
             n_before = len(protected_recs)
             filtered_recs = [(n, s) for n, s in protected_recs if len(s) <= chimera_threshold]
             n_removed = n_before - len(filtered_recs)
-
             if n_removed > 0:
-                runner.log_warn(
-                    f"Chimera safety: removed {n_removed} protected contigs > "
-                    f"{chimera_threshold:,} bp (1.5× max individual contig "
-                    f"{max_individual_len:,} bp) — likely chimeras"
-                )
+                runner.log_warn(f"Chimera safety: removed {n_removed} protected contigs > "
+                                f"{chimera_threshold:,} bp")
                 _write_fasta(filtered_recs, protected_fasta)
             else:
                 runner.log(f"Chimera safety: all {n_before} protected contigs pass "
                            f"(threshold {chimera_threshold:,} bp)")
 
-    # ---- 12D. Remove backbone contigs redundant to protected telomere pool ----
+    # ---- 12D. Strict protected-pool dedup (95%/95%) ----
     if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
         runner.log_info(f"Using protected telomere contigs from {protected_fasta}")
         shutil.copy(protected_fasta, "assemblies/protected.telomere.fa")
@@ -1738,25 +2311,15 @@ def step_12_refine(runner):
             with open(paf, "w") as f:
                 f.write(result.stdout)
 
-            # Use TACO.sh default thresholds (95%/95%).  Only drop backbone
-            # contigs that are nearly identical to protected T2T contigs.
-            # Lower thresholds (60%/90%) were tried but WORSENED duplication
-            # by dropping clean backbone contigs and replacing them with dirty
-            # pool contigs from high-D assemblers.
-            # Pass 1 — strict: drop near-identical contigs (95%/95%)
             n_dropped = _filter_redundant_to_protected(
                 paf, backbone_fa, "assemblies/backbone.filtered.fa",
                 cov_thr=float(os.environ.get("PROTECT_COV", "0.95")),
                 id_thr=float(os.environ.get("PROTECT_ID", "0.95")),
             )
-            runner.log(f"Pass 1 (strict): removed {n_dropped} backbone contigs "
+            runner.log(f"Strict dedup: removed {n_dropped} backbone contigs "
                        f"redundant to protected pool (95%/95%)")
 
-            # Pass 2 — minimap2-based fragment removal: drop backbone
-            # fragments that partially overlap T2T chromosomes (≥50%
-            # coverage at ≥90% identity).  Redundans runs later on the
-            # full combined assembly (12G2) where it can see both T2T
-            # and backbone contigs for smarter redundancy detection.
+            # Fragment removal pass (50%/90%)
             frag_paf = "assemblies/backbone_frag_vs_protected.paf"
             cmd = (f"minimap2 -x asm20 -t {runner.threads} "
                    f"assemblies/protected.telomere.fa assemblies/backbone.filtered.fa")
@@ -1765,72 +2328,364 @@ def step_12_refine(runner):
                 f.write(result.stdout)
 
             n_frag = _filter_fragments_to_protected(
-                frag_paf,
-                "assemblies/backbone.filtered.fa",
+                frag_paf, "assemblies/backbone.filtered.fa",
                 "assemblies/backbone.filtered.defrag.fa",
                 frag_cov_thr=float(os.environ.get("FRAG_COV", "0.50")),
                 frag_id_thr=float(os.environ.get("FRAG_ID", "0.90")),
             )
             if n_frag > 0:
-                runner.log(f"Pass 2 (fragment): removed {n_frag} backbone "
-                           f"fragments partially covered by T2T contigs (50%/90%)")
+                runner.log(f"Fragment removal: removed {n_frag} backbone fragments (50%/90%)")
                 shutil.copy("assemblies/backbone.filtered.defrag.fa",
                             "assemblies/backbone.filtered.fa")
             else:
-                runner.log("Pass 2 (fragment): no additional fragments removed")
+                runner.log("Fragment removal: no additional fragments removed")
         else:
-            runner.log_warn("minimap2 not found; cannot filter redundant backbone contigs.")
+            runner.log_warn("minimap2 not found; cannot filter redundant backbone contigs")
             shutil.copy(backbone_fa, "assemblies/backbone.filtered.fa")
 
-        # Name-based dedup: remove backbone contigs whose names match protected IDs
         _name_dedup_fasta("assemblies/protected.telomere.fa",
                           "assemblies/backbone.filtered.fa",
                           "assemblies/backbone.filtered.nodup.fa")
     else:
-        runner.log_warn("No protected telomere contigs found; keeping backbone for telomere rescue only")
+        runner.log_warn("No protected telomere contigs; keeping backbone for rescue only")
         with open("assemblies/protected.telomere.fa", "w") as f:
             pass
         shutil.copy(backbone_fa, "assemblies/backbone.filtered.nodup.fa")
 
-    # ---- 12E. Telomere rescue using optimized best single-end pool ----
+    # ---- 12D3. Classify remaining backbone contigs by telomere status ----
+    backbone_nodup_fa = "assemblies/backbone.filtered.nodup.fa"
+    runner.log_info("Classifying backbone contigs by telomere status")
+    bb_t2t_ids, bb_telo_ids = _classify_contigs_telomere_status(
+        backbone_nodup_fa, runner)
+    runner.log(f"Backbone telomere census: {len(bb_t2t_ids)} T2T, "
+               f"{len(bb_telo_ids)} any-telomere, out of "
+               f"{sum(1 for _ in _read_fasta_records(backbone_nodup_fa))} total")
+
+    # ---- 12D4. Aggressive non-telomeric dedup against T2T pool ----
+    # Non-telomeric backbone contigs that overlap T2T pool at 70%/85% are
+    # redundant partial copies that don't add telomere information.
+    # Telomere-bearing backbone contigs are kept regardless (they contribute
+    # chromosome-end information even if they overlap a T2T contig).
+    if protected_fasta and os.path.isfile(protected_fasta) and \
+       os.path.getsize(protected_fasta) > 0 and shutil.which("minimap2"):
+        aggr_paf = "assemblies/backbone_aggr_vs_protected.paf"
+        cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+               f"assemblies/protected.telomere.fa {backbone_nodup_fa}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        with open(aggr_paf, "w") as f:
+            f.write(result.stdout)
+
+        # Parse PAF: only drop NON-telomeric contigs that hit T2T at >= 70%/85%
+        aggr_best = _parse_paf_best_hits(aggr_paf)
+        aggr_cov = float(os.environ.get("AGGR_NONTELO_COV", "0.70"))
+        aggr_id = float(os.environ.get("AGGR_NONTELO_ID", "0.85"))
+        aggr_drop = {q for q, (cov, ident) in aggr_best.items()
+                     if cov >= aggr_cov and ident >= aggr_id
+                     and q not in bb_telo_ids}
+
+        if aggr_drop:
+            recs = [(n, s) for n, s in _read_fasta_records(backbone_nodup_fa)
+                    if n not in aggr_drop]
+            _write_fasta(recs, backbone_nodup_fa)
+            runner.log(f"Aggressive non-telo dedup: removed {len(aggr_drop)} "
+                       f"non-telomeric backbone contigs redundant to T2T pool "
+                       f"({aggr_cov:.0%}/{aggr_id:.0%})")
+        else:
+            runner.log("Aggressive non-telo dedup: no additional contigs removed")
+
+    # ---- 12D5. Self-dedup of non-telomeric backbone contigs ----
+    # When two non-telomeric backbone contigs overlap at 80%/90%,
+    # remove the shorter one.  Telomere-bearing contigs are never removed.
+    n_self_dedup = _self_dedup_non_telomeric(
+        backbone_nodup_fa, bb_telo_ids,
+        "assemblies/backbone.filtered.selfdedup.fa",
+        runner.threads,
+        cov_thr=float(os.environ.get("SELFDEDUP_COV", "0.80")),
+        id_thr=float(os.environ.get("SELFDEDUP_ID", "0.90")),
+    )
+    if n_self_dedup > 0:
+        runner.log(f"Non-telo self-dedup: removed {n_self_dedup} redundant "
+                   f"non-telomeric backbone contigs")
+        shutil.copy("assemblies/backbone.filtered.selfdedup.fa",
+                    backbone_nodup_fa)
+    else:
+        runner.log("Non-telo self-dedup: no additional contigs removed")
+
+    # ---- 12E. Telomere rescue candidate screening ----
+    # T2T-first philosophy: only accept rescue donors that bring telomere
+    # evidence to the assembly.  Non-telomeric donors are rejected because
+    # they don't improve chromosome-end completeness.
     single_tel_src = ""
-    for candidate in ["single_tel_best_clean.fasta", "single_tel_clean.fasta", "single_tel.fasta"]:
+    for candidate in ["single_tel_best_clean.fasta", "single_tel_best.fasta",
+                      "telomere_supported_best.fasta", "single_tel_clean.fasta",
+                      "single_tel.fasta"]:
         if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
             single_tel_src = candidate
             break
 
-    if single_tel_src:
-        runner.log_info(f"Running telomere rescue using {single_tel_src}")
-        shutil.copy("assemblies/backbone.filtered.nodup.fa", "assemblies/backbone.telomere_rescued.fa")
+    working_backbone = backbone_nodup_fa
 
-        if shutil.which("minimap2"):
-            rescue_paf = "assemblies/single_tel_vs_backbone.paf"
-            cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-                   f"assemblies/backbone.telomere_rescued.fa {single_tel_src}")
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            with open(rescue_paf, "w") as f:
-                f.write(result.stdout)
+    if single_tel_src and shutil.which("minimap2"):
+        runner.log_info(f"Screening telomere rescue candidates from {single_tel_src}")
 
-            n_rescued = _telomere_rescue(
-                single_tel_src,
-                "assemblies/backbone.telomere_rescued.fa",
-                rescue_paf,
-                "assemblies/single_tel.replaced.ids",
-                "assemblies/backbone.telomere_rescued.next.fa",
-            )
-            runner.log(f"Telomere rescue: {n_rescued} backbone contigs replaced with telomeric versions")
+        rescue_paf = "assemblies/single_tel_vs_backbone.paf"
+        cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+               f"{working_backbone} {single_tel_src}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        with open(rescue_paf, "w") as f:
+            f.write(result.stdout)
 
-            if os.path.isfile("assemblies/backbone.telomere_rescued.next.fa") and \
-               os.path.getsize("assemblies/backbone.telomere_rescued.next.fa") > 0:
-                shutil.move("assemblies/backbone.telomere_rescued.next.fa",
-                            "assemblies/backbone.telomere_rescued.fa")
-        else:
-            runner.log_warn("minimap2 not found; skipping telomere rescue.")
+        donor_seqs = dict(_read_fasta_records(single_tel_src))
+        backbone_seqs = dict(_read_fasta_records(working_backbone))
+
+        all_hits = _parse_paf_rescue_hits(rescue_paf, donor_seqs, backbone_seqs)
+        runner.log(f"Telomere rescue: {len(all_hits)} raw alignment hits")
+
+        # Write debug TSV with all hits
+        _write_rescue_debug_tsv(all_hits, "assemblies/single_tel.replaced.debug.tsv")
+
+        # Structural screening
+        rejected, candidates = _screen_rescue_candidates(
+            all_hits,
+            min_ident=float(os.environ.get("RESCUE_MIN_IDENT", "0.85")),
+            min_aligned_bp=int(os.environ.get("RESCUE_MIN_ALN_BP", "8000")),
+            min_cov_backbone=float(os.environ.get("RESCUE_MIN_COV_BB", "0.60")),
+            min_cov_donor=float(os.environ.get("RESCUE_MIN_COV_DONOR", "0.50")),
+            min_ext=int(os.environ.get("RESCUE_MIN_EXT", "1000")),
+        )
+        runner.log(f"Structural screening: {len(rejected)} rejected, "
+                   f"{len(candidates)} plausible candidates")
+
+        # ---- Donor telomere verification ----
+        # T2T-first philosophy: only accept donors that carry telomere signal.
+        # Write donor FASTA for classification, then filter candidates.
+        donor_telo_verified = set()
+        if candidates:
+            donor_check_fa = "assemblies/rescue_donors_check.fa"
+            unique_donors = {c["donor"] for c in candidates}
+            _write_fasta([(n, donor_seqs[n]) for n in unique_donors if n in donor_seqs],
+                         donor_check_fa)
+            _, donor_telo_set = _classify_contigs_telomere_status(
+                donor_check_fa, runner)
+            donor_telo_verified = donor_telo_set
+
+            # Move non-telomeric donors to rejected
+            telo_verified_candidates = []
+            for c in candidates:
+                if c["donor"] in donor_telo_verified:
+                    telo_verified_candidates.append(c)
+                else:
+                    c["reject_reason"] = "donor_no_telomere_signal"
+                    rejected.append(c)
+
+            n_donor_reject = len(candidates) - len(telo_verified_candidates)
+            if n_donor_reject > 0:
+                runner.log(f"Donor telomere verification: rejected {n_donor_reject} "
+                           f"donors lacking telomere signal")
+            candidates = telo_verified_candidates
+
+            # Re-rank after filtering
+            for i, c in enumerate(candidates):
+                c["candidate_rank"] = i + 1
+
+        runner.log(f"After donor verification: {len(candidates)} telomere-verified candidates")
+
+        # Write candidate TSV
+        _write_candidates_tsv(candidates, "assemblies/single_tel.candidates.tsv")
+
+        # Write rejection summary
+        with open("assemblies/rescue_rejection_summary.txt", "w") as f:
+            f.write(f"Total hits evaluated: {len(all_hits)}\n")
+            f.write(f"Obvious rejections: {len(rejected)}\n")
+            f.write(f"Plausible candidates: {len(candidates)}\n\n")
+            for r in rejected:
+                f.write(f"REJECT {r['donor']} → {r['backbone']}: {r['reject_reason']}\n")
+
+        # ---- 12F. BUSCO trial validation for plausible candidates ----
+        max_accepted = int(os.environ.get("STEP12_MAX_ACCEPTED", "20"))
+        min_bp_ratio = float(os.environ.get("STEP12_MIN_BP_RATIO", "0.90"))
+
+        # Taxon-aware BUSCO thresholds:
+        # - Haploid/fungal: strict (2% C-drop max)
+        # - Plant: relaxed (polyploidy inflates D naturally, allow 4% C-drop)
+        # - Vertebrate/animal: moderate (3% C-drop)
+        taxon = getattr(runner, 'taxon', 'other')
+        default_c_drop = "2.0"
+        default_m_rise = "0.3"
+        if taxon == "plant":
+            default_c_drop = "4.0"
+            default_m_rise = "1.0"
+        elif taxon in ("vertebrate", "animal"):
+            default_c_drop = "3.0"
+            default_m_rise = "0.5"
+
+        max_busco_c_drop = float(os.environ.get("STEP12_MAX_BUSCO_C_DROP", default_c_drop))
+        max_busco_m_rise = float(os.environ.get("STEP12_MAX_BUSCO_M_RISE", default_m_rise))
+
+        lineage = runner.busco_lineage or "ascomycota_odb10"
+        busco_available = shutil.which("busco") is not None and runner.run_busco
+
+        trial_dir = "assemblies/rescue_trials"
+        os.makedirs(trial_dir, exist_ok=True)
+
+        # Get baseline metrics
+        baseline_recs = list(_read_fasta_records(working_backbone))
+        baseline_bp = sum(len(s) for _, s in baseline_recs)
+        baseline_contigs = len(baseline_recs)
+        baseline_busco = None
+
+        if busco_available and candidates:
+            runner.log_info("Computing baseline BUSCO for trial validation")
+            baseline_busco = _run_busco_trial(working_backbone, lineage,
+                                               runner.threads, "baseline", trial_dir)
+            if baseline_busco:
+                runner.log(f"Baseline BUSCO: C={baseline_busco['C']:.1f}% "
+                           f"M={baseline_busco['M']:.1f}%")
+            else:
+                runner.log_warn("Baseline BUSCO parse failed; using structural checks only")
+
+        accepted_count = 0
+        trial_results = []
+        current_backbone = dict(backbone_seqs)  # working copy
+
+        for cand in candidates:
+            if accepted_count >= max_accepted:
+                runner.log_info(f"Reached max accepted rescues ({max_accepted})")
+                break
+
+            backbone_name = cand["backbone"]
+            donor_name = cand["donor"]
+
+            if backbone_name not in current_backbone:
+                continue
+            if donor_name not in donor_seqs:
+                continue
+
+            # Build trial assembly: replace backbone contig with donor
+            trial_recs = []
+            for n, s in current_backbone.items():
+                if n == backbone_name:
+                    trial_recs.append((donor_name, donor_seqs[donor_name]))
+                else:
+                    trial_recs.append((n, s))
+
+            trial_fa = os.path.join(trial_dir, f"trial_{cand['candidate_rank']}.fa")
+            _write_fasta(trial_recs, trial_fa)
+
+            trial_bp = sum(len(s) for _, s in trial_recs)
+            trial_contigs = len(trial_recs)
+
+            # Size check
+            if baseline_bp > 0 and trial_bp < baseline_bp * min_bp_ratio:
+                reason = "bp_drop"
+                trial_results.append({
+                    "candidate_rank": cand["candidate_rank"],
+                    "backbone": backbone_name, "donor": donor_name,
+                    "accepted": False, "reason": reason,
+                    "trial_bp": trial_bp, "trial_contigs": trial_contigs,
+                    "trial_supported": "", "baseline_busco_c": "",
+                    "trial_busco_c": "", "baseline_busco_m": "",
+                    "trial_busco_m": "", "busco_c_delta": "", "busco_m_delta": "",
+                })
+                runner.log(f"  Candidate {cand['candidate_rank']} "
+                           f"({donor_name} → {backbone_name}): REJECTED (bp_drop)")
+                continue
+
+            # BUSCO trial if available
+            trial_busco = None
+            if busco_available and baseline_busco:
+                trial_label = f"trial_{cand['candidate_rank']}"
+                trial_busco = _run_busco_trial(trial_fa, lineage,
+                                                runner.threads, trial_label, trial_dir)
+
+            accepted = True
+            reason = "accepted"
+
+            if trial_busco and baseline_busco:
+                c_delta = trial_busco["C"] - baseline_busco["C"]
+                m_delta = trial_busco["M"] - baseline_busco["M"]
+
+                if c_delta < -max_busco_c_drop:
+                    accepted = False
+                    reason = "busco_c_drop_gt_2"
+                elif m_delta > max_busco_m_rise:
+                    accepted = False
+                    reason = "busco_m_rise"
+            elif busco_available and baseline_busco and trial_busco is None:
+                # BUSCO ran but failed to parse
+                accepted = False
+                reason = "trial_busco_failed"
+
+            trial_results.append({
+                "candidate_rank": cand["candidate_rank"],
+                "backbone": backbone_name, "donor": donor_name,
+                "accepted": accepted, "reason": reason,
+                "trial_bp": trial_bp, "trial_contigs": trial_contigs,
+                "trial_supported": "",
+                "baseline_busco_c": f"{baseline_busco['C']:.1f}" if baseline_busco else "",
+                "trial_busco_c": f"{trial_busco['C']:.1f}" if trial_busco else "",
+                "baseline_busco_m": f"{baseline_busco['M']:.1f}" if baseline_busco else "",
+                "trial_busco_m": f"{trial_busco['M']:.1f}" if trial_busco else "",
+                "busco_c_delta": f"{c_delta:.1f}" if (trial_busco and baseline_busco) else "",
+                "busco_m_delta": f"{m_delta:.1f}" if (trial_busco and baseline_busco) else "",
+            })
+
+            if accepted:
+                accepted_count += 1
+                # Update working backbone
+                del current_backbone[backbone_name]
+                current_backbone[donor_name] = donor_seqs[donor_name]
+                # Update baseline BUSCO for next iteration
+                if trial_busco:
+                    baseline_busco = trial_busco
+                baseline_bp = trial_bp
+                runner.log(f"  Candidate {cand['candidate_rank']} "
+                           f"({donor_name} → {backbone_name}): ACCEPTED")
+            else:
+                runner.log(f"  Candidate {cand['candidate_rank']} "
+                           f"({donor_name} → {backbone_name}): REJECTED ({reason})")
+
+        runner.log(f"Telomere rescue: {accepted_count} replacements accepted")
+
+        # Write trial summary
+        trial_cols = ["candidate_rank", "backbone", "donor", "accepted", "reason",
+                      "trial_bp", "trial_contigs", "trial_supported",
+                      "baseline_busco_c", "trial_busco_c", "baseline_busco_m",
+                      "trial_busco_m", "busco_c_delta", "busco_m_delta"]
+        with open("assemblies/rescue_trial_summary.tsv", "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(trial_cols)
+            for tr in trial_results:
+                w.writerow([tr.get(c, "") for c in trial_cols])
+
+        # Write rescued backbone
+        rescued_recs = list(current_backbone.items())
+        _write_fasta(rescued_recs, "assemblies/backbone.telomere_rescued.fa")
+
+        # Write replaced IDs for reporting
+        with open("assemblies/single_tel.replaced.ids", "w") as f:
+            for tr in trial_results:
+                if tr["accepted"]:
+                    f.write(f"{tr['backbone']}\t{tr['donor']}\n")
     else:
-        runner.log_info("No single-end telomeric contigs available for telomere rescue")
-        shutil.copy("assemblies/backbone.filtered.nodup.fa", "assemblies/backbone.telomere_rescued.fa")
+        if not single_tel_src:
+            runner.log_info("No single-end telomeric contigs available for rescue")
+        elif not shutil.which("minimap2"):
+            runner.log_warn("minimap2 not found; skipping telomere rescue")
 
-    # ---- 12F. Remove rescued contigs redundant to protected set ----
+        shutil.copy(working_backbone, "assemblies/backbone.telomere_rescued.fa")
+
+        # Write empty output files for consistency
+        for p in ["assemblies/single_tel.replaced.debug.tsv",
+                   "assemblies/single_tel.candidates.tsv",
+                   "assemblies/rescue_rejection_summary.txt",
+                   "assemblies/rescue_trial_summary.tsv"]:
+            with open(p, "w") as f:
+                pass
+        with open("assemblies/single_tel.replaced.ids", "w") as f:
+            pass
+
+    # ---- 12F2. Post-rescue dedup against protected set ----
     if os.path.isfile("assemblies/protected.telomere.fa") and \
        os.path.getsize("assemblies/protected.telomere.fa") > 0 and \
        os.path.isfile("assemblies/backbone.telomere_rescued.fa") and \
@@ -1843,8 +2698,7 @@ def step_12_refine(runner):
             f.write(result.stdout)
 
         _filter_redundant_to_protected(
-            dedup_paf,
-            "assemblies/backbone.telomere_rescued.fa",
+            dedup_paf, "assemblies/backbone.telomere_rescued.fa",
             "assemblies/backbone.telomere_rescued.dedup.fa",
             cov_thr=0.95, id_thr=0.95,
         )
@@ -1873,145 +2727,73 @@ def step_12_refine(runner):
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
-    # ---- 12G2. Redundans reduction + scaffolding + gap closing ----
-    # Run Redundans on the FULL combined assembly (T2T + backbone) so it can
-    # see both the protected chromosomes and the surviving backbone fragments.
-    # Running on backbone alone (as was tried earlier) produces "Nothing
-    # reduced!" because the redundancy is between backbone fragments and T2T
-    # contigs, not among the backbone fragments themselves.
-    #
-    # Redundans performs three steps in order:
-    #   1. Reduction — detect and remove heterozygous/duplicate contigs
-    #   2. Scaffolding — join fragments using long reads (+ reference if given)
-    #   3. Gap closing — fill gaps created during scaffolding
-    #
-    # If --reference was provided, it is passed via -r for reference-guided
-    # scaffolding.  Without --reference, Redundans uses only the long reads.
-    if shutil.which("redundans.py") and os.path.isfile(raw_out) and \
-       os.path.getsize(raw_out) > 0:
-        runner.log_info("Running Redundans (reduction + scaffolding + gap closing) "
-                        "on full combined assembly")
-        runner.log_version("redundans.py", "redundans.py")
+    # ---- 12H. purge_dups default cleanup ----
+    if not getattr(runner, 'no_purge_dups', False):
+        purged_fa = "assemblies/final_merge.purged.fasta"
+        _run_purge_dups(runner, raw_out, purged_fa)
+        if os.path.isfile(purged_fa) and os.path.getsize(purged_fa) > 0:
+            shutil.copy(purged_fa, raw_out)
+    else:
+        runner.log_info("purge_dups skipped (--no-purge-dups)")
 
-        redundans_full_dir = "assemblies/redundans_full"
-        if os.path.isdir(redundans_full_dir):
-            shutil.rmtree(redundans_full_dir)
+    # ---- 12I. Platform-aware polishing ----
+    if not getattr(runner, 'no_polish', False):
+        polished_fa = "assemblies/final_merge.polished.fasta"
+        _run_polishing(runner, raw_out, polished_fa)
+        if os.path.isfile(polished_fa) and os.path.getsize(polished_fa) > 0:
+            shutil.copy(polished_fa, raw_out)
+    else:
+        runner.log_info("Polishing skipped (--no-polish)")
 
-        # Determine minimap2 preset based on platform
-        mm2_preset = "map-hifi"
-        if hasattr(runner, 'platform') and runner.platform:
-            if "nano" in runner.platform.lower():
-                mm2_preset = "map-ont"
-            elif "clr" in runner.platform.lower() or runner.platform.lower() == "pacbio":
-                mm2_preset = "map-pb"
-
-        # Build reference flag
-        ref_flag = ""
-        if runner.reference_fasta and os.path.isfile(runner.reference_fasta) \
-           and os.path.getsize(runner.reference_fasta) > 0:
-            ref_flag = f"-r {runner.reference_fasta} "
-            runner.log_info(f"Reference-guided mode using --reference: "
-                            f"{runner.reference_fasta}")
-        else:
-            runner.log_info("De novo mode (no --reference provided, using long reads only)")
-
-        # Count input contigs for logging
-        before_recs = list(_read_fasta_records(raw_out))
-        before_n = len(before_recs)
-        before_len = sum(len(s) for _, s in before_recs)
-
-        red_full_cmd = (
-            f"redundans.py "
-            f"-f {raw_out} "
-            f"-l {runner.fastq} "
-            f"{ref_flag}"
-            f"-o {redundans_full_dir} "
-            f"-t {runner.threads} "
-            f"--minimap2reduce "
-            f"-p {mm2_preset} "
-            f"--identity {os.environ.get('RED_IDENTITY', '0.51')} "
-            f"--overlap {os.environ.get('RED_OVERLAP', '0.80')} "
-            f"--minLength 200"
-        )
-        result = subprocess.run(red_full_cmd, shell=True,
-                                capture_output=True, text=True)
-        runner.log(f"  redundans stdout: {result.stdout.strip()}")
-        if result.stderr.strip():
-            runner.log(f"  redundans stderr: {result.stderr.strip()[:500]}")
-
-        # Redundans output priority: scaffolds.filled.fa > scaffolds.fa > contigs.reduced.fa
-        final_red_fa = None
-        for candidate in [
-            os.path.join(redundans_full_dir, "scaffolds.filled.fa"),
-            os.path.join(redundans_full_dir, "scaffolds.fa"),
-            os.path.join(redundans_full_dir, "contigs.reduced.fa"),
-        ]:
-            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                final_red_fa = candidate
-                break
-
-        if final_red_fa:
-            after_recs = list(_read_fasta_records(final_red_fa))
-            after_n = len(after_recs)
-            after_len = sum(len(s) for _, s in after_recs)
-            runner.log(f"Redundans result: {before_n} → {after_n} contigs/scaffolds, "
-                       f"{before_len:,} → {after_len:,} bp "
-                       f"(from {os.path.basename(final_red_fa)})")
-            shutil.copy(final_red_fa, raw_out)
-        else:
-            runner.log_warn("Redundans produced no output; keeping pre-Redundans assembly")
-    elif not shutil.which("redundans.py"):
-        runner.log_info("redundans.py not found; skipping Redundans reduction/scaffolding/gap closing")
-
-    # ---- 12H. Genome-size-aware pruning ----
-    # If total assembly size exceeds the expected genome size by >15%,
-    # the smallest non-T2T backbone contigs (most likely redundant fragments)
-    # are removed until the assembly is within budget.
-    # This catches fragments that passed both the strict and relaxed filters
-    # but still inflate assembly size and BUSCO D.
+    # ---- 12J. Genome-size-aware pruning (safety net) ----
+    # T2T-first: never prune telomere-bearing contigs.  Classify the final
+    # assembly and protect anything with telomere signal, not just the
+    # original T2T pool.
     expected_size = _parse_genome_size(runner.genomesize)
     if expected_size > 0:
         all_recs = list(_read_fasta_records(raw_out))
         total_len = sum(len(s) for _, s in all_recs)
-        budget = int(expected_size * 1.15)  # 15% tolerance
+        budget = int(expected_size * 1.15)
 
         if total_len > budget:
-            runner.log_warn(
-                f"Assembly size {total_len:,} bp exceeds expected "
-                f"{expected_size:,} bp + 15% = {budget:,} bp"
-            )
-            # Identify protected T2T contig names (they must not be removed)
+            runner.log_warn(f"Assembly size {total_len:,} bp exceeds "
+                            f"{expected_size:,} bp + 15% = {budget:,} bp")
+
+            # Build expanded protected set: original T2T pool + any contig
+            # in the final assembly that carries telomere signal
             protected_names = set()
             if os.path.isfile(prot):
                 for name, _ in _read_fasta_records(prot):
                     protected_names.add(name)
 
-            # Split into protected (keep unconditionally) and removable
+            # Classify final assembly contigs for telomere status
+            final_t2t, final_telo = _classify_contigs_telomere_status(
+                raw_out, runner)
+            protected_names |= final_telo  # protect ALL telomere-bearing contigs
+
             keep_always = [(n, s) for n, s in all_recs if n in protected_names]
             removable = [(n, s) for n, s in all_recs if n not in protected_names]
-
-            # Sort removable by length ascending — remove smallest first
-            # (smallest fragments are most likely to be redundant junk)
             removable.sort(key=lambda x: len(x[1]))
+
+            runner.log(f"Pruning protection: {len(keep_always)} telomere-bearing "
+                       f"contigs protected, {len(removable)} non-telomeric eligible")
 
             keep_len = sum(len(s) for _, s in keep_always)
             kept_backbone = []
             running_len = keep_len
-            # Walk from largest to smallest, adding back until budget reached
             for name, seq in reversed(removable):
                 if running_len + len(seq) <= budget:
                     kept_backbone.append((name, seq))
                     running_len += len(seq)
                 else:
-                    runner.log(f"  Pruning '{name}' ({len(seq):,} bp) — "
-                               f"would exceed genome-size budget")
+                    runner.log(f"  Pruning '{name}' ({len(seq):,} bp, non-telomeric)")
 
             n_pruned = len(removable) - len(kept_backbone)
             if n_pruned > 0:
                 final_recs = keep_always + kept_backbone
                 _write_fasta(final_recs, raw_out)
                 new_total = sum(len(s) for _, s in final_recs)
-                runner.log(f"Genome-size pruning: removed {n_pruned} small backbone "
+                runner.log(f"Genome-size pruning: removed {n_pruned} non-telomeric "
                            f"fragments ({total_len:,} → {new_total:,} bp)")
             else:
                 runner.log("Genome-size pruning: no contigs removed")
@@ -2019,8 +2801,7 @@ def step_12_refine(runner):
             runner.log(f"Assembly size {total_len:,} bp within budget "
                        f"({budget:,} bp) — no pruning needed")
 
-    n_sorted = _fasta_sort_minlen(raw_out,
-                                   f"merged_{assembler}_sort.fa",
+    n_sorted = _fasta_sort_minlen(raw_out, f"merged_{assembler}_sort.fa",
                                    prefix="contig", minlen=500)
     runner.log(f"Sorted final merged assembly: {n_sorted} contigs >= 500 bp")
 
@@ -2185,6 +2966,7 @@ def step_14_telomere_final(runner):
             kmer_min=runner.telo_kmer_min,
             kmer_max=runner.telo_kmer_max,
             threads=runner.threads,
+            taxon=getattr(runner, 'taxon', 'other'),
         )
         write_detection_outputs(results, final_fa, "assemblies/final")
     except Exception as e:

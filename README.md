@@ -85,7 +85,7 @@ mkdir -p my_project && cd my_project
 
 taco -g 12m -t 16 \
   --fastq /path/to/reads.fastq \
-  -m TTAGGG
+  --taxon fungal
 ```
 
 **Assembly-only comparison** (benchmarking only):
@@ -93,7 +93,7 @@ taco -g 12m -t 16 \
 ```bash
 taco -g 12m -t 16 \
   --fastq /path/to/reads.fastq \
-  -m TTAGGG \
+  --taxon fungal \
   --assembly-only
 ```
 
@@ -102,8 +102,16 @@ taco -g 12m -t 16 \
 ```bash
 taco -g 12m -t 16 \
   --fastq /path/to/reads.fastq \
-  -m TTAGGG \
+  --taxon fungal \
   --merqury-db reads.meryl
+```
+
+**With explicit motif override** (only if biologically known):
+
+```bash
+taco -g 12m -t 16 \
+  --fastq /path/to/reads.fastq \
+  -m TTAGGG
 ```
 
 ## Usage
@@ -115,10 +123,11 @@ taco -g 12m -t 16 \
 | `-g`, `--genomesize` | Estimated haploid genome size (e.g., `12m`, `40m`, `2g`) |
 | `-t`, `--threads` | Number of CPU threads |
 | `--fastq` | Input FASTQ file (use absolute path) |
-| `-m`, `--motif` | Telomere motif or seed motif |
-| `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio` |
+| `--taxon` | Taxonomy preset for telomere detection: `vertebrate`, `animal`, `plant`, `insect`, `fungal`, or `other` (default). Sets motif-family priors and detection behavior automatically. |
+| `-m`, `--motif` | Telomere motif override (optional). Only use when the exact motif is biologically known for the species. When omitted, taxon-aware hybrid detection is used instead. |
+| `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio`. Also determines default polishing tool. |
 | `-s`, `--steps` | Run selected steps only (e.g., `1,3-5`) |
-| `--reference`, `-ref` | Reference FASTA for comparison and Redundans scaffolding. Included as the "reference" assembler in all comparison tables. In Step 12, used as the reference genome for Redundans reference-guided reduction and scaffolding (`-r`). When omitted, Step 12 runs in pure de novo mode using only long reads for scaffolding. |
+| `--reference`, `-ref` | Reference FASTA for comparison. Included as the "reference" assembler in all comparison tables. |
 | `--busco` | Run BUSCO (optionally specify lineage dataset) |
 | `--choose` | Manually choose the backbone assembler |
 | `--assembly-only` | Stop after assembler comparison |
@@ -126,6 +135,8 @@ taco -g 12m -t 16 \
 | `--merqury` | Enable Merqury with auto-detected `.meryl` database |
 | `--merqury-db` | Enable Merqury with a specific `.meryl` database path |
 | `--no-merqury` | Disable Merqury even if available |
+| `--no-purge-dups` | Skip purge_dups after refinement |
+| `--no-polish` | Skip automatic polishing after refinement |
 
 ### Assembly-Only Mode
 
@@ -133,15 +144,15 @@ Use `--assembly-only` when the goal is assembler benchmarking and comparison wit
 
 ## Sequencing Platform Support
 
-TACO v1.0.0 supports three sequencing platforms. Each assembler receives platform-appropriate flags automatically.
+TACO supports three sequencing platforms. Each assembler receives platform-appropriate flags automatically. The platform also determines the default polishing strategy: HiFi assemblies skip polishing by default (already ~Q40+ accuracy; NextPolish2 used only if installed), Nanopore assemblies use Medaka (neural-network polisher; falls back to Racon), and CLR assemblies use Racon.
 
 | Platform | `--platform` | Assemblers Used | Notes |
 |---|---|---|---|
 | PacBio HiFi | `pacbio-hifi` (default) | canu, nextDenovo, peregrine, IPA, flye, hifiasm | All 6 assemblers |
-| Oxford Nanopore | `nanopore` | canu, nextDenovo, flye, hifiasm | Peregrine and IPA skipped |
-| PacBio CLR | `pacbio` | canu, nextDenovo, peregrine, flye, hifiasm | IPA skipped |
+| Oxford Nanopore | `nanopore` | canu, nextDenovo, flye | Peregrine, IPA, hifiasm skipped |
+| PacBio CLR | `pacbio` | canu, nextDenovo, peregrine, flye | IPA, hifiasm skipped |
 
-Incompatible assemblers are automatically skipped with a warning. For example, IPA only supports PacBio HiFi reads, and Peregrine does not support Nanopore reads.
+Incompatible assemblers are automatically skipped with a warning. IPA and hifiasm only support PacBio HiFi reads. Peregrine does not support Nanopore reads.
 
 ## Pipeline Steps
 
@@ -170,11 +181,26 @@ With `--assembly-only`, TACO follows the comparison path (Steps 1-11, 18) and st
 
 ## Telomere Detection
 
-TACO v1.0.0 uses a hybrid telomere detection system that combines built-in motif families with optional de novo k-mer discovery.
+TACO v1.2.0 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+
+### Taxon-Aware Presets
+
+Use `--taxon` to select the appropriate telomere motif priors for your organism. This is the recommended approach instead of forcing `--motif` directly.
+
+| `--taxon` | Primary Motifs | Notes |
+|---|---|---|
+| `vertebrate` | TTAGGG | Highly conserved; exact motif matching is most reliable here |
+| `animal` | TTAGGG | Strong prior for vertebrates, less certain for distant metazoans |
+| `plant` | TTTAGGG | Common plant repeat; some lineages vary |
+| `insect` | TTAGG | Common insect repeat; not universal across all insect orders |
+| `fungal` | TTAGGG, TG1-3, Candida | Diverse fungal telomeres — all built-in families used |
+| `other` (default) | All families | Unknown taxon — relies on de novo discovery plus all priors |
+
+The `--motif` flag is an optional override. Do not force `--motif` unless the telomere repeat is biologically confirmed for your species or lineage. For fungi and unknown taxa especially, forcing a motif may miss true telomeres.
 
 ### Built-in Motif Families
 
-TACO ships with three motif families covering the most common telomere repeats in eukaryotes: the canonical vertebrate/filamentous fungal TTAGGG repeat, the budding yeast TG1-3/C1-3A degenerate repeat, and the Candida 23-bp repeat (ACGGATGTCTAACTTCTTGGTGT). Users can specify a motif with `-m` or allow automatic detection.
+TACO ships with five motif families: the canonical vertebrate/filamentous fungal TTAGGG repeat, the budding yeast TG1-3/C1-3A degenerate repeat, the Candida 23-bp repeat (ACGGATGTCTAACTTCTTGGTGT), the plant TTTAGGG repeat, and the insect TTAGG repeat.
 
 ### Scoring System
 
@@ -204,62 +230,67 @@ BUSCO single-copy completeness (S%) is used instead of total completeness (C%) t
 
 `--auto-mode n50` selects the assembly with the highest N50. This reproduces legacy behavior but may favor contiguous assemblies that lack completeness.
 
-## Step 12 — Backbone Refinement with Redundans
+## Step 12 — T2T-First Telomere-Aware Backbone Refinement
 
-Step 12 refines the backbone assembly through: minimap2-based redundancy reduction against the protected T2T pool, telomere rescue, final combine, and then Redundans on the full combined assembly for reduction, scaffolding, and gap closing.
+Step 12 adopts a T2T-first assembly philosophy: T2T contigs from all assemblers form the primary foundation, while backbone contigs serve as gap-fill for chromosomal regions not covered by T2T contigs. Duplicate non-telomeric backbone contigs are aggressively removed, and rescue donors must carry verified telomere signal.
 
 ### Step 12 Sub-step Flow
 
-1. **12D Pass 1** — strict minimap2 dedup (95%/95%) removes near-identical backbone contigs.
-2. **12D Pass 2** — minimap2 fragment removal (50%/90%) removes backbone fragments partially overlapping T2T chromosomes.
-3. **12E** — telomere rescue: backbone contigs replaced by longer telomeric versions where possible.
-4. **12F** — post-rescue dedup against T2T pool.
-5. **12G** — final combine: protected T2T contigs + surviving backbone.
-6. **12G2** — Redundans on the full combined assembly (see below).
-7. **12H** — genome-size-aware pruning (safety net).
+1. **12A** — optional Merqury pre-selection.
+2. **12B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
+3. **12C** — prepare cleaned backbone + chimera safety check on protected pool.
+4. **12D** — T2T-first foundation building:
+   - **12D1** strict dedup (95%/95%): remove backbone contigs near-identical to T2T pool.
+   - **12D2** fragment removal (50%/90%): remove backbone fragments partially overlapping T2T chromosomes.
+   - **12D3** backbone telomere classification: run telomere detection on remaining backbone contigs to identify which carry telomere signal.
+   - **12D4** aggressive non-telomeric dedup (70%/85%): backbone contigs lacking telomere support that overlap the T2T pool are removed more aggressively than telomere-bearing contigs.
+   - **12D5** non-telomeric self-dedup (80%/90%): when two non-telomeric backbone contigs overlap, the shorter one is removed. Telomere-bearing contigs are always kept.
+5. **12E** — telomere rescue with donor verification: align donor pool to backbone, compute structural metrics, then verify each donor carries telomere signal. Non-telomeric donors are rejected regardless of alignment quality.
+6. **12F** — BUSCO trial validation: for each telomere-verified candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop, plant: 4%, vertebrate: 3%).
+7. **12G** — final combine: T2T foundation + telomere-rescued backbone gap-fill.
+8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
+9. **12I** — automatic polishing: skip for HiFi (NextPolish2 if installed), Medaka for ONT (Racon fallback), Racon for CLR (skip with `--no-polish`).
+10. **12J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
 
-### Redundans Integration (Step 12G2)
+### BUSCO Trial Validation
 
-TACO uses [Redundans](https://github.com/Gabaldonlab/redundans) (Pryszcz & Gabaldón 2016) on the full combined assembly so it can see both T2T chromosomes and backbone fragments together. Redundans runs all three of its stages in order:
+TACO validates each telomere rescue candidate by building a trial assembly where one backbone contig is replaced by one donor contig, then running BUSCO with the same lineage selected by the user. Rejection thresholds are taxon-aware: fungi use strict thresholds (2% C-drop max), plants use relaxed thresholds (4% C-drop, accounting for polyploidy), and vertebrates use moderate thresholds (3% C-drop). This greedy, sequential approach ensures that each accepted rescue improves or maintains assembly quality.
 
-1. **Redundancy reduction** — detects and removes heterozygous/duplicate contigs across the entire assembly. Because Redundans can see both the T2T contigs and the backbone fragments, it correctly identifies backbone fragments that are partial copies of T2T chromosomes. Thresholds: identity >= 0.51, overlap >= 0.80 (configurable via `RED_IDENTITY` / `RED_OVERLAP` environment variables).
+### Post-Refinement Stack
 
-2. **Long-read scaffolding** — joins fragments using the original sequencing reads (HiFi, ONT, or CLR). The minimap2 preset is auto-selected from `--platform`.
+After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups behaviour is taxon-aware: vertebrate, animal, and plant genomes use two-round purging (`-2` flag) for more thorough cleanup of larger, more complex genomes, while fungal and insect genomes use single-round to avoid over-purging. A warning is emitted for plant genomes due to polyploid risk. This is followed by automatic polishing selected from `--platform`: HiFi assemblies skip polishing by default (already ~Q40+ accuracy; NextPolish2 applied only if installed), Nanopore assemblies use Medaka (falls back to Racon if Medaka is not installed), and CLR assemblies use Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish` respectively.
 
-3. **Gap closing** — fills gaps introduced during scaffolding using the same long reads.
+### Diploid and Polyploid Note
 
-### Reference-Guided vs De Novo Mode
-
-The `--reference` / `-ref` parameter controls whether Redundans operates in reference-guided or de novo mode:
-
-- **With `--reference`**: The reference FASTA is passed to Redundans via `-r`. This enables reference-guided reduction and scaffolding, where Redundans uses the reference chromosome structure to order and orient contigs in addition to long-read evidence.
-
-- **Without `--reference`** (pure de novo): The reference is skipped entirely. Redundans uses only HiFi/long reads for reduction, scaffolding, and gap closing. No reference sequences are involved. This is the standard mode for de novo genome assembly projects.
-
-If `redundans.py` is not installed, TACO keeps the minimap2-based fragment removal in 12D and skips Redundans entirely.
+TACO is designed for producing a best primary-style chromosome-level assembly, not a fully phased diploid or polyploid reconstruction. For strongly diploid or polyploid genomes, telomere-bearing contigs from different haplotypes may appear as rescue donors, and purge_dups may collapse alternative haplotigs. This is acceptable when the goal is a cleaned primary reference assembly.
 
 ## Output Structure
 
 ```
 project_directory/
 ├── assemblies/
-│   ├── assembly_info.csv          # Unified comparison table
-│   ├── canu.fasta                 # Normalized assembly outputs
+│   ├── assembly_info.csv                # Unified comparison table
+│   ├── canu.fasta                       # Normalized assembly outputs
 │   ├── nextdenovo.fasta
 │   ├── ...
-│   └── *.busco/                   # BUSCO results per assembly
+│   ├── single_tel.replaced.debug.tsv    # All rescue alignment hits
+│   ├── single_tel.candidates.tsv        # Plausible rescue candidates
+│   ├── rescue_rejection_summary.txt     # Rejection reasons
+│   ├── rescue_trial_summary.tsv         # BUSCO trial results
+│   ├── final_merge.raw.fasta            # Pre-purge combined assembly
+│   └── *.busco/                         # BUSCO results per assembly
 ├── final_results/
-│   ├── final_result.csv           # Final comparison report
-│   ├── final_assembly.fasta       # Refined assembly (full mode)
-│   └── assembly_only_result.csv   # Comparison summary (assembly-only)
-├── telomere_pool/                 # Telomere pool intermediates
-├── quast_results/                 # QUAST output
-├── logs/                          # Per-step log files
-├── benchmark_logs/                # Machine-readable benchmark data
+│   ├── final_result.csv                 # Final comparison report
+│   ├── final_assembly.fasta             # Refined assembly (full mode)
+│   └── assembly_only_result.csv         # Comparison summary (assembly-only)
+├── telomere_pool/                       # Telomere pool intermediates
+├── quast_results/                       # QUAST output
+├── logs/                                # Per-step log files
+├── benchmark_logs/                      # Machine-readable benchmark data
 │   ├── run_metadata.tsv
 │   ├── step_benchmark.tsv
 │   └── run_summary.txt
-└── version.txt                    # Software versions
+└── version.txt                          # Software versions
 ```
 
 ## Project Structure
@@ -269,7 +300,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.0.0)
+│   ├── __init__.py         # Package metadata (v1.2.0)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
@@ -294,7 +325,9 @@ TACO/
 
 **IPA or Peregrine skipped:** These assemblers only support certain platforms. IPA requires PacBio HiFi; Peregrine does not support Nanopore. Use `--platform` to match your data type.
 
-**Telomere motif appears incorrect:** Do not assume the same motif for all fungi. Choose a motif appropriate for the target organism. TACO's built-in motif families cover canonical TTAGGG, budding yeast TG1-3, and Candida repeats.
+**Telomere motif appears incorrect:** Do not force `--motif` unless the telomere repeat is biologically known for your species. Use `--taxon` to select the appropriate preset instead. TACO's built-in motif families cover canonical TTAGGG, budding yeast TG1-3, Candida, plant TTTAGGG, and insect TTAGG repeats.
+
+**purge_dups or polishing not running:** These tools must be installed in the conda environment. Use `conda install -c bioconda purge_dups racon medaka` or skip with `--no-purge-dups` / `--no-polish`. For Nanopore polishing, Medaka is preferred; if unavailable, Racon is used as fallback.
 
 **`TACO.sh: command not found`:** Add the TACO directory to your PATH or run with the full path.
 

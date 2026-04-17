@@ -29,8 +29,11 @@ dependencies:
   # Contig merging (telomere-aware validated merge in Step 10)
   # quickmerge provides merge_wrapper.py used by Step 10
   - quickmerge
-  # Redundancy reduction, scaffolding, gap closing (Step 12)
-  - redundans
+  # Post-assembly haplotig/duplicate purging (Step 12)
+  - purge_dups
+  # Polishing (auto-selected by --platform in Step 12)
+  - racon
+  - medaka
   # Download tools (used by pipeline.py for --external FASTA fetching)
   - curl
   - wget
