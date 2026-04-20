@@ -1133,6 +1133,11 @@ def step_10_telomere_pool(runner):
     for fname, ids in [("t2t.fasta", t2t_ids), ("single_tel.fasta", single_ids),
                        ("telomere_supported.fasta", supported_ids)]:
         recs = [(n, pool_seqs[n]) for n in ids if n in pool_seqs]
+        missing = [n for n in ids if n not in pool_seqs]
+        if missing:
+            runner.log_warn(f"Name mismatch writing {fname}: {len(missing)}/{len(ids)} "
+                            f"classified IDs not found in pool_seqs "
+                            f"(first 3: {missing[:3]})")
         _write_fasta(recs, fname)
 
     runner.log(f"Pool classification: {len(t2t_ids)} t2t, {len(single_ids)} single, {len(supported_ids)} supported")
@@ -1328,10 +1333,10 @@ def step_10_telomere_pool(runner):
         if os.path.isfile(src):
             shutil.copy(src, dst)
 
-    # Count contigs
+    # Count contigs from final output files (after clean_contained dedup)
     strict_t2t_n = sum(1 for _ in open("t2t.fasta") if _.startswith(">")) if os.path.isfile("t2t.fasta") else 0
-    single_tel_n = sum(1 for _ in open("single_tel_best.fasta") if _.startswith(">")) if os.path.isfile("single_tel_best.fasta") else 0
-    tel_supported_n = sum(1 for _ in open("telomere_supported_best.fasta") if _.startswith(">")) if os.path.isfile("telomere_supported_best.fasta") else 0
+    single_tel_n = sum(1 for _ in open("single_tel.fasta") if _.startswith(">")) if os.path.isfile("single_tel.fasta") else 0
+    tel_supported_n = sum(1 for _ in open("telomere_supported.fasta") if _.startswith(">")) if os.path.isfile("telomere_supported.fasta") else 0
 
     with open("telomere_support_summary.csv", "w") as f:
         f.write(f"strict_t2t_contigs,{strict_t2t_n}\n")
@@ -2655,6 +2660,13 @@ def step_12_refine(runner):
 
     working_backbone = backbone_nodup_fa
 
+    # Pre-initialize rescue variables so they are always defined,
+    # even when the rescue if-block is skipped entirely.
+    candidates = []
+    donor_seqs = {}
+    donor_telo_verified = set()
+    donor_t2t_verified = set()
+
     if single_tel_src and shutil.which("minimap2"):
         runner.log_info(f"Screening telomere rescue candidates from {single_tel_src}")
 
@@ -2805,6 +2817,8 @@ def step_12_refine(runner):
         baseline_contigs = len(baseline_recs)
         baseline_busco = None
 
+        runner.log_info(f"BUSCO trial validation: {len(candidates)} candidates, "
+                        f"busco_available={busco_available}")
         if busco_available and candidates:
             runner.log_info("Computing baseline BUSCO for trial validation")
             baseline_busco = _run_busco_trial(working_backbone, lineage,
@@ -2819,6 +2833,10 @@ def step_12_refine(runner):
         accepted_count = 0
         trial_results = []
         current_backbone = dict(backbone_seqs)
+
+        if not candidates:
+            runner.log_info("No plausible rescue candidates after filtering; "
+                            "skipping BUSCO trial validation loop")
 
         for cand in candidates:
             if accepted_count >= max_accepted:
@@ -3142,9 +3160,9 @@ def step_12_refine(runner):
     if prot_ids and len_to_asm:
         if os.path.isfile(prot):
             for cname, cseq in _read_fasta_records(prot):
-                candidates = len_to_asm.get(len(cseq), [])
-                if candidates:
-                    pool_asm_map[cname] = candidates[0]
+                asm_matches = len_to_asm.get(len(cseq), [])
+                if asm_matches:
+                    pool_asm_map[cname] = asm_matches[0]
 
     # Also map rescue donor contigs
     if replaced_map and len_to_asm:
@@ -3154,9 +3172,9 @@ def step_12_refine(runner):
                 # Try to find the donor in the raw_out before rename
                 for cname, cseq in _read_fasta_records(raw_out):
                     if cname == donor_name:
-                        candidates = len_to_asm.get(len(cseq), [])
-                        if candidates:
-                            pool_asm_map[donor_name] = candidates[0]
+                        asm_matches = len_to_asm.get(len(cseq), [])
+                        if asm_matches:
+                            pool_asm_map[donor_name] = asm_matches[0]
                         break
 
     _write_provenance_gff(
