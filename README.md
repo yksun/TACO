@@ -301,6 +301,8 @@ When validating rescue candidates via BUSCO trial, the maximum acceptable C% dro
 
 A D-rise (duplicated BUSCO increase) check catches cases where a rescue introduces redundant copies of single-copy orthologs — a sign of retained haplotigs or mis-joined contigs. All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP`, `STEP12_MAX_BUSCO_M_RISE`, and `STEP12_MAX_BUSCO_D_RISE` environment variables.
 
+Additional environment variables for fine-tuning Step 12: `PROTECT_COV` / `PROTECT_ID` (strict dedup thresholds, default 0.95/0.95), `DEDUP_MAX_BUSCO_C_DROP` (maximum tolerated BUSCO C drop after dedup, default 3.0%), `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `AGGR_NONTELO_COV` / `AGGR_NONTELO_ID` (taxon-aware non-telo dedup), `SELFDEDUP_COV` / `SELFDEDUP_ID` (self-dedup thresholds).
+
 ### Taxon-Specific Rescue Limits (Step 12F)
 
 The maximum number of accepted rescue candidates per run is taxon-aware: fungi allow up to 20 rescues (many small chromosomes), vertebrates 10, plants 8 (conservative due to polyploidy risk), and other taxa 15. This prevents runaway replacement in complex genomes.
@@ -326,10 +328,11 @@ Duplicate non-telomeric backbone contigs are aggressively removed (with taxon-aw
 
 1. **12A** — Merqury QV scoring (optional; auto-detected if installed, or enabled with `--merqury`/`--merqury-db`).
 2. **12B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
-3. **12C** — prepare cleaned backbone + chimera safety check on protected pool.
+3. **12C** — prepare cleaned backbone + chimera safety using two strategies: (a) **size gate** — contigs > 1.5× the largest individual assembler contig are flagged; (b) **cross-assembly mapping** — each protected contig is aligned against all other assembler outputs; contigs not well-covered (≥60%) by any single assembler's contig are flagged as potential chimeras. Configurable via `CHIMERA_MIN_CROSS_COV`.
 4. **12D** — T2T-first foundation building:
-   - **12D1** strict dedup (95%/95%): remove backbone contigs near-identical to T2T pool.
-   - **12D2** fragment removal (50%/90%): remove backbone fragments partially overlapping T2T chromosomes.
+   - **12D1** strict dedup (95%/95%): remove backbone contigs near-identical to T2T pool. Each removal is logged (name, length, coverage, identity).
+   - **12D2** post-dedup BUSCO safety check: runs BUSCO on the combined assembly (protected + remaining backbone) and compares to the backbone alone. Warns if BUSCO C drops > 3% (configurable via `DEDUP_MAX_BUSCO_C_DROP`), with remediation suggestions.
+   - **12D2b** fragment removal (50%/90%): remove backbone fragments partially overlapping T2T chromosomes.
    - **12D3** backbone telomere classification: run telomere detection on remaining backbone contigs to identify which carry telomere signal.
    - **12D4** aggressive non-telomeric dedup (taxon-aware): backbone contigs lacking telomere support that overlap the T2T pool are removed. Thresholds: fungi 70%/85%, plant/vertebrate 85%/92%, other 75%/88%.
    - **12D5** non-telomeric self-dedup (taxon-aware): when two non-telomeric backbone contigs overlap, the shorter one is removed. Thresholds: fungi 80%/90%, plant/vertebrate 90%/95%, other 85%/92%. Telomere-bearing contigs are always kept.
@@ -354,7 +357,11 @@ TACO is designed for producing a best primary-style chromosome-level assembly, n
 
 ### Provenance GFF3
 
-TACO writes a GFF3 annotation file (`final.merged.provenance.gff3`) alongside the final assembly. Each contig gets one GFF3 record spanning its full length, with attributes documenting where it came from: `source_assembler` (which assembler originally produced it), `role` (t2t_pool, backbone, or rescue_donor), `original_name` (name before the sort/rename step), and `replacement_class` (for rescue donors: fill_missing_end, replace_non_telo_backbone, replace_single_with_better, or replace_protected_t2t). This makes it straightforward to trace which regions of the final chromosome-level assembly came from which assembler and why.
+TACO writes a GFF3 annotation file (`final.merged.provenance.gff3`) alongside the final assembly. Each contig gets one GFF3 record (type=contig) spanning its full length, with attributes documenting its full provenance chain: `source_assembler` (which assembler produced it), `assembler_contig` (the original contig name from that assembler before Step 10 pool renaming), `source_type` (assembler or quickmerge), `role` (backbone, upgrade_donor, or novel_t2t), `replacement_class` (for upgrade donors), `replaced_contig` (which backbone contig was replaced), and `description` (a human-readable summary like "Entire replacement: peregrine contig 'contig_5' replaced by canu contig 'tig00000015' (class: upgrade_tier2_to_t2t)").
+
+For quickmerge-derived contigs, the GFF3 includes additional contig-level attributes (`qm_assembler1`, `qm_assembler2`) identifying the two source assemblers, plus child records (type=region) with `Parent` linking to the contig. Each region record spans the genomic coordinates contributed by a specific assembler, with `source_assembler` and `assembler_contig` showing the original source. For example, a quickmerge contig produced from canu × flye will have region records like "Region 1-500000 from canu contig 'tig00001'" and "Region 400000-900000 from flye contig 'contig_3'", enabling users to trace every base pair back to its assembler of origin.
+
+A companion file `pool_contig_provenance.tsv` maps every pool contig back to its source assembler and original contig name, with extended columns for quickmerge contigs: `qm_assembler1`, `qm_assembler2`, and `qm_regions` (semicolon-delimited `start-end:assembler:contig` entries).
 
 ## Output Structure
 
@@ -374,7 +381,8 @@ project_directory/
 ├── final_results/
 │   ├── final_result.csv                 # Final comparison report
 │   ├── final_assembly.fasta             # Refined assembly (full mode)
-│   ├── final.merged.provenance.gff3     # GFF3 provenance: source assembler per contig
+│   ├── final.merged.provenance.gff3     # GFF3 provenance: full assembler tracing per contig
+│   ├── pool_contig_provenance.tsv       # Pool contig → assembler + original name mapping
 │   └── assembly_only_result.csv         # Comparison summary (assembly-only)
 ├── telomere_pool/                       # Telomere pool intermediates
 ├── quast_results/                       # QUAST output

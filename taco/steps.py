@@ -1025,6 +1025,7 @@ def step_10_telomere_pool(runner):
     # Run quickmerge pairwise, then validate: only accept merged contigs that
     # (a) classify as strict_t2t and (b) pass length sanity check.
     validated_t2t_from_merge = []  # list of (name, seq) tuples
+    qm_pair_map = {}  # quickmerge_contig_name -> (assembler1, assembler2)
     if len(fasta_files) > 1 and shutil.which("merge_wrapper.py"):
         for old_f in glob.glob("merged_*.fasta"):
             os.remove(old_f)
@@ -1058,6 +1059,8 @@ def step_10_telomere_pool(runner):
                             f"Validated {len(new_t2t)} T2T contigs from "
                             f"quickmerge({base1} × {base2})"
                         )
+                        for tname, tseq in new_t2t:
+                            qm_pair_map[tname] = (base1, base2)
                         validated_t2t_from_merge.extend(new_t2t)
                     else:
                         runner.log_info(
@@ -1089,9 +1092,148 @@ def step_10_telomere_pool(runner):
     n_qm = len(validated_t2t_from_merge)
     runner.log(f"Pool: {len(fasta_files)} assembler .telo.fasta files + {n_qm} validated quickmerge T2T")
 
-    n_sorted = _fasta_sort_minlen("allmerged_telo.fasta", "allmerged_telo_sort.fasta",
-                                   prefix="contig", minlen=500)
+    n_sorted, pool_name_map = _fasta_sort_minlen_with_map(
+        "allmerged_telo.fasta", "allmerged_telo_sort.fasta",
+        prefix="contig", minlen=500)
     runner.log(f"Sorted telomere contigs: {n_sorted} contigs >= 500 bp")
+
+    # Build comprehensive provenance map:
+    # pool_contig_name → (assembler, original_name, source_type)
+    #
+    # The concatenation order is tracked in contig_order (assembler_key, orig_name).
+    # Quickmerge contigs are appended after with suffix "_qm_validated".
+    # pool_name_map gives {new_sorted_name: old_concat_name}.
+    # We need: old_concat_name → (assembler, original_name, source_type).
+    concat_provenance = {}  # old_concat_name → (asm, orig, source_type)
+    for f_path in sorted(fasta_files):
+        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(
+            ".result.fasta", "").replace(".fasta", "")
+        asm_key = basename.lower()
+        if os.path.isfile(f_path):
+            for cname, _ in _read_fasta_records(f_path):
+                concat_provenance[cname] = (asm_key, cname, "assembler")
+    # ---- Region-level provenance for quickmerge contigs ----
+    # For each validated quickmerge T2T, align it against both source assembler
+    # FASTAs to determine which assembler contributed which region.
+    # qm_regions: qm_contig_name -> list of (start, end, assembler, source_contig)
+    qm_regions = {}
+    if validated_t2t_from_merge and qm_pair_map and shutil.which("minimap2"):
+        # Write all validated QM contigs to a temporary FASTA
+        qm_tmp_fa = "assemblies/_qm_validated_tmp.fa"
+        _write_fasta(validated_t2t_from_merge, qm_tmp_fa)
+
+        for qm_name, (asm1, asm2) in qm_pair_map.items():
+            regions = []
+            qm_seq_len = 0
+            for tname, tseq in validated_t2t_from_merge:
+                if tname == qm_name:
+                    qm_seq_len = len(tseq)
+                    break
+            if qm_seq_len == 0:
+                continue
+
+            # Write just this one QM contig
+            qm_single_fa = "assemblies/_qm_single_tmp.fa"
+            for tname, tseq in validated_t2t_from_merge:
+                if tname == qm_name:
+                    _write_fasta([(tname, tseq)], qm_single_fa)
+                    break
+
+            # Align against each source assembler
+            for asm_name in [asm1, asm2]:
+                asm_fa = f"assemblies/{asm_name}.telo.fasta"
+                if not os.path.isfile(asm_fa):
+                    asm_fa = f"assemblies/{asm_name}.result.fasta"
+                if not os.path.isfile(asm_fa):
+                    continue
+
+                paf_tmp = "assemblies/_qm_region_tmp.paf"
+                cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                       f"{qm_single_fa} {asm_fa}")
+                result = subprocess.run(cmd, shell=True, capture_output=True,
+                                        text=True)
+                with open(paf_tmp, "w") as f:
+                    f.write(result.stdout)
+
+                # Parse PAF: find which target regions of the QM contig each
+                # source assembler covers.  PAF target = qm_contig (reference),
+                # query = assembler contig.
+                if os.path.isfile(paf_tmp):
+                    with open(paf_tmp) as f:
+                        for ln in f:
+                            p = ln.rstrip().split("\t")
+                            if len(p) < 12:
+                                continue
+                            src_contig = p[0]
+                            tstart, tend = int(p[7]), int(p[8])
+                            matches, alnlen = int(p[9]), int(p[10])
+                            if alnlen <= 0:
+                                continue
+                            ident = matches / max(1, alnlen)
+                            if ident >= 0.85 and (tend - tstart) >= 1000:
+                                regions.append((tstart, tend, asm_name,
+                                                src_contig, ident))
+
+            # Merge overlapping regions per assembler and pick best coverage
+            if regions:
+                # Sort by start position
+                regions.sort(key=lambda x: x[0])
+                # Deduplicate: for overlapping regions from different assemblers,
+                # keep both (they show the merge boundary).  Just store all.
+                qm_regions[qm_name] = regions
+
+        # Cleanup temp files
+        for tmp in ["assemblies/_qm_validated_tmp.fa",
+                     "assemblies/_qm_single_tmp.fa",
+                     "assemblies/_qm_region_tmp.paf"]:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+
+    for name, seq in validated_t2t_from_merge:
+        qm_name = f"{name}_qm_validated"
+        asm1, asm2 = qm_pair_map.get(name, ("unknown", "unknown"))
+        concat_provenance[qm_name] = (
+            "quickmerge", name, "quickmerge",
+            asm1, asm2,
+            qm_regions.get(name, [])
+        )
+
+    # Now map pool sorted names to provenance
+    # Extended format: (asm, orig_name, source_type, [asm1, asm2, regions])
+    pool_provenance = {}
+    for new_name, old_name in pool_name_map.items():
+        if old_name in concat_provenance:
+            prov = concat_provenance[old_name]
+            if len(prov) == 3:
+                # Regular assembler contig: (asm, orig, source_type)
+                pool_provenance[new_name] = prov
+            else:
+                # Quickmerge contig: (asm, orig, source_type, asm1, asm2, regions)
+                pool_provenance[new_name] = prov
+        else:
+            pool_provenance[new_name] = ("unknown", old_name, "unknown")
+
+    # Save provenance TSV for Step 12 GFF generation
+    # Extended format with quickmerge pair info and region detail
+    prov_tsv = "pool_contig_provenance.tsv"
+    with open(prov_tsv, "w") as f:
+        f.write("pool_name\tassembler\toriginal_name\tsource_type\t"
+                "qm_assembler1\tqm_assembler2\tqm_regions\n")
+        for pname in sorted(pool_provenance.keys(),
+                            key=lambda x: int(x.split("_")[1]) if "_" in x else 0):
+            prov = pool_provenance[pname]
+            asm, orig, stype = prov[0], prov[1], prov[2]
+            if len(prov) >= 6 and stype == "quickmerge":
+                asm1, asm2, regions = prov[3], prov[4], prov[5]
+                # Format regions as "start-end:asm:contig;..."
+                reg_str = ";".join(
+                    f"{s}-{e}:{a}:{c}"
+                    for s, e, a, c, _ in regions
+                ) if regions else ""
+                f.write(f"{pname}\t{asm}\t{orig}\t{stype}\t{asm1}\t{asm2}\t{reg_str}\n")
+            else:
+                f.write(f"{pname}\t{asm}\t{orig}\t{stype}\t\t\t\n")
+    runner.log(f"Saved pool contig provenance: {prov_tsv} ({len(pool_provenance)} entries)")
 
     # ===== Hybrid telomere detection on merged pool =====
     runner.log("Running hybrid telomere detection on merged pool")
@@ -1179,68 +1321,11 @@ def step_10_telomere_pool(runner):
     # .telo.fasta files have prefixes that indicate which assembler produced them.
     # We track the source assembler for each contig by noting which input file
     # contributed it.
-    contig_source_asm = {}  # contig_name -> assembler_name
-    for f_path in sorted(fasta_files):
-        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(".result.fasta", "").replace(".fasta", "")
-        asm_key = basename.lower()
-        if os.path.isfile(f_path):
-            for line in open(f_path):
-                if line.startswith(">"):
-                    # After sort/rename, contigs get sequential "contig_NNN" names.
-                    # We can't directly map those back.  Instead we'll count contigs
-                    # per assembler and assign quality based on position in the
-                    # concatenated pool.
-                    pass  # filled below via position tracking
-
-    # Track source assembler by position in concatenated pool
-    contig_order = []  # list of (assembler_key, original_name)
-    for f_path in sorted(fasta_files):
-        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(".result.fasta", "").replace(".fasta", "")
-        asm_key = basename.lower()
-        if os.path.isfile(f_path):
-            for line in open(f_path):
-                if line.startswith(">"):
-                    orig_name = line[1:].strip().split()[0]
-                    contig_order.append((asm_key, orig_name))
-
-    # After funannotate sort / _fasta_sort_minlen, contigs are renamed to
-    # "contig_001", "contig_002", etc. sorted by length descending.
-    # We need to map pool contig names back to their source assembler.
-    # Read the sorted pool and match by sequence identity to the originals.
-    # SIMPLER APPROACH: read pool_fasta, for each contig check which assembler
-    # .telo.fasta contains a sequence with the same length (approximate match).
-    # EVEN SIMPLER: read all original seqs with lengths, map pool contigs by length.
-    orig_seq_lengths = {}  # (asm_key, length) -> asm_key
-    for f_path in sorted(fasta_files):
-        basename = os.path.basename(f_path).replace(".telo.fasta", "").replace(".result.fasta", "").replace(".fasta", "")
-        asm_key = basename.lower()
-        if os.path.isfile(f_path):
-            name = None
-            seqlen = 0
-            for line in open(f_path):
-                if line.startswith(">"):
-                    if name is not None:
-                        orig_seq_lengths[(asm_key, seqlen)] = asm_key
-                    name = line[1:].strip().split()[0]
-                    seqlen = 0
-                else:
-                    seqlen += len(line.strip())
-            if name is not None:
-                orig_seq_lengths[(asm_key, seqlen)] = asm_key
-
-    # Map pool contigs to assembler by matching sequence length
+    # Map pool contigs to source assembler using the provenance map
+    # (accurately tracked through concatenation and sort in Step 10).
     pool_contig_asm = {}  # pool_contig_name -> asm_key
-    if os.path.isfile(pool_fasta):
-        pool_seqs_for_map = dict(_read_fasta_records(pool_fasta))
-        # Build length->asm lookup (group by length)
-        len_to_asm = {}
-        for (asm_key, slen), ak in orig_seq_lengths.items():
-            len_to_asm.setdefault(slen, []).append(ak)
-        for cname, cseq in pool_seqs_for_map.items():
-            clen = len(cseq)
-            candidates = len_to_asm.get(clen, [])
-            if candidates:
-                pool_contig_asm[cname] = candidates[0]  # first match
+    for pname, (asm, orig, stype) in pool_provenance.items():
+        pool_contig_asm[pname] = asm
 
     if pool_contig_asm:
         # Count per assembler
@@ -1628,16 +1713,33 @@ def _parse_paf_best_hits(paf_path):
     return best
 
 
-def _filter_redundant_to_protected(paf_path, backbone_fa, out_fa, cov_thr=0.95, id_thr=0.95):
+def _filter_redundant_to_protected(paf_path, backbone_fa, out_fa, cov_thr=0.95, id_thr=0.95,
+                                    logger=None):
     """Remove backbone contigs that are redundant to the protected telomere pool.
 
     Uses PAF from minimap2 alignment of backbone vs protected pool.
     Keeps backbone contigs that are NOT covered >= cov_thr with identity >= id_thr.
+
+    Returns (n_dropped, drop_details) where drop_details is a list of
+    (backbone_name, backbone_len, cov, ident) tuples for logging.
     """
     best = _parse_paf_best_hits(paf_path)
-    drop = {q for q, (cov, ident) in best.items() if cov >= cov_thr and ident >= id_thr}
+    drop = {}  # name -> (cov, ident)
+    for q, (cov, ident) in best.items():
+        if cov >= cov_thr and ident >= id_thr:
+            drop[q] = (cov, ident)
 
-    recs = [(n, s) for n, s in _read_fasta_records(backbone_fa) if n not in drop]
+    drop_details = []
+    recs = []
+    for n, s in _read_fasta_records(backbone_fa):
+        if n in drop:
+            cov, ident = drop[n]
+            drop_details.append((n, len(s), cov, ident))
+            if logger:
+                logger(f"  Dedup drop: {n} ({len(s):,} bp, "
+                       f"cov={cov:.3f}, ident={ident:.3f})")
+        else:
+            recs.append((n, s))
     _write_fasta(recs, out_fa)
     return len(drop)
 
@@ -1788,70 +1890,178 @@ def _self_dedup_non_telomeric(fasta_path, telo_ids, out_path, threads,
 
 def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
                           replaced_map, backbone_assembler, pool_asm_map,
-                          runner):
+                          pool_provenance_map=None, runner=None):
     """Write a GFF3 file documenting the provenance of each contig in the final assembly.
 
-    Each contig gets a single GFF3 record spanning its full length, with attributes:
+    Each contig gets a GFF3 record (type=contig) spanning its full length, with attributes:
       - source_assembler: which assembler originally produced this contig
-      - role: t2t_pool, backbone, rescue_donor
-      - replacement_class: (for rescue donors) fill_missing_end, etc.
-      - original_name: name before the sort/rename step
+      - role: backbone, upgrade_donor, novel_t2t
+      - original_name: contig name before sort/rename (the pool contig name)
+      - assembler_contig: the ORIGINAL assembler contig name (before Step 10 pool renaming)
+      - source_type: assembler or quickmerge
+      - replacement_class: (for donors) upgrade_tier2_to_t2t, fill_missing_end, etc.
+      - replaced_contig: (for donors) which backbone contig was replaced
+      - qm_assembler1, qm_assembler2: (for quickmerge) the two source assemblers
+      - description: human-readable provenance summary
       - length: contig length in bp
+
+    For quickmerge contigs, child records (type=region) are emitted showing which
+    assembler contributed each genomic region, with attributes:
+      - Parent: the parent contig ID
+      - source_assembler: which assembler contributed this region
+      - assembler_contig: the original contig name from that assembler
+      - description: human-readable region summary (e.g., "Region 1-500000 from canu contig 'tig00001'")
 
     Args:
         final_fa: path to final renamed FASTA
         gff_path: output GFF3 path
         name_map: {new_contig_name: old_contig_name} from _fasta_sort_minlen_with_map
-        protected_ids: set of contig names that came from the protected T2T pool
-        replaced_map: {donor_name: (backbone_name, replacement_class)} from replaced.ids
+        protected_ids: set of contig names from the protected T2T pool
+        replaced_map: {donor_name: (backbone_name, replacement_class)}
         backbone_assembler: name of the selected backbone assembler
-        pool_asm_map: {contig_name: assembler_key} mapping pool contigs to their source
+        pool_asm_map: {contig_name: assembler_key}
+        pool_provenance_map: {pool_name: (asm, orig, source_type[, asm1, asm2, regions])}
+            Normal entries are 3-tuples; quickmerge entries are 6-tuples with
+            source assembler pair and region-level mapping.
         runner: pipeline runner for logging
     """
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
         return
 
-    # Build reverse lookup: what donor contigs are now in the assembly?
+    if pool_provenance_map is None:
+        pool_provenance_map = {}
+
     donor_names = set(replaced_map.keys())
 
     lines = ["##gff-version 3"]
     lines.append(f"# TACO provenance annotation for {os.path.basename(final_fa)}")
     lines.append(f"# Backbone assembler: {backbone_assembler}")
     lines.append(f"# Generated by TACO v1.2.0")
+    lines.append(f"# Columns: seqid source type start end score strand phase attributes")
     lines.append("#")
 
-    # Read final FASTA to get sequence lengths and names
+    n_bb = n_upgrade = n_novel = 0
+
     for new_name, seq in _read_fasta_records(final_fa):
         length = len(seq)
         old_name = name_map.get(new_name, new_name)
 
-        # Determine role and source assembler
-        if old_name in protected_ids:
-            role = "t2t_pool"
-            source_asm = pool_asm_map.get(old_name, "unknown")
-        elif old_name in donor_names:
+        # Look up full provenance from Step 10 TSV
+        # Quickmerge entries are 6-tuples: (asm, orig, source_type, asm1, asm2, regions)
+        # Normal entries are 3-tuples: (asm, orig, source_type)
+        prov = pool_provenance_map.get(old_name)
+        qm_asm1 = qm_asm2 = ""
+        qm_regions = []
+        if prov and len(prov) >= 6:
+            orig_asm, orig_contig, source_type = prov[0], prov[1], prov[2]
+            qm_asm1, qm_asm2 = prov[3], prov[4]
+            qm_regions = prov[5] if prov[5] else []
+        elif prov:
+            orig_asm, orig_contig, source_type = prov[0], prov[1], prov[2]
+        else:
+            orig_asm = "unknown"
+            orig_contig = old_name
+            source_type = "unknown"
+
+        # Determine role, source assembler, and build description
+        if old_name in donor_names:
             bb_name, repl_class = replaced_map[old_name]
-            role = "rescue_donor"
-            source_asm = pool_asm_map.get(old_name, "unknown")
+            role = "upgrade_donor"
+            source_asm = pool_asm_map.get(old_name, orig_asm)
+            n_upgrade += 1
+
+            if source_type == "quickmerge" and qm_asm1 and qm_asm2:
+                desc = (f"Entire replacement: {backbone_assembler} contig "
+                        f"'{bb_name}' replaced by quickmerge of "
+                        f"{qm_asm1} x {qm_asm2} contig "
+                        f"'{orig_contig}' (class: {repl_class})")
+            elif source_type == "quickmerge":
+                desc = (f"Entire replacement: {backbone_assembler} contig "
+                        f"'{bb_name}' replaced by quickmerge contig "
+                        f"'{orig_contig}' (class: {repl_class})")
+            else:
+                desc = (f"Entire replacement: {backbone_assembler} contig "
+                        f"'{bb_name}' replaced by {source_asm} contig "
+                        f"'{orig_contig}' (class: {repl_class})")
+        elif old_name in protected_ids and old_name not in donor_names:
+            role = "novel_t2t"
+            source_asm = pool_asm_map.get(old_name, orig_asm)
+            n_novel += 1
+
+            if source_type == "quickmerge" and qm_asm1 and qm_asm2:
+                desc = (f"Novel T2T addition from quickmerge of "
+                        f"{qm_asm1} x {qm_asm2}: '{orig_contig}' "
+                        f"covers a chromosomal region absent from "
+                        f"{backbone_assembler} backbone")
+            elif source_type == "quickmerge":
+                desc = (f"Novel T2T addition from quickmerge: '{orig_contig}' "
+                        f"covers a chromosomal region absent from "
+                        f"{backbone_assembler} backbone")
+            else:
+                desc = (f"Novel T2T addition from {source_asm}: '{orig_contig}' "
+                        f"covers a chromosomal region absent from "
+                        f"{backbone_assembler} backbone")
         else:
             role = "backbone"
             repl_class = ""
             source_asm = backbone_assembler
+            n_bb += 1
+
+            # Check if this backbone contig has a known original name
+            # (backbone contigs may also have provenance if they were
+            # in the pool before being selected as backbone)
+            bb_prov = pool_provenance_map.get(old_name)
+            if bb_prov:
+                if len(bb_prov) >= 6:
+                    orig_asm, orig_contig, source_type = bb_prov[0], bb_prov[1], bb_prov[2]
+                else:
+                    orig_asm, orig_contig, source_type = bb_prov[0], bb_prov[1], bb_prov[2]
+                source_asm = orig_asm
+                desc = (f"Retained from {source_asm} ({backbone_assembler} backbone): "
+                        f"original contig '{orig_contig}'")
+            else:
+                desc = (f"Retained from {backbone_assembler} backbone: "
+                        f"original contig '{old_name}'")
 
         # GFF3 columns: seqid source type start end score strand phase attributes
-        attrs = (f"ID={new_name};original_name={old_name};"
-                 f"source_assembler={source_asm};role={role};length={length}")
-        if role == "rescue_donor":
+        attrs = (f"ID={new_name}"
+                 f";original_name={old_name}"
+                 f";assembler_contig={orig_contig}"
+                 f";source_assembler={source_asm}"
+                 f";source_type={source_type}"
+                 f";role={role}"
+                 f";length={length}"
+                 f";description={desc}")
+        if role == "upgrade_donor":
             attrs += f";replacement_class={repl_class};replaced_contig={bb_name}"
+        if source_type == "quickmerge" and qm_asm1 and qm_asm2:
+            attrs += f";qm_assembler1={qm_asm1};qm_assembler2={qm_asm2}"
 
         lines.append(f"{new_name}\tTACO\tcontig\t1\t{length}\t.\t.\t.\t{attrs}")
 
-    # Also write ##sequence-region pragmas for GFF3 compliance
+        # Emit child region-level GFF records for quickmerge contigs
+        # Each region shows which assembler contributed that segment
+        if source_type == "quickmerge" and qm_regions:
+            for ridx, (rstart, rend, rasm, rcontig) in enumerate(
+                    sorted(qm_regions, key=lambda r: r[0]), 1):
+                region_id = f"{new_name}_region_{ridx}"
+                region_desc = (f"Region {rstart}-{rend} from {rasm} "
+                               f"contig '{rcontig}'")
+                region_attrs = (
+                    f"ID={region_id}"
+                    f";Parent={new_name}"
+                    f";source_assembler={rasm}"
+                    f";assembler_contig={rcontig}"
+                    f";description={region_desc}")
+                lines.append(
+                    f"{new_name}\tTACO\tregion\t{rstart}\t{rend}"
+                    f"\t.\t.\t.\t{region_attrs}")
+
+    # Write ##sequence-region pragmas for GFF3 compliance
     seq_regions = []
     for new_name, seq in _read_fasta_records(final_fa):
         seq_regions.append(f"##sequence-region {new_name} 1 {len(seq)}")
 
-    # Insert sequence-region lines after the header
     header_end = 0
     for i, line in enumerate(lines):
         if not line.startswith("#"):
@@ -1862,11 +2072,9 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
     with open(gff_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
-    n_t2t = sum(1 for l in lines if "\trole=t2t_pool" in l or "role=t2t_pool;" in l)
-    n_bb = sum(1 for l in lines if "\trole=backbone" in l or "role=backbone;" in l)
-    n_rescue = sum(1 for l in lines if "role=rescue_donor" in l)
-    runner.log(f"Wrote provenance GFF: {gff_path} "
-               f"({n_t2t} T2T, {n_bb} backbone, {n_rescue} rescue)")
+    if runner:
+        runner.log(f"Wrote provenance GFF: {gff_path} "
+                   f"({n_bb} backbone, {n_upgrade} upgrades, {n_novel} novel T2T)")
 
 
 def _telomere_rescue(single_fa, backbone_fa, paf_path, out_ids, out_fa,
@@ -2470,10 +2678,20 @@ def step_12_refine(runner):
     runner.log_info(f"Selected backbone: {asm_fa}")
 
     # ---- 12C. Prepare cleaned backbone + chimera safety ----
+    # Chimera detection uses two complementary strategies:
+    #   1. Size gate: contigs > 1.5× the largest individual assembler contig
+    #      are likely chimeric (spurious joins across chromosomes).
+    #   2. Cross-assembly mapping: each protected contig is aligned against
+    #      all other assembler outputs.  A non-chimeric contig should be
+    #      largely covered (≥60%) by at least one other assembler's contigs.
+    #      A chimera that fused two separate chromosomes won't be fully
+    #      covered by any single assembler's individual contig — it will
+    #      only show partial hits.
     backbone_fa = "assemblies/backbone.clean.fa"
     _clean_backbone_headers(asm_fa, backbone_fa)
 
     if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
+        # ---- Strategy 1: Size gate ----
         max_individual_len = 0
         for telo_fa in glob.glob("assemblies/*.telo.fasta"):
             for _, seq in _read_fasta_records(telo_fa):
@@ -2482,129 +2700,230 @@ def step_12_refine(runner):
             for _, seq in _read_fasta_records(backbone_fa):
                 max_individual_len = max(max_individual_len, len(seq))
 
+        size_suspects = set()
         if max_individual_len > 0:
             chimera_threshold = int(max_individual_len * 1.5)
             protected_recs = list(_read_fasta_records(protected_fasta))
             n_before = len(protected_recs)
-            filtered_recs = [(n, s) for n, s in protected_recs if len(s) <= chimera_threshold]
-            n_removed = n_before - len(filtered_recs)
-            if n_removed > 0:
-                runner.log_warn(f"Chimera safety: removed {n_removed} protected contigs > "
-                                f"{chimera_threshold:,} bp")
-                _write_fasta(filtered_recs, protected_fasta)
-            else:
-                runner.log(f"Chimera safety: all {n_before} protected contigs pass "
-                           f"(threshold {chimera_threshold:,} bp)")
-
-    # ---- 12D. Strict protected-pool dedup (95%/95%) ----
-    if protected_fasta and os.path.isfile(protected_fasta) and os.path.getsize(protected_fasta) > 0:
-        runner.log_info(f"Using protected telomere contigs from {protected_fasta}")
-        shutil.copy(protected_fasta, "assemblies/protected.telomere.fa")
-
-        if shutil.which("minimap2"):
-            runner.log_version("minimap2", "minimap2")
-            paf = "assemblies/backbone_vs_protected.paf"
-            cmd = f"minimap2 -x asm20 -t {runner.threads} assemblies/protected.telomere.fa {backbone_fa}"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            with open(paf, "w") as f:
-                f.write(result.stdout)
-
-            n_dropped = _filter_redundant_to_protected(
-                paf, backbone_fa, "assemblies/backbone.filtered.fa",
-                cov_thr=float(os.environ.get("PROTECT_COV", "0.95")),
-                id_thr=float(os.environ.get("PROTECT_ID", "0.95")),
-            )
-            runner.log(f"Strict dedup: removed {n_dropped} backbone contigs "
-                       f"redundant to protected pool (95%/95%)")
-
-            # Fragment removal pass (50%/90%)
-            frag_paf = "assemblies/backbone_frag_vs_protected.paf"
-            cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-                   f"assemblies/protected.telomere.fa assemblies/backbone.filtered.fa")
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            with open(frag_paf, "w") as f:
-                f.write(result.stdout)
-
-            n_frag = _filter_fragments_to_protected(
-                frag_paf, "assemblies/backbone.filtered.fa",
-                "assemblies/backbone.filtered.defrag.fa",
-                frag_cov_thr=float(os.environ.get("FRAG_COV", "0.50")),
-                frag_id_thr=float(os.environ.get("FRAG_ID", "0.90")),
-            )
-            if n_frag > 0:
-                runner.log(f"Fragment removal: removed {n_frag} backbone fragments (50%/90%)")
-                shutil.copy("assemblies/backbone.filtered.defrag.fa",
-                            "assemblies/backbone.filtered.fa")
-            else:
-                runner.log("Fragment removal: no additional fragments removed")
+            for n, s in protected_recs:
+                if len(s) > chimera_threshold:
+                    size_suspects.add(n)
         else:
-            runner.log_warn("minimap2 not found; cannot filter redundant backbone contigs")
-            shutil.copy(backbone_fa, "assemblies/backbone.filtered.fa")
+            protected_recs = list(_read_fasta_records(protected_fasta))
+            n_before = len(protected_recs)
+            chimera_threshold = 0
 
-        _name_dedup_fasta("assemblies/protected.telomere.fa",
-                          "assemblies/backbone.filtered.fa",
-                          "assemblies/backbone.filtered.nodup.fa")
-    else:
-        runner.log_warn("No protected telomere contigs; keeping backbone for rescue only")
-        with open("assemblies/protected.telomere.fa", "w") as f:
-            pass
-        shutil.copy(backbone_fa, "assemblies/backbone.filtered.nodup.fa")
+        # ---- Strategy 2: Cross-assembly mapping consistency ----
+        # Align protected contigs against each assembler's output.  For each
+        # protected contig, track the BEST single-contig coverage from any
+        # assembler.  A legitimate T2T contig should be well-covered by at
+        # least one other assembler's contig.  Chimeras will only show
+        # partial coverage (two halves matching different contigs).
+        mapping_suspects = set()
+        if shutil.which("minimap2") and len(protected_recs) > 0:
+            # Collect all assembler result FASTAs (excluding the selected backbone)
+            asm_fastas = []
+            for asm_name in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm"]:
+                for suffix in [".result.fasta", ".telo.fasta"]:
+                    af = f"assemblies/{asm_name}{suffix}"
+                    if os.path.isfile(af) and os.path.getsize(af) > 0:
+                        asm_fastas.append(af)
+                        break
 
-    # ---- 12D3. Classify remaining backbone contigs by telomere status ----
-    backbone_nodup_fa = "assemblies/backbone.filtered.nodup.fa"
+            if len(asm_fastas) >= 2:
+                # For each protected contig, find best single-contig coverage
+                # across all assembler outputs
+                prot_best_cov = {}  # contig_name -> best coverage fraction
+                for af in asm_fastas:
+                    chk_paf = "assemblies/_chimera_check.paf"
+                    cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                           f"{af} {protected_fasta}")
+                    result = subprocess.run(cmd, shell=True, capture_output=True,
+                                            text=True)
+                    with open(chk_paf, "w") as f:
+                        f.write(result.stdout)
+
+                    hits = _parse_paf_best_hits(chk_paf)
+                    for qname, (cov, ident) in hits.items():
+                        if ident >= 0.90:  # only count high-identity hits
+                            prev = prot_best_cov.get(qname, 0.0)
+                            if cov > prev:
+                                prot_best_cov[qname] = cov
+
+                # Protected contigs not well-covered by any assembler are suspect
+                min_cross_cov = float(os.environ.get("CHIMERA_MIN_CROSS_COV", "0.60"))
+                for n, _ in protected_recs:
+                    best_cov = prot_best_cov.get(n, 0.0)
+                    if best_cov < min_cross_cov:
+                        mapping_suspects.add(n)
+                        runner.log(f"  Chimera mapping suspect: {n} "
+                                   f"(best cross-assembly cov={best_cov:.2f})")
+
+                if os.path.isfile("assemblies/_chimera_check.paf"):
+                    os.remove("assemblies/_chimera_check.paf")
+
+        # ---- Combine both strategies ----
+        # Remove contigs flagged by EITHER strategy (conservative for safety)
+        chimera_remove = size_suspects | mapping_suspects
+        if chimera_remove:
+            filtered_recs = [(n, s) for n, s in protected_recs
+                             if n not in chimera_remove]
+            n_removed = n_before - len(filtered_recs)
+            reasons = []
+            if size_suspects:
+                reasons.append(f"{len(size_suspects)} by size >{chimera_threshold:,} bp")
+            if mapping_suspects:
+                reasons.append(f"{len(mapping_suspects)} by cross-assembly mapping")
+            runner.log_warn(f"Chimera safety: removed {n_removed} protected contigs "
+                            f"({', '.join(reasons)})")
+            _write_fasta(filtered_recs, protected_fasta)
+        else:
+            runner.log(f"Chimera safety: all {n_before} protected contigs pass "
+                       f"(size threshold {chimera_threshold:,} bp, "
+                       f"cross-assembly mapping OK)")
+
+    # ====================================================================
+    # BACKBONE-FIRST STRATEGY (v1.2.0)
+    #
+    # The backbone assembler was selected for the highest composite quality
+    # score (BUSCO S, T2T count, N50, contiguity).  Its contigs carry the
+    # gene content that earned it the top score — removing them to make room
+    # for pool T2T contigs from other assemblers risks losing BUSCO genes
+    # in non-overlapping regions.
+    #
+    # Strategy:
+    #   1. Classify backbone contigs by telomere status FIRST.
+    #   2. Backbone T2T contigs = Tier 1 (immutable, keep always).
+    #   3. Backbone non-T2T contigs = Tier 2 (upgradeable).
+    #   4. Pool T2T contigs that are NOT redundant to backbone Tier 1
+    #      become "upgrade donors" — they can replace Tier 2 backbone
+    #      contigs to add telomere completeness without losing BUSCO genes.
+    #   5. Each upgrade is validated via BUSCO trial.
+    #   6. Final = backbone Tier 1 + upgraded Tier 2 + remaining Tier 2.
+    # ====================================================================
+
+    taxon = getattr(runner, 'taxon', 'other')
+    allow_t2t_replace = getattr(runner, 'allow_t2t_replace', False)
+
+    # ---- 12D. Classify backbone contigs by telomere status ----
+    # This MUST happen before any dedup, so we know which backbone contigs
+    # are T2T (Tier 1) and which are non-T2T (Tier 2).
     runner.log_info("Classifying backbone contigs by telomere status")
     bb_t2t_ids, bb_telo_ids = _classify_contigs_telomere_status(
-        backbone_nodup_fa, runner)
-    runner.log(f"Backbone telomere census: {len(bb_t2t_ids)} T2T, "
-               f"{len(bb_telo_ids)} any-telomere, out of "
-               f"{sum(1 for _ in _read_fasta_records(backbone_nodup_fa))} total")
+        backbone_fa, runner)
+    bb_total = sum(1 for _ in _read_fasta_records(backbone_fa))
+    bb_tier2_count = bb_total - len(bb_t2t_ids)
+    runner.log(f"Backbone telomere census: {len(bb_t2t_ids)} T2T (Tier 1), "
+               f"{len(bb_telo_ids)} any-telomere, {bb_total} total")
+    runner.log_info(f"Tier 1 (backbone T2T, immutable): {len(bb_t2t_ids)} contigs"
+                    f"{' (--allow-t2t-replace ON)' if allow_t2t_replace else ''}")
+    runner.log_info(f"Tier 2 (backbone non-T2T, upgradeable): {bb_tier2_count} contigs")
 
-    # ---- 12D4. Taxon-aware non-telomeric dedup against Tier 1 pool ----
-    # Non-telomeric backbone contigs overlapping the Tier 1 T2T pool are
-    # removed at taxon-appropriate thresholds:
-    #   Fungi/haploid:        aggressive (70%/85%) — most overlap is artefactual
-    #   Plant/polyploid:      conservative (85%/92%) — overlap can be homeologous
-    #   Vertebrate/animal:    conservative (85%/92%) — repeat-rich, allelic overlap
-    #   Insect/other:         moderate (75%/88%)
-    taxon = getattr(runner, 'taxon', 'other')
-    if taxon == "fungal":
-        default_aggr_cov, default_aggr_id = "0.70", "0.85"
-    elif taxon in ("plant", "vertebrate", "animal"):
-        default_aggr_cov, default_aggr_id = "0.85", "0.92"
-    else:
-        default_aggr_cov, default_aggr_id = "0.75", "0.88"
-
+    # Copy pool T2T for reference (chimera-checked version)
     if protected_fasta and os.path.isfile(protected_fasta) and \
-       os.path.getsize(protected_fasta) > 0 and shutil.which("minimap2"):
-        aggr_paf = "assemblies/backbone_aggr_vs_protected.paf"
+       os.path.getsize(protected_fasta) > 0:
+        shutil.copy(protected_fasta, "assemblies/protected.telomere.fa")
+    else:
+        with open("assemblies/protected.telomere.fa", "w") as f:
+            pass
+
+    pool_t2t_fa = "assemblies/protected.telomere.fa"
+
+    # ---- 12D2. Find novel pool T2T contigs (not redundant to backbone) ----
+    # Pool T2T contigs that cover the same chromosomes as backbone Tier 1
+    # are redundant — the backbone version is preferred (preserves BUSCO).
+    # Only pool T2T contigs covering regions where backbone LACKS T2T are
+    # useful as upgrade donors.
+    novel_pool_t2t_fa = "assemblies/novel_pool_t2t.fa"
+    novel_pool_ids = set()
+
+    if os.path.isfile(pool_t2t_fa) and os.path.getsize(pool_t2t_fa) > 0 \
+       and shutil.which("minimap2"):
+        runner.log_version("minimap2", "minimap2")
+
+        # Align pool T2T against backbone (full backbone, not just Tier 1)
+        pool_vs_bb_paf = "assemblies/pool_t2t_vs_backbone.paf"
         cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-               f"assemblies/protected.telomere.fa {backbone_nodup_fa}")
+               f"{backbone_fa} {pool_t2t_fa}")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        with open(aggr_paf, "w") as f:
+        with open(pool_vs_bb_paf, "w") as f:
             f.write(result.stdout)
 
-        aggr_best = _parse_paf_best_hits(aggr_paf)
-        aggr_cov = float(os.environ.get("AGGR_NONTELO_COV", default_aggr_cov))
-        aggr_id = float(os.environ.get("AGGR_NONTELO_ID", default_aggr_id))
-        aggr_drop = {q for q, (cov, ident) in aggr_best.items()
-                     if cov >= aggr_cov and ident >= aggr_id
-                     and q not in bb_telo_ids}
+        pool_hits = _parse_paf_best_hits(pool_vs_bb_paf)
 
-        if aggr_drop:
-            recs = [(n, s) for n, s in _read_fasta_records(backbone_nodup_fa)
-                    if n not in aggr_drop]
-            _write_fasta(recs, backbone_nodup_fa)
-            runner.log(f"Non-telo dedup vs Tier 1 (taxon={taxon}): removed "
-                       f"{len(aggr_drop)} contigs ({aggr_cov}/{aggr_id})")
-        else:
-            runner.log(f"Non-telo dedup vs Tier 1 (taxon={taxon}): "
-                       f"no additional contigs removed")
+        # A pool T2T contig is "redundant" if it aligns well (≥80% cov,
+        # ≥90% identity) to a backbone Tier 1 (T2T) contig.
+        # Pool T2T contigs that align to Tier 2 backbone contigs are
+        # "upgrade donors" — they can replace the non-T2T version.
+        # Pool T2T contigs that don't align to anything are novel additions.
+        redundant_to_tier1 = set()
+        upgrade_donors = {}  # pool_contig -> best backbone Tier 2 target
 
-    # ---- 12D5. Taxon-aware non-telomeric self-dedup ----
-    # Thresholds scale with taxon:
-    #   Fungi:                aggressive (80%/90%)
-    #   Plant/vertebrate:     conservative (90%/95%)
-    #   Insect/other:         moderate (85%/92%)
+        # Parse PAF to find which backbone contig each pool contig maps to
+        pool_to_target = {}  # pool_name -> (backbone_name, cov, ident)
+        if os.path.isfile(pool_vs_bb_paf):
+            with open(pool_vs_bb_paf) as f:
+                for ln in f:
+                    if not ln.strip() or ln.startswith("#"):
+                        continue
+                    p = ln.rstrip().split("\t")
+                    if len(p) < 12:
+                        continue
+                    qname, qlen = p[0], int(p[1])
+                    qs, qe = int(p[2]), int(p[3])
+                    tname = p[5]
+                    matches, alnlen = int(p[9]), int(p[10])
+                    if qlen <= 0 or alnlen <= 0:
+                        continue
+                    ident = matches / max(1, alnlen)
+                    cov = (qe - qs) / max(1, qlen)
+                    cur = pool_to_target.get(qname, ("", 0.0, 0.0))
+                    if cov > cur[1] or (abs(cov - cur[1]) < 1e-12 and ident > cur[2]):
+                        pool_to_target[qname] = (tname, cov, ident)
+
+        pool_recs = list(_read_fasta_records(pool_t2t_fa))
+        novel_recs = []
+        for pname, pseq in pool_recs:
+            if pname in pool_to_target:
+                target, cov, ident = pool_to_target[pname]
+                if target in bb_t2t_ids and cov >= 0.80 and ident >= 0.90:
+                    # Pool T2T covers same chromosome as backbone T2T → redundant
+                    redundant_to_tier1.add(pname)
+                    runner.log(f"  Pool T2T '{pname}' redundant to backbone "
+                               f"T2T '{target}' (cov={cov:.2f}, id={ident:.2f})")
+                elif target not in bb_t2t_ids and cov >= 0.60 and ident >= 0.85:
+                    # Pool T2T covers a Tier 2 backbone contig → upgrade donor
+                    upgrade_donors[pname] = target
+                    novel_recs.append((pname, pseq))
+                    novel_pool_ids.add(pname)
+                    runner.log(f"  Pool T2T '{pname}' can upgrade backbone "
+                               f"Tier 2 '{target}' (cov={cov:.2f}, id={ident:.2f})")
+                else:
+                    # Pool T2T has low coverage against backbone — may cover a
+                    # new region not in backbone at all → add as novel
+                    novel_recs.append((pname, pseq))
+                    novel_pool_ids.add(pname)
+                    runner.log(f"  Pool T2T '{pname}' covers novel region "
+                               f"(best bb hit: {target}, cov={cov:.2f})")
+            else:
+                # No alignment to backbone at all → novel region
+                novel_recs.append((pname, pseq))
+                novel_pool_ids.add(pname)
+                runner.log(f"  Pool T2T '{pname}' no backbone alignment → novel")
+
+        _write_fasta(novel_recs, novel_pool_t2t_fa)
+        runner.log(f"Pool T2T analysis: {len(pool_recs)} total, "
+                   f"{len(redundant_to_tier1)} redundant to backbone T2T, "
+                   f"{len(upgrade_donors)} upgrade donors, "
+                   f"{len(novel_pool_ids) - len(upgrade_donors)} novel additions")
+    else:
+        if not shutil.which("minimap2"):
+            runner.log_warn("minimap2 not found; cannot compare pool T2T to backbone")
+        with open(novel_pool_t2t_fa, "w") as f:
+            pass
+
+    # ---- 12D3. Self-dedup backbone Tier 2 (internal redundancy) ----
+    # Taxon-aware thresholds for self-dedup among Tier 2 contigs:
     if taxon == "fungal":
         default_sd_cov, default_sd_id = "0.80", "0.90"
     elif taxon in ("plant", "vertebrate", "animal"):
@@ -2612,81 +2931,109 @@ def step_12_refine(runner):
     else:
         default_sd_cov, default_sd_id = "0.85", "0.92"
 
+    # Work on a copy of the backbone
+    shutil.copy(backbone_fa, "assemblies/backbone.working.fa")
+    working_backbone_fa = "assemblies/backbone.working.fa"
+
     n_self_dedup = _self_dedup_non_telomeric(
-        backbone_nodup_fa, bb_telo_ids,
-        "assemblies/backbone.filtered.selfdedup.fa",
+        working_backbone_fa, bb_telo_ids,
+        "assemblies/backbone.selfdedup.fa",
         runner.threads,
         cov_thr=float(os.environ.get("SELFDEDUP_COV", default_sd_cov)),
         id_thr=float(os.environ.get("SELFDEDUP_ID", default_sd_id)),
     )
     if n_self_dedup > 0:
-        runner.log(f"Non-telo self-dedup (taxon={taxon}): removed "
-                   f"{n_self_dedup} redundant contigs")
-        shutil.copy("assemblies/backbone.filtered.selfdedup.fa",
-                    backbone_nodup_fa)
+        runner.log(f"Tier 2 self-dedup (taxon={taxon}): removed "
+                   f"{n_self_dedup} redundant non-telomeric contigs")
+        shutil.copy("assemblies/backbone.selfdedup.fa", working_backbone_fa)
     else:
-        runner.log(f"Non-telo self-dedup (taxon={taxon}): "
-                   f"no additional contigs removed")
+        runner.log(f"Tier 2 self-dedup (taxon={taxon}): "
+                   f"no redundant contigs found")
 
-    # ---- 12E. Telomere rescue with Tier 1 protection + replacement classes ----
-    # Two-tier model:
-    #   Tier 1 (immutable): protected T2T contigs — never replaced unless
-    #     --allow-t2t-replace is set.
-    #   Tier 2 (editable): everything else in the backbone.
+    # ---- 12E. Telomere upgrade: replace Tier 2 with pool T2T donors ----
+    # Two types of upgrades:
+    #   1. Direct upgrade: pool T2T contig replaces a specific Tier 2 contig
+    #      (aligned as covering the same chromosome region).
+    #   2. Novel addition: pool T2T contig covers a region not in backbone.
     #
-    # Replacement classes (logged in trial summary):
-    #   fill_missing_end          — backbone has no telo, donor adds one
-    #   replace_non_telo_backbone — backbone has no telo, donor has telo
-    #   replace_single_with_better — backbone has 1-end telo, donor has stronger
-    #   replace_protected_t2t     — backbone is Tier 1 T2T (disabled by default)
+    # Also check single-end telomere pool for additional rescue candidates.
+    #
+    # Replacement classes:
+    #   upgrade_tier2_to_t2t     — Tier 2 backbone replaced by pool T2T
+    #   fill_missing_end         — backbone non-telo → donor adds telomere
+    #   replace_single_with_better — backbone single-telo → donor is T2T
+    #   add_novel_t2t            — pool T2T covers region not in backbone
 
-    # Build immutable Tier 1 set
-    tier1_ids = set()
-    if os.path.isfile("assemblies/protected.telomere.fa") and \
-       os.path.getsize("assemblies/protected.telomere.fa") > 0:
-        for name, _ in _read_fasta_records("assemblies/protected.telomere.fa"):
-            tier1_ids.add(name)
-    allow_t2t_replace = getattr(runner, 'allow_t2t_replace', False)
-    runner.log_info(f"Tier 1 (immutable) contigs: {len(tier1_ids)}"
-                    f"{' (--allow-t2t-replace ON)' if allow_t2t_replace else ''}")
-
+    # Collect all donor sources: pool T2T upgrades + single-end telomere pool
     single_tel_src = ""
-    for candidate in ["single_tel_best_clean.fasta", "single_tel_best.fasta",
-                      "telomere_supported_best.fasta", "single_tel_clean.fasta",
-                      "single_tel.fasta"]:
-        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-            single_tel_src = candidate
+    for candidate_file in ["single_tel_best_clean.fasta", "single_tel_best.fasta",
+                           "telomere_supported_best.fasta", "single_tel_clean.fasta",
+                           "single_tel.fasta"]:
+        if os.path.isfile(candidate_file) and os.path.getsize(candidate_file) > 0:
+            single_tel_src = candidate_file
             break
 
-    working_backbone = backbone_nodup_fa
-
-    # Pre-initialize rescue variables so they are always defined,
-    # even when the rescue if-block is skipped entirely.
+    # Pre-initialize rescue variables
     candidates = []
     donor_seqs = {}
     donor_telo_verified = set()
     donor_t2t_verified = set()
+    tier1_ids = bb_t2t_ids.copy()  # Tier 1 = backbone T2T contigs
 
+    # Read current working backbone
+    backbone_seqs = dict(_read_fasta_records(working_backbone_fa))
+    backbone_nodup_fa = working_backbone_fa  # alias for downstream compat
+
+    # ---- 12E1. Build upgrade candidates from pool T2T donors ----
+    if upgrade_donors and shutil.which("minimap2"):
+        pool_donor_seqs = dict(_read_fasta_records(novel_pool_t2t_fa))
+
+        for pool_name, bb_target in upgrade_donors.items():
+            if bb_target in backbone_seqs and pool_name in pool_donor_seqs:
+                # Determine replacement class
+                if bb_target in bb_t2t_ids:
+                    repl_class = "replace_protected_t2t"
+                    if not allow_t2t_replace:
+                        continue  # skip Tier 1 targets
+                elif bb_target in bb_telo_ids:
+                    repl_class = "replace_single_with_better"
+                else:
+                    repl_class = "upgrade_tier2_to_t2t"
+
+                candidates.append({
+                    "donor": pool_name,
+                    "backbone": bb_target,
+                    "replacement_class": repl_class,
+                    "source": "pool_t2t",
+                })
+
+        runner.log(f"Pool T2T upgrade candidates: {len(candidates)} "
+                   f"(targeting Tier 2 backbone contigs)")
+
+        # Add donor sequences
+        donor_seqs.update(pool_donor_seqs)
+        donor_t2t_verified = novel_pool_ids.copy()  # pool T2T are already T2T-verified
+        donor_telo_verified = novel_pool_ids.copy()
+
+    # ---- 12E2. Also screen single-end telomere pool for rescue ----
     if single_tel_src and shutil.which("minimap2"):
-        runner.log_info(f"Screening telomere rescue candidates from {single_tel_src}")
+        runner.log_info(f"Screening additional rescue candidates from {single_tel_src}")
 
         rescue_paf = "assemblies/single_tel_vs_backbone.paf"
         cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-               f"{working_backbone} {single_tel_src}")
+               f"{working_backbone_fa} {single_tel_src}")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         with open(rescue_paf, "w") as f:
             f.write(result.stdout)
 
-        donor_seqs = dict(_read_fasta_records(single_tel_src))
-        backbone_seqs = dict(_read_fasta_records(working_backbone))
-
-        all_hits = _parse_paf_rescue_hits(rescue_paf, donor_seqs, backbone_seqs)
-        runner.log(f"Telomere rescue: {len(all_hits)} raw alignment hits")
+        stel_donor_seqs = dict(_read_fasta_records(single_tel_src))
+        all_hits = _parse_paf_rescue_hits(rescue_paf, stel_donor_seqs, backbone_seqs)
+        runner.log(f"Single-end telomere rescue: {len(all_hits)} raw alignment hits")
 
         _write_rescue_debug_tsv(all_hits, "assemblies/single_tel.replaced.debug.tsv")
 
         # Structural screening
-        rejected, candidates = _screen_rescue_candidates(
+        rejected, stel_candidates = _screen_rescue_candidates(
             all_hits,
             min_ident=float(os.environ.get("RESCUE_MIN_IDENT", "0.85")),
             min_aligned_bp=int(os.environ.get("RESCUE_MIN_ALN_BP", "8000")),
@@ -2695,52 +3042,50 @@ def step_12_refine(runner):
             min_ext=int(os.environ.get("RESCUE_MIN_EXT", "1000")),
         )
         runner.log(f"Structural screening: {len(rejected)} rejected, "
-                   f"{len(candidates)} plausible candidates")
+                   f"{len(stel_candidates)} plausible candidates")
 
-        # ---- Tier 1 protection: reject candidates targeting immutable contigs ----
+        # Tier 1 protection: reject candidates targeting backbone T2T
         if not allow_t2t_replace:
             tier1_filtered = []
-            for c in candidates:
+            for c in stel_candidates:
                 if c["backbone"] in tier1_ids:
-                    c["reject_reason"] = "target_is_tier1_protected_t2t"
+                    c["reject_reason"] = "target_is_tier1_backbone_t2t"
                     rejected.append(c)
                 else:
                     tier1_filtered.append(c)
-            n_tier1_reject = len(candidates) - len(tier1_filtered)
+            n_tier1_reject = len(stel_candidates) - len(tier1_filtered)
             if n_tier1_reject > 0:
                 runner.log(f"Tier 1 protection: blocked {n_tier1_reject} candidates "
-                           f"targeting immutable T2T contigs")
-            candidates = tier1_filtered
+                           f"targeting backbone T2T contigs")
+            stel_candidates = tier1_filtered
 
-        # ---- Donor telomere verification ----
-        donor_telo_verified = set()
-        donor_t2t_verified = set()
-        if candidates:
+        # Donor telomere verification for single-end candidates
+        if stel_candidates:
             donor_check_fa = "assemblies/rescue_donors_check.fa"
-            unique_donors = {c["donor"] for c in candidates}
-            _write_fasta([(n, donor_seqs[n]) for n in unique_donors if n in donor_seqs],
-                         donor_check_fa)
+            unique_donors = {c["donor"] for c in stel_candidates}
+            _write_fasta([(n, stel_donor_seqs[n]) for n in unique_donors
+                          if n in stel_donor_seqs], donor_check_fa)
             d_t2t_set, d_telo_set = _classify_contigs_telomere_status(
                 donor_check_fa, runner)
-            donor_telo_verified = d_telo_set
-            donor_t2t_verified = d_t2t_set
+            donor_telo_verified |= d_telo_set
+            donor_t2t_verified |= d_t2t_set
 
-            telo_verified_candidates = []
-            for c in candidates:
+            telo_verified = []
+            for c in stel_candidates:
                 if c["donor"] in donor_telo_verified:
-                    telo_verified_candidates.append(c)
+                    telo_verified.append(c)
                 else:
                     c["reject_reason"] = "donor_no_telomere_signal"
                     rejected.append(c)
 
-            n_donor_reject = len(candidates) - len(telo_verified_candidates)
+            n_donor_reject = len(stel_candidates) - len(telo_verified)
             if n_donor_reject > 0:
                 runner.log(f"Donor telomere verification: rejected {n_donor_reject} "
                            f"donors lacking telomere signal")
-            candidates = telo_verified_candidates
+            stel_candidates = telo_verified
 
-        # ---- Assign replacement class to each candidate ----
-        for c in candidates:
+        # Assign replacement classes for single-end rescue
+        for c in stel_candidates:
             bb_name = c["backbone"]
             d_name = c["donor"]
             if bb_name in tier1_ids:
@@ -2754,291 +3099,307 @@ def step_12_refine(runner):
                 c["replacement_class"] = "replace_single_with_better"
             else:
                 c["replacement_class"] = "replace_non_telo_backbone"
+            c["source"] = "single_tel"
 
-        # Re-rank after all filtering
-        for i, c in enumerate(candidates):
-            c["candidate_rank"] = i + 1
+        # Merge single-end candidates with pool T2T candidates
+        # (pool T2T upgrades take priority — they're T2T-verified by definition)
+        already_targeted = {c["backbone"] for c in candidates}
+        for c in stel_candidates:
+            if c["backbone"] not in already_targeted:
+                candidates.append(c)
+                already_targeted.add(c["backbone"])
 
-        runner.log(f"After all filtering: {len(candidates)} rescue candidates")
-
-        # Write candidate TSV
-        _write_candidates_tsv(candidates, "assemblies/single_tel.candidates.tsv")
+        donor_seqs.update(stel_donor_seqs)
 
         # Write rejection summary
         with open("assemblies/rescue_rejection_summary.txt", "w") as f:
             f.write(f"Total hits evaluated: {len(all_hits)}\n")
             f.write(f"Obvious rejections: {len(rejected)}\n")
-            f.write(f"Plausible candidates: {len(candidates)}\n")
-            f.write(f"Tier 1 (immutable) contigs: {len(tier1_ids)}\n")
+            f.write(f"Plausible candidates (single-end): {len(stel_candidates)}\n")
+            f.write(f"Tier 1 (backbone T2T, immutable): {len(tier1_ids)}\n")
             f.write(f"Allow T2T replace: {allow_t2t_replace}\n\n")
             for r in rejected:
                 f.write(f"REJECT {r.get('donor','')} → {r.get('backbone','')}: "
                         f"{r.get('reject_reason','')}\n")
+    else:
+        if not single_tel_src:
+            runner.log_info("No single-end telomeric contigs for additional rescue")
+        for p in ["assemblies/single_tel.replaced.debug.tsv",
+                   "assemblies/rescue_rejection_summary.txt"]:
+            with open(p, "w") as f:
+                pass
 
-        # ---- 12F. BUSCO trial validation (enhanced) ----
-        # Taxon-aware max rescue limits:
-        #   Fungi: 20 (small genomes, rescue is effective)
-        #   Plant: 8 (conservative, polyploidy risk)
-        #   Vertebrate/animal: 10 (conservative, repeat-rich)
-        #   Insect/other: 15 (moderate)
-        if taxon == "fungal":
-            default_max = "20"
-        elif taxon == "plant":
-            default_max = "8"
-        elif taxon in ("vertebrate", "animal"):
-            default_max = "10"
+    # Rank all candidates
+    for i, c in enumerate(candidates):
+        c["candidate_rank"] = i + 1
+    runner.log(f"Total upgrade/rescue candidates: {len(candidates)}")
+
+    _write_candidates_tsv(candidates, "assemblies/single_tel.candidates.tsv")
+
+    # ---- 12F. BUSCO trial validation (enhanced) ----
+    # Taxon-aware max rescue limits:
+    if taxon == "fungal":
+        default_max = "20"
+    elif taxon == "plant":
+        default_max = "8"
+    elif taxon in ("vertebrate", "animal"):
+        default_max = "10"
+    else:
+        default_max = "15"
+    max_accepted = int(os.environ.get("STEP12_MAX_ACCEPTED", default_max))
+    min_bp_ratio = float(os.environ.get("STEP12_MIN_BP_RATIO", "0.90"))
+
+    # Taxon-aware BUSCO thresholds (C-drop, M-rise, D-rise):
+    default_c_drop, default_m_rise, default_d_rise = "2.0", "0.3", "3.0"
+    if taxon == "plant":
+        default_c_drop, default_m_rise, default_d_rise = "4.0", "1.0", "6.0"
+    elif taxon in ("vertebrate", "animal"):
+        default_c_drop, default_m_rise, default_d_rise = "3.0", "0.5", "4.0"
+    elif taxon == "fungal":
+        default_d_rise = "2.0"  # fungi: duplication almost always artefactual
+
+    max_busco_c_drop = float(os.environ.get("STEP12_MAX_BUSCO_C_DROP", default_c_drop))
+    max_busco_m_rise = float(os.environ.get("STEP12_MAX_BUSCO_M_RISE", default_m_rise))
+    max_busco_d_rise = float(os.environ.get("STEP12_MAX_BUSCO_D_RISE", default_d_rise))
+
+    lineage = runner.busco_lineage or "ascomycota_odb10"
+    busco_available = shutil.which("busco") is not None and runner.run_busco
+
+    trial_dir = "assemblies/rescue_trials"
+    os.makedirs(trial_dir, exist_ok=True)
+
+    # Baseline = current backbone (preserves original BUSCO quality)
+    baseline_recs = list(_read_fasta_records(working_backbone_fa))
+    baseline_bp = sum(len(s) for _, s in baseline_recs)
+    baseline_contigs = len(baseline_recs)
+    baseline_busco = None
+
+    runner.log_info(f"BUSCO trial validation: {len(candidates)} candidates, "
+                    f"busco_available={busco_available}")
+    if busco_available and candidates:
+        runner.log_info("Computing baseline BUSCO for trial validation")
+        baseline_busco = _run_busco_trial(working_backbone_fa, lineage,
+                                           runner.threads, "baseline", trial_dir)
+        if baseline_busco:
+            runner.log(f"Baseline BUSCO (backbone): C={baseline_busco['C']:.1f}% "
+                       f"D={baseline_busco.get('D', 0):.1f}% "
+                       f"M={baseline_busco['M']:.1f}%")
         else:
-            default_max = "15"
-        max_accepted = int(os.environ.get("STEP12_MAX_ACCEPTED", default_max))
-        min_bp_ratio = float(os.environ.get("STEP12_MIN_BP_RATIO", "0.90"))
+            runner.log_warn("Baseline BUSCO parse failed; using structural checks only")
 
-        # Taxon-aware BUSCO thresholds (C-drop, M-rise, D-rise):
-        default_c_drop, default_m_rise, default_d_rise = "2.0", "0.3", "3.0"
-        if taxon == "plant":
-            default_c_drop, default_m_rise, default_d_rise = "4.0", "1.0", "6.0"
-        elif taxon in ("vertebrate", "animal"):
-            default_c_drop, default_m_rise, default_d_rise = "3.0", "0.5", "4.0"
-        elif taxon == "fungal":
-            default_d_rise = "2.0"  # fungi: duplication almost always artefactual
+    accepted_count = 0
+    trial_results = []
+    current_backbone = dict(backbone_seqs)
 
-        max_busco_c_drop = float(os.environ.get("STEP12_MAX_BUSCO_C_DROP", default_c_drop))
-        max_busco_m_rise = float(os.environ.get("STEP12_MAX_BUSCO_M_RISE", default_m_rise))
-        max_busco_d_rise = float(os.environ.get("STEP12_MAX_BUSCO_D_RISE", default_d_rise))
+    if not candidates:
+        runner.log_info("No upgrade/rescue candidates; backbone preserved as-is")
 
-        lineage = runner.busco_lineage or "ascomycota_odb10"
-        busco_available = shutil.which("busco") is not None and runner.run_busco
+    for cand in candidates:
+        if accepted_count >= max_accepted:
+            runner.log_info(f"Reached max accepted upgrades ({max_accepted}) "
+                            f"for taxon={taxon}")
+            break
 
-        trial_dir = "assemblies/rescue_trials"
-        os.makedirs(trial_dir, exist_ok=True)
+        backbone_name = cand["backbone"]
+        donor_name = cand["donor"]
+        repl_class = cand.get("replacement_class", "unknown")
 
-        # Get baseline metrics
-        baseline_recs = list(_read_fasta_records(working_backbone))
-        baseline_bp = sum(len(s) for _, s in baseline_recs)
-        baseline_contigs = len(baseline_recs)
-        baseline_busco = None
+        if backbone_name not in current_backbone:
+            continue
+        if donor_name not in donor_seqs:
+            continue
 
-        runner.log_info(f"BUSCO trial validation: {len(candidates)} candidates, "
-                        f"busco_available={busco_available}")
-        if busco_available and candidates:
-            runner.log_info("Computing baseline BUSCO for trial validation")
-            baseline_busco = _run_busco_trial(working_backbone, lineage,
-                                               runner.threads, "baseline", trial_dir)
-            if baseline_busco:
-                runner.log(f"Baseline BUSCO: C={baseline_busco['C']:.1f}% "
-                           f"D={baseline_busco.get('D', 0):.1f}% "
-                           f"M={baseline_busco['M']:.1f}%")
+        # Build trial assembly: replace backbone contig with donor
+        trial_recs = []
+        for n, s in current_backbone.items():
+            if n == backbone_name:
+                trial_recs.append((donor_name, donor_seqs[donor_name]))
             else:
-                runner.log_warn("Baseline BUSCO parse failed; using structural checks only")
+                trial_recs.append((n, s))
 
-        accepted_count = 0
-        trial_results = []
-        current_backbone = dict(backbone_seqs)
+        trial_fa = os.path.join(trial_dir, f"trial_{cand['candidate_rank']}.fa")
+        _write_fasta(trial_recs, trial_fa)
 
-        if not candidates:
-            runner.log_info("No plausible rescue candidates after filtering; "
-                            "skipping BUSCO trial validation loop")
+        trial_bp = sum(len(s) for _, s in trial_recs)
+        trial_contigs = len(trial_recs)
 
-        for cand in candidates:
-            if accepted_count >= max_accepted:
-                runner.log_info(f"Reached max accepted rescues ({max_accepted}) "
-                                f"for taxon={taxon}")
-                break
-
-            backbone_name = cand["backbone"]
-            donor_name = cand["donor"]
-            repl_class = cand.get("replacement_class", "unknown")
-
-            if backbone_name not in current_backbone:
-                continue
-            if donor_name not in donor_seqs:
-                continue
-
-            # Build trial assembly
-            trial_recs = []
-            for n, s in current_backbone.items():
-                if n == backbone_name:
-                    trial_recs.append((donor_name, donor_seqs[donor_name]))
-                else:
-                    trial_recs.append((n, s))
-
-            trial_fa = os.path.join(trial_dir, f"trial_{cand['candidate_rank']}.fa")
-            _write_fasta(trial_recs, trial_fa)
-
-            trial_bp = sum(len(s) for _, s in trial_recs)
-            trial_contigs = len(trial_recs)
-
-            # Size check — reject suspicious size drops
-            if baseline_bp > 0 and trial_bp < baseline_bp * min_bp_ratio:
-                reason = "bp_drop_suspicious"
-                trial_results.append({
-                    "candidate_rank": cand["candidate_rank"],
-                    "backbone": backbone_name, "donor": donor_name,
-                    "replacement_class": repl_class,
-                    "accepted": False, "reason": reason,
-                    "trial_bp": trial_bp, "trial_contigs": trial_contigs,
-                    "baseline_busco_c": "", "trial_busco_c": "",
-                    "baseline_busco_d": "", "trial_busco_d": "",
-                    "baseline_busco_m": "", "trial_busco_m": "",
-                    "busco_c_delta": "", "busco_d_delta": "", "busco_m_delta": "",
-                })
-                runner.log(f"  Candidate {cand['candidate_rank']} "
-                           f"({donor_name} → {backbone_name}): "
-                           f"REJECTED (bp_drop_suspicious, {repl_class})")
-                continue
-
-            # BUSCO trial
-            trial_busco = None
-            c_delta = d_delta = m_delta = 0.0
-            if busco_available and baseline_busco:
-                trial_label = f"trial_{cand['candidate_rank']}"
-                trial_busco = _run_busco_trial(trial_fa, lineage,
-                                                runner.threads, trial_label, trial_dir)
-
-            accepted = True
-            reason = "accepted"
-
-            if trial_busco and baseline_busco:
-                c_delta = trial_busco["C"] - baseline_busco["C"]
-                m_delta = trial_busco["M"] - baseline_busco["M"]
-                d_delta = trial_busco.get("D", 0) - baseline_busco.get("D", 0)
-
-                if c_delta < -max_busco_c_drop:
-                    accepted = False
-                    reason = f"busco_c_drop ({c_delta:.1f}% < -{max_busco_c_drop}%)"
-                elif m_delta > max_busco_m_rise:
-                    accepted = False
-                    reason = f"busco_m_rise ({m_delta:.1f}% > +{max_busco_m_rise}%)"
-                elif d_delta > max_busco_d_rise:
-                    accepted = False
-                    reason = f"busco_d_rise ({d_delta:.1f}% > +{max_busco_d_rise}%)"
-            elif busco_available and baseline_busco and trial_busco is None:
-                accepted = False
-                reason = "trial_busco_failed"
-
-            # Additional safety: check that donor telomere evidence is not
-            # weaker than what we're replacing (don't replace telo with weaker telo)
-            if accepted and repl_class == "replace_single_with_better":
-                # Donor should have at least as strong telomere signal
-                if donor_name not in donor_t2t_verified and backbone_name in bb_telo_ids:
-                    # Donor is single-end replacing single-end — only accept if
-                    # structural score is high (donor is genuinely better)
-                    if cand.get("structural_score", 0) < 7.0:
-                        accepted = False
-                        reason = "donor_telo_not_stronger_than_backbone"
-
+        # Size check — reject suspicious size drops
+        if baseline_bp > 0 and trial_bp < baseline_bp * min_bp_ratio:
+            reason = "bp_drop_suspicious"
             trial_results.append({
                 "candidate_rank": cand["candidate_rank"],
                 "backbone": backbone_name, "donor": donor_name,
                 "replacement_class": repl_class,
-                "accepted": accepted, "reason": reason,
+                "accepted": False, "reason": reason,
                 "trial_bp": trial_bp, "trial_contigs": trial_contigs,
-                "baseline_busco_c": f"{baseline_busco['C']:.1f}" if baseline_busco else "",
-                "trial_busco_c": f"{trial_busco['C']:.1f}" if trial_busco else "",
-                "baseline_busco_d": f"{baseline_busco.get('D', 0):.1f}" if baseline_busco else "",
-                "trial_busco_d": f"{trial_busco.get('D', 0):.1f}" if trial_busco else "",
-                "baseline_busco_m": f"{baseline_busco['M']:.1f}" if baseline_busco else "",
-                "trial_busco_m": f"{trial_busco['M']:.1f}" if trial_busco else "",
-                "busco_c_delta": f"{c_delta:.1f}" if (trial_busco and baseline_busco) else "",
-                "busco_d_delta": f"{d_delta:.1f}" if (trial_busco and baseline_busco) else "",
-                "busco_m_delta": f"{m_delta:.1f}" if (trial_busco and baseline_busco) else "",
+                "baseline_busco_c": "", "trial_busco_c": "",
+                "baseline_busco_d": "", "trial_busco_d": "",
+                "baseline_busco_m": "", "trial_busco_m": "",
+                "busco_c_delta": "", "busco_d_delta": "", "busco_m_delta": "",
             })
+            runner.log(f"  Candidate {cand['candidate_rank']} "
+                       f"({donor_name} → {backbone_name}): "
+                       f"REJECTED (bp_drop_suspicious, {repl_class})")
+            continue
 
-            if accepted:
-                accepted_count += 1
-                del current_backbone[backbone_name]
-                current_backbone[donor_name] = donor_seqs[donor_name]
-                if trial_busco:
-                    baseline_busco = trial_busco
-                baseline_bp = trial_bp
-                runner.log(f"  Candidate {cand['candidate_rank']} "
-                           f"({donor_name} → {backbone_name}): "
-                           f"ACCEPTED ({repl_class})")
-            else:
-                runner.log(f"  Candidate {cand['candidate_rank']} "
-                           f"({donor_name} → {backbone_name}): "
-                           f"REJECTED ({reason}, {repl_class})")
+        # BUSCO trial
+        trial_busco = None
+        c_delta = d_delta = m_delta = 0.0
+        if busco_available and baseline_busco:
+            trial_label = f"trial_{cand['candidate_rank']}"
+            trial_busco = _run_busco_trial(trial_fa, lineage,
+                                            runner.threads, trial_label, trial_dir)
 
-        runner.log(f"Telomere rescue: {accepted_count} replacements accepted "
-                   f"(max={max_accepted}, taxon={taxon})")
+        accepted = True
+        reason = "accepted"
 
-        # Write trial summary with replacement class + D-rise columns
-        trial_cols = ["candidate_rank", "backbone", "donor",
-                      "replacement_class", "accepted", "reason",
-                      "trial_bp", "trial_contigs",
-                      "baseline_busco_c", "trial_busco_c", "busco_c_delta",
-                      "baseline_busco_d", "trial_busco_d", "busco_d_delta",
-                      "baseline_busco_m", "trial_busco_m", "busco_m_delta"]
-        with open("assemblies/rescue_trial_summary.tsv", "w", newline="") as f:
-            w = csv.writer(f, delimiter="\t")
-            w.writerow(trial_cols)
-            for tr in trial_results:
-                w.writerow([tr.get(c, "") for c in trial_cols])
+        if trial_busco and baseline_busco:
+            c_delta = trial_busco["C"] - baseline_busco["C"]
+            m_delta = trial_busco["M"] - baseline_busco["M"]
+            d_delta = trial_busco.get("D", 0) - baseline_busco.get("D", 0)
 
-        # Write rescued backbone
-        rescued_recs = list(current_backbone.items())
-        _write_fasta(rescued_recs, "assemblies/backbone.telomere_rescued.fa")
+            if c_delta < -max_busco_c_drop:
+                accepted = False
+                reason = f"busco_c_drop ({c_delta:.1f}% < -{max_busco_c_drop}%)"
+            elif m_delta > max_busco_m_rise:
+                accepted = False
+                reason = f"busco_m_rise ({m_delta:.1f}% > +{max_busco_m_rise}%)"
+            elif d_delta > max_busco_d_rise:
+                accepted = False
+                reason = f"busco_d_rise ({d_delta:.1f}% > +{max_busco_d_rise}%)"
+        elif busco_available and baseline_busco and trial_busco is None:
+            accepted = False
+            reason = "trial_busco_failed"
 
-        with open("assemblies/single_tel.replaced.ids", "w") as f:
-            for tr in trial_results:
-                if tr["accepted"]:
-                    f.write(f"{tr['backbone']}\t{tr['donor']}\t"
-                            f"{tr['replacement_class']}\n")
-    else:
-        if not single_tel_src:
-            runner.log_info("No single-end telomeric contigs available for rescue")
-        elif not shutil.which("minimap2"):
-            runner.log_warn("minimap2 not found; skipping telomere rescue")
+        # Telomere evidence safety for single-end replacements
+        if accepted and repl_class == "replace_single_with_better":
+            if donor_name not in donor_t2t_verified and backbone_name in bb_telo_ids:
+                if cand.get("structural_score", 0) < 7.0:
+                    accepted = False
+                    reason = "donor_telo_not_stronger_than_backbone"
 
-        shutil.copy(working_backbone, "assemblies/backbone.telomere_rescued.fa")
+        trial_results.append({
+            "candidate_rank": cand["candidate_rank"],
+            "backbone": backbone_name, "donor": donor_name,
+            "replacement_class": repl_class,
+            "accepted": accepted, "reason": reason,
+            "trial_bp": trial_bp, "trial_contigs": trial_contigs,
+            "baseline_busco_c": f"{baseline_busco['C']:.1f}" if baseline_busco else "",
+            "trial_busco_c": f"{trial_busco['C']:.1f}" if trial_busco else "",
+            "baseline_busco_d": f"{baseline_busco.get('D', 0):.1f}" if baseline_busco else "",
+            "trial_busco_d": f"{trial_busco.get('D', 0):.1f}" if trial_busco else "",
+            "baseline_busco_m": f"{baseline_busco['M']:.1f}" if baseline_busco else "",
+            "trial_busco_m": f"{trial_busco['M']:.1f}" if trial_busco else "",
+            "busco_c_delta": f"{c_delta:.1f}" if (trial_busco and baseline_busco) else "",
+            "busco_d_delta": f"{d_delta:.1f}" if (trial_busco and baseline_busco) else "",
+            "busco_m_delta": f"{m_delta:.1f}" if (trial_busco and baseline_busco) else "",
+        })
 
-        for p in ["assemblies/single_tel.replaced.debug.tsv",
-                   "assemblies/single_tel.candidates.tsv",
-                   "assemblies/rescue_rejection_summary.txt",
-                   "assemblies/rescue_trial_summary.tsv"]:
-            with open(p, "w") as f:
-                pass
-        with open("assemblies/single_tel.replaced.ids", "w") as f:
-            pass
+        if accepted:
+            accepted_count += 1
+            del current_backbone[backbone_name]
+            current_backbone[donor_name] = donor_seqs[donor_name]
+            if trial_busco:
+                baseline_busco = trial_busco
+            baseline_bp = trial_bp
+            runner.log(f"  Candidate {cand['candidate_rank']} "
+                       f"({donor_name} → {backbone_name}): "
+                       f"ACCEPTED ({repl_class})")
+        else:
+            runner.log(f"  Candidate {cand['candidate_rank']} "
+                       f"({donor_name} → {backbone_name}): "
+                       f"REJECTED ({reason}, {repl_class})")
 
-    # ---- 12F2. Post-rescue dedup against protected set ----
-    if os.path.isfile("assemblies/protected.telomere.fa") and \
-       os.path.getsize("assemblies/protected.telomere.fa") > 0 and \
-       os.path.isfile("assemblies/backbone.telomere_rescued.fa") and \
-       shutil.which("minimap2"):
-        dedup_paf = "assemblies/rescued_vs_protected.paf"
+    runner.log(f"Telomere upgrades: {accepted_count} accepted "
+               f"(max={max_accepted}, taxon={taxon})")
+
+    # Write trial summary
+    trial_cols = ["candidate_rank", "backbone", "donor",
+                  "replacement_class", "accepted", "reason",
+                  "trial_bp", "trial_contigs",
+                  "baseline_busco_c", "trial_busco_c", "busco_c_delta",
+                  "baseline_busco_d", "trial_busco_d", "busco_d_delta",
+                  "baseline_busco_m", "trial_busco_m", "busco_m_delta"]
+    with open("assemblies/rescue_trial_summary.tsv", "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(trial_cols)
+        for tr in trial_results:
+            w.writerow([tr.get(c, "") for c in trial_cols])
+
+    with open("assemblies/single_tel.replaced.ids", "w") as f:
+        for tr in trial_results:
+            if tr["accepted"]:
+                f.write(f"{tr['backbone']}\t{tr['donor']}\t"
+                        f"{tr['replacement_class']}\n")
+
+    # ---- 12F2. Add novel pool T2T contigs that don't replace anything ----
+    # These cover chromosomal regions not represented in the backbone at all.
+    novel_additions = 0
+    if os.path.isfile(novel_pool_t2t_fa) and os.path.getsize(novel_pool_t2t_fa) > 0:
+        replaced_donors = {tr["donor"] for tr in trial_results if tr["accepted"]}
+        for pname, pseq in _read_fasta_records(novel_pool_t2t_fa):
+            if pname not in replaced_donors and pname not in current_backbone:
+                # Check this isn't redundant to anything already in current_backbone
+                # (simple length-based dedup — full dedup happens at 12G2)
+                if pname not in upgrade_donors:
+                    current_backbone[pname] = pseq
+                    novel_additions += 1
+                    runner.log(f"  Added novel pool T2T '{pname}' "
+                               f"({len(pseq):,} bp, new chromosomal region)")
+    if novel_additions > 0:
+        runner.log(f"Novel pool T2T additions: {novel_additions} contigs "
+                   f"covering regions absent from backbone")
+
+    # Write the upgraded backbone
+    _write_fasta(list(current_backbone.items()),
+                 "assemblies/backbone.telomere_rescued.fa")
+
+    # ---- 12G. Final assembly ----
+    # In backbone-first mode, the assembly IS the backbone (with upgrades).
+    # No separate pool + backbone merge needed.
+    raw_out = "assemblies/final_merge.raw.fasta"
+    shutil.copy("assemblies/backbone.telomere_rescued.fa", raw_out)
+
+    # ---- 12G2. Post-upgrade dedup (safety net) ----
+    # Remove any remaining redundancy between novel additions and backbone
+    if novel_additions > 0 and shutil.which("minimap2"):
+        dedup_paf = "assemblies/post_upgrade_dedup.paf"
         cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-               f"assemblies/protected.telomere.fa assemblies/backbone.telomere_rescued.fa")
+               f"{raw_out} {raw_out}")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         with open(dedup_paf, "w") as f:
             f.write(result.stdout)
 
-        _filter_redundant_to_protected(
-            dedup_paf, "assemblies/backbone.telomere_rescued.fa",
-            "assemblies/backbone.telomere_rescued.dedup.fa",
+        # Only remove contigs that are fully contained (95%/95%) in another
+        # AND are shorter (i.e., they are fragments of a larger contig)
+        best = _parse_paf_best_hits(dedup_paf)
+        recs = list(_read_fasta_records(raw_out))
+        rec_lens = {n: len(s) for n, s in recs}
+        self_drop = set()
+        for qname, (cov, ident) in best.items():
+            # PAF self-hits are excluded naturally (coverage = 1.0 but it's
+            # the query hitting itself) — minimap2 -x asm20 maps query to ref
+            # so we need to check the target is different
+            if cov >= 0.95 and ident >= 0.95 and qname not in tier1_ids:
+                # This contig is well-covered by something — could be self-hit
+                # Only drop if there exists a LARGER contig covering it
+                pass  # _filter_redundant_to_protected handles this below
+
+        # Use existing dedup function (safe — protects Tier 1)
+        n_post_dedup = _self_dedup_non_telomeric(
+            raw_out, tier1_ids | bb_telo_ids,
+            "assemblies/final_merge.deduped.fa",
+            runner.threads,
             cov_thr=0.95, id_thr=0.95,
         )
-    else:
-        shutil.copy("assemblies/backbone.telomere_rescued.fa",
-                     "assemblies/backbone.telomere_rescued.dedup.fa")
+        if n_post_dedup > 0:
+            shutil.copy("assemblies/final_merge.deduped.fa", raw_out)
+            runner.log(f"Post-upgrade dedup: removed {n_post_dedup} redundant contigs")
+        else:
+            runner.log("Post-upgrade dedup: no redundancy found")
 
-    # ---- 12G. Final combine ----
+    # Keep prot variable pointing to pool T2T for downstream provenance
     prot = "assemblies/protected.telomere.fa"
-    rescued = "assemblies/backbone.telomere_rescued.dedup.fa"
-    raw_out = "assemblies/final_merge.raw.fasta"
-
-    if os.path.isfile(prot) and os.path.getsize(prot) > 0 and \
-       os.path.isfile(rescued) and os.path.getsize(rescued) > 0:
-        with open(raw_out, "w") as out:
-            with open(prot) as f:
-                out.write(f.read())
-            with open(rescued) as f:
-                out.write(f.read())
-    elif os.path.isfile(prot) and os.path.getsize(prot) > 0:
-        shutil.copy(prot, raw_out)
-    elif os.path.isfile(rescued) and os.path.getsize(rescued) > 0:
-        shutil.copy(rescued, raw_out)
-    else:
-        shutil.copy(asm_fa, raw_out)
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
@@ -3143,44 +3504,51 @@ def step_12_refine(runner):
                 elif len(parts) == 2:
                     replaced_map[parts[1]] = (parts[0], "unknown")
 
-    # 3. pool_asm_map: map pool contig names to source assembler by sequence length
-    #    Read all normalized assembler FASTAs and build length->assembler lookup
+    # 3. pool_provenance_map: read provenance TSV from Step 10
+    #    Maps pool contig names → (asm, orig, source_type, qm_asm1, qm_asm2, qm_regions)
+    pool_provenance_map = {}
+    prov_tsv = "pool_contig_provenance.tsv"
+    if os.path.isfile(prov_tsv):
+        with open(prov_tsv) as f:
+            header = f.readline()
+            for ln in f:
+                parts = ln.rstrip("\n").split("\t")
+                if len(parts) >= 7 and parts[3] == "quickmerge":
+                    # Parse region string: "start-end:asm:contig;..."
+                    regions = []
+                    if parts[6]:
+                        for seg in parts[6].split(";"):
+                            try:
+                                rng, asm_r, contig_r = seg.split(":", 2)
+                                rs, re = rng.split("-")
+                                regions.append((int(rs), int(re), asm_r, contig_r))
+                            except (ValueError, IndexError):
+                                pass
+                    pool_provenance_map[parts[0]] = (
+                        parts[1], parts[2], parts[3],
+                        parts[4], parts[5], regions
+                    )
+                elif len(parts) >= 4:
+                    pool_provenance_map[parts[0]] = (parts[1], parts[2], parts[3])
+                elif len(parts) >= 3:
+                    pool_provenance_map[parts[0]] = (parts[1], parts[2], "unknown")
+        runner.log(f"Loaded pool provenance: {len(pool_provenance_map)} entries")
+    else:
+        runner.log_warn("pool_contig_provenance.tsv not found; "
+                        "GFF provenance will use backbone assembler for all contigs")
+
+    # Build pool_asm_map for compatibility
     pool_asm_map = {}
-    len_to_asm = {}
-    for asm_name in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm"]:
-        telo_fa = f"assemblies/{asm_name}.telo.fasta"
-        result_fa = f"assemblies/{asm_name}.result.fasta"
-        src = telo_fa if os.path.isfile(telo_fa) else result_fa
-        if os.path.isfile(src):
-            for cname, cseq in _read_fasta_records(src):
-                clen = len(cseq)
-                len_to_asm.setdefault(clen, []).append(asm_name)
-
-    # Map pool contigs (in protected set) to assembler by matching length
-    if prot_ids and len_to_asm:
-        if os.path.isfile(prot):
-            for cname, cseq in _read_fasta_records(prot):
-                asm_matches = len_to_asm.get(len(cseq), [])
-                if asm_matches:
-                    pool_asm_map[cname] = asm_matches[0]
-
-    # Also map rescue donor contigs
-    if replaced_map and len_to_asm:
-        # Donors come from the single-end telomere pool; try to match by length
-        for donor_name in replaced_map:
-            if donor_name not in pool_asm_map:
-                # Try to find the donor in the raw_out before rename
-                for cname, cseq in _read_fasta_records(raw_out):
-                    if cname == donor_name:
-                        asm_matches = len_to_asm.get(len(cseq), [])
-                        if asm_matches:
-                            pool_asm_map[donor_name] = asm_matches[0]
-                        break
+    for pn, prov in pool_provenance_map.items():
+        pool_asm_map[pn] = prov[0]
 
     _write_provenance_gff(
         "assemblies/final.merged.fasta",
         "assemblies/final.merged.provenance.gff3",
-        name_map, prot_ids, replaced_map, assembler, pool_asm_map, runner)
+        name_map, prot_ids, replaced_map, backbone_assembler=assembler,
+        pool_asm_map=pool_asm_map,
+        pool_provenance_map=pool_provenance_map,
+        runner=runner)
 
     # Also copy GFF to final_results when cleanup runs
     runner.log("Wrote assemblies/final.merged.provenance.gff3")
@@ -3682,6 +4050,7 @@ def step_17_cleanup(runner):
     for src in [
         "assemblies/final.merged.fasta",
         "assemblies/final.merged.provenance.gff3",
+        "pool_contig_provenance.tsv",
         "assemblies/selection_debug.tsv",
         "assemblies/selection_decision.txt",
         "assemblies/merged.merqury.csv",

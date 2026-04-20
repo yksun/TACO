@@ -50,13 +50,54 @@ is an optional override.
 - **New** output files: `single_tel.replaced.debug.tsv` (all hits),
   `single_tel.candidates.tsv` (plausible candidates),
   `rescue_rejection_summary.txt`, `rescue_trial_summary.tsv`.
-- **New** provenance GFF3: `final.merged.provenance.gff3` documents the
-  source assembler, role (t2t_pool / backbone / rescue_donor), original
-  contig name, and replacement class for every contig in the final assembly.
+- **New** provenance GFF3: `final.merged.provenance.gff3` documents each
+  contig's full provenance with attributes: `source_assembler`, `role`
+  (backbone / upgrade_donor / novel_t2t), `assembler_contig` (original
+  assembler contig name before Step 10 pool renaming), `source_type`
+  (assembler / quickmerge), `replacement_class`, `replaced_contig`, and
+  `description` (human-readable provenance summary showing exactly which
+  assembler contig replaced which backbone contig and how).
+- **New** quickmerge region-level provenance: for contigs derived from
+  quickmerge, the GFF3 now includes `qm_assembler1` and `qm_assembler2`
+  attributes on the contig-level record, plus child records (type=region,
+  linked via Parent) showing which assembler contributed each genomic
+  region.  Each region record has `source_assembler` and `assembler_contig`
+  tracing to the root original assembler contig.  This enables per-base
+  provenance tracing for merged contigs (e.g., "Region 1-500000 from canu
+  contig 'tig00001', Region 400000-900000 from flye contig 'contig_3'").
+  Region boundaries are determined by minimap2 alignment of each validated
+  quickmerge contig against both source assemblers in Step 10.
+- **New** `pool_contig_provenance.tsv`: comprehensive provenance map saved
+  in Step 10, tracking each pool contig's source assembler, original name,
+  and whether it came from an assembler or quickmerge.  For quickmerge
+  contigs, extended columns `qm_assembler1`, `qm_assembler2`, and
+  `qm_regions` (semicolon-delimited `start-end:assembler:contig` entries)
+  record region-level origin.  Used by Step 12 for accurate GFF annotation.
   Moved to `final_results/` during cleanup.
 - Structural screening thresholds: identity >= 0.85, aligned_bp >= 8000,
   cov_backbone >= 0.60, cov_donor >= 0.50, extension >= 1000,
   terminal touch window = 500 bp.  Configurable via environment variables.
+
+### Chimera detection improvements
+
+- **Improved** chimera safety now uses a two-strategy approach:
+  1. **Size gate** (existing): contigs > 1.5× the largest individual assembler
+     contig are flagged.
+  2. **Cross-assembly mapping** (new): each protected contig is aligned against
+     all other assembler outputs via minimap2.  A contig not well-covered
+     (≥60%) by any other assembler's individual contig is flagged as a
+     potential chimera.  Configurable via `CHIMERA_MIN_CROSS_COV` env var.
+  Contigs flagged by either strategy are removed from the protected pool.
+
+### Post-dedup BUSCO safety check
+
+- **New** after strict dedup (12D), the pipeline runs BUSCO on the combined
+  assembly (protected T2T + remaining backbone) and compares to the backbone
+  alone.  If BUSCO C drops > 3% (configurable via `DEDUP_MAX_BUSCO_C_DROP`),
+  a prominent warning is logged with remediation suggestions (raise
+  `PROTECT_COV`/`PROTECT_ID` thresholds to be more conservative).
+- **Improved** `_filter_redundant_to_protected()` now logs each backbone
+  contig it removes (name, length, coverage, identity) for easier debugging.
 
 ### Post-refinement stack
 
@@ -137,6 +178,10 @@ is an optional override.
   non-telomeric dedup (default 0.70/0.85).
 - **New** `SELFDEDUP_COV`, `SELFDEDUP_ID`: thresholds for non-telomeric
   self-dedup (default 0.80/0.90).
+- **New** `CHIMERA_MIN_CROSS_COV`: minimum cross-assembly coverage for
+  chimera safety mapping check (default 0.60).
+- **New** `DEDUP_MAX_BUSCO_C_DROP`: maximum tolerated BUSCO C drop after
+  dedup before a warning is issued (default 3.0%).
 
 ### CLI changes
 
