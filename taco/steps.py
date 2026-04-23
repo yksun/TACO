@@ -2264,21 +2264,36 @@ def _write_rescue_debug_tsv(hits, path):
 
 
 def _write_candidates_tsv(candidates, path):
-    """Write plausible rescue candidates to TSV."""
-    cols = ["candidate_rank", "backbone", "donor", "ident", "aligned_bp",
+    """Write plausible upgrade/rescue candidates to TSV.
+
+    Handles both pool T2T upgrade candidates (which have 'source' and
+    'replacement_class' but no alignment stats) and single-end rescue
+    candidates (which have full alignment fields like 'ident', 'cov_backbone').
+    """
+    cols = ["candidate_rank", "source", "backbone", "donor",
+            "replacement_class", "ident", "aligned_bp",
             "cov_backbone", "cov_donor", "ext", "len_gain",
             "touches_left", "touches_right", "structural_score"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(cols)
         for c in candidates:
+            ident = c.get("ident")
+            cov_bb = c.get("cov_backbone")
+            cov_d = c.get("cov_donor")
+            score = c.get("structural_score")
             w.writerow([
-                c["candidate_rank"], c["backbone"], c["donor"],
-                f"{c['ident']:.4f}", c["aligned_bp"],
-                f"{c['cov_backbone']:.4f}", f"{c['cov_donor']:.4f}",
-                c["ext"], c["len_gain"],
-                c["touches_left"], c["touches_right"],
-                f"{c['structural_score']:.4f}",
+                c.get("candidate_rank", ""),
+                c.get("source", "rescue"),
+                c["backbone"], c["donor"],
+                c.get("replacement_class", ""),
+                f"{ident:.4f}" if ident is not None else "",
+                c.get("aligned_bp", ""),
+                f"{cov_bb:.4f}" if cov_bb is not None else "",
+                f"{cov_d:.4f}" if cov_d is not None else "",
+                c.get("ext", ""), c.get("len_gain", ""),
+                c.get("touches_left", ""), c.get("touches_right", ""),
+                f"{score:.4f}" if score is not None else "",
             ])
 
 
