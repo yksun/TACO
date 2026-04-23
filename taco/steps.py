@@ -1014,9 +1014,18 @@ def step_10_telomere_pool(runner):
     os.makedirs("assemblies", exist_ok=True)
 
     fasta_files = glob.glob("assemblies/*.telo.fasta")
+    # Exclude leftover final assembly files from previous runs — these should
+    # not be treated as assembler inputs for the pool.
+    _exclude_prefixes = {"final", "final_merge", "backbone"}
+    fasta_files = [f for f in fasta_files
+                   if os.path.basename(f).replace(".telo.fasta", "")
+                   not in _exclude_prefixes]
     if not fasta_files:
         runner.log_info("No per-assembly *.telo.fasta files found; attempting to continue")
         fasta_files = glob.glob("assemblies/*.result.fasta")
+        fasta_files = [f for f in fasta_files
+                       if os.path.basename(f).replace(".result.fasta", "")
+                       not in _exclude_prefixes]
         if not fasta_files:
             runner.log_error("Still no FASTA files after generation.")
             raise RuntimeError("No FASTA files found")
@@ -1946,10 +1955,26 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
         length = len(seq)
         old_name = name_map.get(new_name, new_name)
 
+        # purge_dups renames contigs by appending _0, _1, etc. suffixes
+        # (e.g., "contig_14" becomes "contig_14_0" or "peregrine_3" becomes
+        # "peregrine_3_1").  Strip this suffix for provenance/role lookups.
+        lookup_name = old_name
+        if lookup_name not in pool_provenance_map and \
+           lookup_name not in protected_ids and \
+           lookup_name not in donor_names:
+            # Try stripping trailing _N suffix (purge_dups artifact)
+            m = re.match(r'^(.+)_(\d+)$', lookup_name)
+            if m:
+                base = m.group(1)
+                if base in pool_provenance_map or \
+                   base in protected_ids or \
+                   base in donor_names:
+                    lookup_name = base
+
         # Look up full provenance from Step 10 TSV
         # Quickmerge entries are 6-tuples: (asm, orig, source_type, asm1, asm2, regions)
         # Normal entries are 3-tuples: (asm, orig, source_type)
-        prov = pool_provenance_map.get(old_name)
+        prov = pool_provenance_map.get(lookup_name)
         qm_asm1 = qm_asm2 = ""
         qm_regions = []
         if prov and len(prov) >= 6:
@@ -1964,10 +1989,11 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
             source_type = "unknown"
 
         # Determine role, source assembler, and build description
-        if old_name in donor_names:
-            bb_name, repl_class = replaced_map[old_name]
+        # Use lookup_name (purge_dups suffix stripped) for all set/dict lookups
+        if lookup_name in donor_names:
+            bb_name, repl_class = replaced_map[lookup_name]
             role = "upgrade_donor"
-            source_asm = pool_asm_map.get(old_name, orig_asm)
+            source_asm = pool_asm_map.get(lookup_name, orig_asm)
             n_upgrade += 1
 
             if source_type == "quickmerge" and qm_asm1 and qm_asm2:
@@ -1983,9 +2009,9 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
                 desc = (f"Entire replacement: {backbone_assembler} contig "
                         f"'{bb_name}' replaced by {source_asm} contig "
                         f"'{orig_contig}' (class: {repl_class})")
-        elif old_name in protected_ids and old_name not in donor_names:
+        elif lookup_name in protected_ids and lookup_name not in donor_names:
             role = "novel_t2t"
-            source_asm = pool_asm_map.get(old_name, orig_asm)
+            source_asm = pool_asm_map.get(lookup_name, orig_asm)
             n_novel += 1
 
             if source_type == "quickmerge" and qm_asm1 and qm_asm2:
@@ -2010,7 +2036,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
             # Check if this backbone contig has a known original name
             # (backbone contigs may also have provenance if they were
             # in the pool before being selected as backbone)
-            bb_prov = pool_provenance_map.get(old_name)
+            bb_prov = pool_provenance_map.get(lookup_name)
             if bb_prov:
                 if len(bb_prov) >= 6:
                     orig_asm, orig_contig, source_type = bb_prov[0], bb_prov[1], bb_prov[2]
@@ -2498,9 +2524,13 @@ def _run_polishing(runner, input_fa, output_fa):
             # Build yak k-mer databases from HiFi reads
             runner.log_info("Building yak k-mer databases (k=21, k=31)...")
             for ksize, yak_out in [(21, k21_yak), (31, k31_yak)]:
-                if os.path.isfile(yak_out) and os.path.getsize(yak_out) > 0:
+                if os.path.isfile(yak_out) and os.path.getsize(yak_out) > 1024:
                     runner.log(f"  Reusing existing {yak_out}")
                     continue
+                elif os.path.isfile(yak_out):
+                    runner.log(f"  Removing suspect yak file {yak_out} "
+                               f"({os.path.getsize(yak_out)} bytes)")
+                    os.remove(yak_out)
                 cmd = (f"{yak_bin} count -k {ksize} -b 37 "
                        f"-t {runner.threads} -o {yak_out} {runner.fastq}")
                 result = subprocess.run(cmd, shell=True, capture_output=True,
@@ -2514,8 +2544,12 @@ def _run_polishing(runner, input_fa, output_fa):
                 runner.log(f"  Built {yak_out}")
 
             # Run NextPolish2
+            # Use absolute paths to avoid issues with working directories
+            abs_input = os.path.abspath(input_fa)
+            abs_k21 = os.path.abspath(k21_yak)
+            abs_k31 = os.path.abspath(k31_yak)
             cmd = (f"{np2_bin} -t {runner.threads} "
-                   f"{input_fa} {k21_yak} {k31_yak}")
+                   f"{abs_input} {abs_k21} {abs_k31}")
             runner.log_info(f"Running: {np2_bin} -t {runner.threads} ...")
             result = subprocess.run(cmd, shell=True, capture_output=True,
                                     text=True)
@@ -2527,10 +2561,24 @@ def _run_polishing(runner, input_fa, output_fa):
                     runner.log("NextPolish2 polishing complete")
                     return True
 
-            # If NextPolish2 wrote nothing or failed, log and fall back
+            # If NextPolish2 failed, check if yak databases are stale/corrupt
             err_msg = (result.stderr or "").strip()[:300]
-            runner.log_warn(f"NextPolish2 failed or produced no output"
-                            f"{': ' + err_msg if err_msg else ''}")
+            yak_stale = ("not a valid" in err_msg or "InvalidData" in err_msg
+                         or "panicked" in err_msg)
+
+            if yak_stale:
+                runner.log_warn(
+                    f"NextPolish2 failed (likely stale/incompatible yak databases). "
+                    f"Removing cached .yak files — they will be rebuilt on next run. "
+                    f"Error: {err_msg}")
+                for yf in [k21_yak, k31_yak]:
+                    if os.path.isfile(yf):
+                        os.remove(yf)
+                        runner.log(f"  Removed stale {yf}")
+            else:
+                runner.log_warn(f"NextPolish2 failed or produced no output"
+                                f"{': ' + err_msg if err_msg else ''}")
+
             shutil.copy(input_fa, output_fa)
             return False
         else:
@@ -2938,13 +2986,15 @@ def step_12_refine(runner):
             pass
 
     # ---- 12D3. Self-dedup backbone Tier 2 (internal redundancy) ----
-    # Taxon-aware thresholds for self-dedup among Tier 2 contigs:
+    # Conservative thresholds: only remove contigs that are almost entirely
+    # contained in another (95%/95%), to avoid dropping contigs with unique
+    # BUSCO genes.  Override with SELFDEDUP_COV / SELFDEDUP_ID env vars.
     if taxon == "fungal":
-        default_sd_cov, default_sd_id = "0.80", "0.90"
+        default_sd_cov, default_sd_id = "0.95", "0.95"
     elif taxon in ("plant", "vertebrate", "animal"):
-        default_sd_cov, default_sd_id = "0.90", "0.95"
+        default_sd_cov, default_sd_id = "0.95", "0.95"
     else:
-        default_sd_cov, default_sd_id = "0.85", "0.92"
+        default_sd_cov, default_sd_id = "0.95", "0.95"
 
     # Work on a copy of the backbone
     shutil.copy(backbone_fa, "assemblies/backbone.working.fa")
@@ -2961,6 +3011,30 @@ def step_12_refine(runner):
         runner.log(f"Tier 2 self-dedup (taxon={taxon}): removed "
                    f"{n_self_dedup} redundant non-telomeric contigs")
         shutil.copy("assemblies/backbone.selfdedup.fa", working_backbone_fa)
+
+        # BUSCO safety check: warn if self-dedup caused significant gene loss
+        busco_available = shutil.which("busco") is not None and runner.run_busco
+        if busco_available:
+            lineage = runner.busco_lineage or "ascomycota_odb10"
+            sd_trial_dir = "assemblies/selfdedup_busco_check"
+            os.makedirs(sd_trial_dir, exist_ok=True)
+
+            bb_busco = _run_busco_trial(backbone_fa, lineage,
+                                         runner.threads, "pre_selfdedup", sd_trial_dir)
+            sd_busco = _run_busco_trial(working_backbone_fa, lineage,
+                                         runner.threads, "post_selfdedup", sd_trial_dir)
+            if bb_busco and sd_busco:
+                c_drop = sd_busco["C"] - bb_busco["C"]
+                max_c_drop = float(os.environ.get("SELFDEDUP_MAX_BUSCO_C_DROP", "2.0"))
+                runner.log(f"Self-dedup BUSCO check: C {bb_busco['C']:.1f}% → "
+                           f"{sd_busco['C']:.1f}% (delta {c_drop:+.1f}%)")
+                if c_drop < -max_c_drop:
+                    runner.log_warn(
+                        f"Self-dedup caused BUSCO C drop of {c_drop:.1f}% "
+                        f"(threshold: {max_c_drop}%). Reverting self-dedup to "
+                        f"preserve gene completeness.")
+                    shutil.copy(backbone_fa, working_backbone_fa)
+                    n_self_dedup = 0
     else:
         runner.log(f"Tier 2 self-dedup (taxon={taxon}): "
                    f"no redundant contigs found")
