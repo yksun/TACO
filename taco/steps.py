@@ -3531,6 +3531,13 @@ def step_12_refine(runner):
                 f.write(f"{tr['backbone']}\t{tr['donor']}\t"
                         f"{tr['replacement_class']}\n")
 
+    # Build replaced_map early so novel filter can add to it.
+    # Format: {donor_name: (backbone_name, replacement_class)}
+    replaced_map = {}
+    for tr in trial_results:
+        if tr["accepted"]:
+            replaced_map[tr["donor"]] = (tr["backbone"], tr["replacement_class"])
+
     # ---- 12F2. Add novel pool T2T contigs (D-aware duplicate filter) ----
     # Before adding a "novel" T2T contig, check if it overlaps existing backbone.
     # Three possible outcomes for each candidate:
@@ -3825,16 +3832,17 @@ def step_12_refine(runner):
             prot_ids.add(pname)
 
     # 2. replaced_map: {donor_name: (backbone_name, replacement_class)}
-    replaced_map = {}
+    # Already initialized before 12F2 with trial results + novel upgrades.
+    # Merge any entries from the .ids file (in case of restart from mid-step).
     repl_ids_path = "assemblies/single_tel.replaced.ids"
     if os.path.isfile(repl_ids_path):
         with open(repl_ids_path) as f:
             for ln in f:
                 parts = ln.rstrip("\n").split("\t")
                 if len(parts) >= 3:
-                    replaced_map[parts[1]] = (parts[0], parts[2])
+                    replaced_map.setdefault(parts[1], (parts[0], parts[2]))
                 elif len(parts) == 2:
-                    replaced_map[parts[1]] = (parts[0], "unknown")
+                    replaced_map.setdefault(parts[1], (parts[0], "unknown"))
 
     # 3. pool_provenance_map: read provenance TSV from Step 10
     #    Maps pool contig names → (asm, orig, source_type, qm_asm1, qm_asm2, qm_regions)
