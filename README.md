@@ -189,7 +189,7 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 | **Backbone T2T weight** | 350 (high) | 200 (reduced) | 200 (reduced) | 300 (default) |
 | **BUSCO D penalty** | 600 (strict) | 300 (relaxed) | 500 (default) | 500 (default) |
 | **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2% (default) |
-| **purge_dups mode** | single-round | two-round + polyploid warning | two-round | single-round |
+| **purge_dups mode** | two-round (haploid-aggressive) | single-round + polyploid warning | two-round | single-round |
 | **Polishing (HiFi)** | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) |
 | **Polishing (ONT)** | Medaka → Racon | Medaka → Racon | Medaka → Racon | Medaka → Racon |
 | **Polishing (CLR)** | Racon | Racon | Racon | Racon |
@@ -307,9 +307,13 @@ Additional environment variables for fine-tuning Step 12: `PROTECT_COV` / `PROTE
 
 The maximum number of accepted rescue candidates per run is taxon-aware: fungi allow up to 20 rescues (many small chromosomes), vertebrates 10, plants 8 (conservative due to polyploidy risk), and other taxa 15. This prevents runaway replacement in complex genomes.
 
+### D-Aware Duplicate Filter (Step 12F2)
+
+Before adding "novel" pool T2T contigs, TACO checks each candidate against the current backbone with minimap2. Three outcomes are possible: (a) if the novel T2T overlaps a Tier 2 (non-T2T) backbone contig at ≥80% query coverage and ≥90% identity, it REPLACES the backbone contig — the T2T version is better (has telomeres, higher confidence chromosome ends); (b) if it overlaps a Tier 1 (already T2T) backbone contig, it's rejected as a pure duplicate; (c) if no significant overlap exists, it's added as a genuinely novel chromosomal region. An optional BUSCO D check (when BUSCO is available) rejects additions that increase duplication beyond the taxon-specific threshold. Thresholds are configurable: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID` (default 0.90), `NOVEL_MAX_D_RISE` (default: taxon D threshold).
+
 ### Taxon-Specific purge_dups Behaviour (Step 12H)
 
-purge_dups uses single-round purging for fungal, insect, and other genomes to avoid over-purging small or simple genomes. For vertebrate, animal, and plant genomes, two-round purging (`-2` flag) is used for more thorough cleanup of larger, more complex genomes. A warning is emitted for plant genomes because purge_dups may incorrectly collapse homeologous sequences in polyploid species — use `--no-purge-dups` if this is a concern.
+purge_dups strategy is taxon-aware. Fungi and other haploid genomes use two-round purging (`-2` flag) for more aggressive duplicate detection — in haploid genomes, duplicated contigs receive similar read coverage to primary contigs, making them harder to detect with single-round purging. Vertebrate and animal genomes also use two-round purging for thorough haplotig removal. Plant genomes use conservative single-round purging to avoid collapsing homeologous sequences in polyploid species — use `--no-purge-dups` if this is still too aggressive. Coverage cutoffs from `calcuts` are logged for debugging; override with the `PURGE_DUPS_CALCUTS` environment variable if automatic thresholds are incorrect for your dataset.
 
 ### N50-only Mode
 
@@ -322,23 +326,20 @@ Step 12 adopts a T2T-first assembly philosophy with a **two-tier confidence mode
 - **Tier 1 (Immutable)**: T2T contigs — contigs with verified telomere signal at both ends. These are treated as protected chromosomal anchors and are never replaced during rescue, unless `--allow-t2t-replace` is explicitly set. This protects the highest-confidence contigs from accidental degradation.
 - **Tier 2 (Editable)**: Backbone contigs — gap-fill contigs that cover chromosomal regions not represented by T2T contigs. These may be replaced by telomere-bearing rescue donors if the replacement passes BUSCO trial validation.
 
-Duplicate non-telomeric backbone contigs are aggressively removed (with taxon-aware thresholds), and rescue donors must carry verified telomere signal.
+Backbone contigs are preserved by default to maintain BUSCO completeness — purge_dups at Step 12H handles haplotig removal using read-coverage evidence. Novel T2T additions undergo a D-aware duplicate filter that either upgrades Tier 2 backbone contigs (replacing non-T2T with T2T) or rejects pure duplicates of Tier 1 contigs. Rescue donors must carry verified telomere signal.
 
 ### Step 12 Sub-step Flow
 
 1. **12A** — Merqury QV scoring (optional; auto-detected if installed, or enabled with `--merqury`/`--merqury-db`).
 2. **12B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
 3. **12C** — prepare cleaned backbone + chimera safety using two strategies: (a) **size gate** — contigs > 1.5× the largest individual assembler contig are flagged; (b) **cross-assembly mapping** — each protected contig is aligned against all other assembler outputs; contigs not well-covered (≥60%) by any single assembler's contig are flagged as potential chimeras. Configurable via `CHIMERA_MIN_CROSS_COV`.
-4. **12D** — T2T-first foundation building:
-   - **12D1** strict dedup (95%/95%): remove backbone contigs near-identical to T2T pool. Each removal is logged (name, length, coverage, identity).
-   - **12D2** post-dedup BUSCO safety check: runs BUSCO on the combined assembly (protected + remaining backbone) and compares to the backbone alone. Warns if BUSCO C drops > 3% (configurable via `DEDUP_MAX_BUSCO_C_DROP`), with remediation suggestions.
-   - **12D2b** fragment removal (50%/90%): remove backbone fragments partially overlapping T2T chromosomes.
-   - **12D3** backbone telomere classification: run telomere detection on remaining backbone contigs to identify which carry telomere signal.
-   - **12D4** aggressive non-telomeric dedup (taxon-aware): backbone contigs lacking telomere support that overlap the T2T pool are removed. Thresholds: fungi 70%/85%, plant/vertebrate 85%/92%, other 75%/88%.
-   - **12D5** non-telomeric self-dedup (taxon-aware): when two non-telomeric backbone contigs overlap, the shorter one is removed. Thresholds: fungi 80%/90%, plant/vertebrate 90%/95%, other 85%/92%. Telomere-bearing contigs are always kept.
-5. **12E** — telomere rescue with two-tier protection: align donor pool to backbone, compute structural metrics, verify each donor carries telomere signal, and classify each replacement. Tier 1 (T2T) contigs are immutable by default — candidates targeting them are rejected unless `--allow-t2t-replace` is set. Each accepted candidate is assigned a **replacement class**: `fill_missing_end`, `replace_non_telo_backbone`, `replace_single_with_better`, or `replace_protected_t2t`.
-6. **12F** — BUSCO trial validation: for each telomere-verified candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). Maximum accepted rescues are also taxon-aware (fungi: 20, plant: 8, vertebrate: 10, other: 15). An additional safety check rejects `replace_single_with_better` candidates if the replacement loses telomere evidence at either end.
-7. **12G** — final combine: T2T foundation + telomere-rescued backbone gap-fill.
+4. **12D** — backbone-first classification and pool T2T analysis:
+   - **12D1** backbone telomere classification: classify backbone contigs as Tier 1 (T2T, immutable) or Tier 2 (non-T2T, upgradeable).
+   - **12D2** pool T2T analysis: align pool T2T contigs against backbone. Pool T2T redundant to Tier 1 backbone are discarded. Pool T2T that cover a Tier 2 backbone contig (≥80% target coverage, ≥85% identity) become upgrade donors. Others are candidate novel additions.
+   - **12D3** backbone self-dedup: disabled by default (preserves BUSCO completeness). purge_dups at 12H handles haplotig removal. Re-enable with `SELFDEDUP_ENABLE=1`.
+5. **12E** — telomere upgrade: pool T2T donors replace Tier 2 backbone contigs. Tier 1 (T2T) contigs are immutable — candidates targeting them are rejected unless `--allow-t2t-replace` is set. Each replacement is assigned a class: `upgrade_tier2_to_t2t`, `replace_single_with_better`, etc.
+6. **12F** — BUSCO trial validation: for each candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). D-aware novel filter (12F2): novel T2T contigs that overlap Tier 2 backbone REPLACE the backbone (upgrade); those overlapping Tier 1 are rejected as duplicates; those with no overlap are added as genuinely novel. Optional BUSCO D check rejects additions that increase duplication excessively.
+7. **12G** — final combine: backbone (with upgrades) + novel additions. Post-upgrade dedup protects all backbone contigs; only novel additions can be removed if redundant.
 8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
 9. **12I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
 10. **12J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
@@ -349,7 +350,7 @@ TACO validates each telomere rescue candidate by building a trial assembly where
 
 ### Post-Refinement Stack
 
-After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups behaviour is taxon-aware: vertebrate, animal, and plant genomes use two-round purging (`-2` flag) for more thorough cleanup of larger, more complex genomes, while fungal and insect genomes use single-round to avoid over-purging. A warning is emitted for plant genomes due to polyploid risk. This is followed by automatic polishing selected from `--platform`: HiFi assemblies are polished with NextPolish2 by default (builds yak k-mer databases at k=21 and k=31 from HiFi reads, then applies k-mer-based correction — safe and effective for high-accuracy reads), Nanopore assemblies use Medaka (falls back to Racon if Medaka is not installed), and CLR assemblies use Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish` respectively.
+After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups strategy is taxon-aware: fungi and other haploid genomes use two-round purging (`-2`) for aggressive duplicate detection — in haploid genomes, duplicated contigs receive similar read coverage to primary contigs, making them harder to detect. Vertebrate and animal genomes also use two-round purging. Plants use conservative single-round purging to preserve homeologs; a warning is emitted for polyploid risk. Coverage cutoffs from `calcuts` are logged; override with `PURGE_DUPS_CALCUTS` if automatic thresholds are incorrect. This is followed by automatic polishing selected from `--platform`: HiFi assemblies use NextPolish2 (maps HiFi reads to assembly with minimap2, sorts BAM with samtools, builds yak k-mer databases, then runs k-mer-based correction), Nanopore uses Medaka (falls back to Racon), and CLR uses Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish`.
 
 ### Diploid and Polyploid Note
 

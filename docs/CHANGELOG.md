@@ -74,6 +74,36 @@ is an optional override.
   `qm_regions` (semicolon-delimited `start-end:assembler:contig` entries)
   record region-level origin.  Used by Step 12 for accurate GFF annotation.
   Moved to `final_results/` during cleanup.
+- **Fixed** pool T2T upgrade coverage check: now verifies BOTH query coverage
+  (pool contig) AND target coverage (backbone contig ≥80%).  Previously only
+  checked query coverage, allowing a small pool contig to "upgrade" a much
+  larger backbone contig, losing unique content and BUSCO genes.
+- **New** D-aware duplicate filter for novel T2T additions (12F2): before
+  adding a "novel" pool T2T contig, aligns it against the current backbone.
+  Three outcomes: (a) if it overlaps a Tier 2 (non-T2T) backbone contig, it
+  REPLACES the backbone (upgrade — T2T is better than non-T2T); (b) if it
+  overlaps a Tier 1 (already T2T) backbone contig, it's rejected as a
+  duplicate; (c) if no significant overlap, it's added as genuinely novel.
+  Optional BUSCO D check rejects additions that increase D beyond the taxon
+  threshold.  Configurable: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID`
+  (default 0.90), `NOVEL_MAX_D_RISE` (default: taxon D threshold).
+- **Disabled** backbone self-dedup by default: even conservative thresholds
+  removed backbone contigs with unique BUSCO genes.  purge_dups at 12H
+  handles haplotig removal more safely.  Re-enable with `SELFDEDUP_ENABLE=1`.
+- **Improved** purge_dups taxon-aware strategy: fungi/haploid genomes now use
+  two-round purging (`-2`) for more aggressive duplicate detection since
+  coverage differences between primary and duplicate are subtle in haploid
+  assemblies.  Plants use conservative single-round to preserve homeologs.
+  Coverage cutoffs are logged for debugging.  Override with
+  `PURGE_DUPS_CALCUTS` env var.
+- **Fixed** NextPolish2 v0.2.2 invocation: requires sorted BAM as first
+  argument (`nextPolish2 -t N reads.sorted.bam genome.fa k21.yak k31.yak`).
+  TACO now maps HiFi reads with `minimap2 -ax map-hifi`, sorts with
+  `samtools sort`, and passes the BAM correctly.  Requires `samtools`.
+- **Fixed** Step 13 BUSCO caching: always clears stale `busco/final/` results
+  before rerunning, preventing silent reuse of outdated metrics.
+- **Fixed** cleanup file move: uses explicit remove-then-copy instead of
+  `shutil.move` to avoid silent failures when destination already exists.
 - Structural screening thresholds: identity >= 0.85, aligned_bp >= 8000,
   cov_backbone >= 0.60, cov_donor >= 0.50, extension >= 1000,
   terminal touch window = 500 bp.  Configurable via environment variables.

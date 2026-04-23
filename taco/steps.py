@@ -2048,12 +2048,17 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
             else:
                 # This is a backbone contig not in the pool — it comes directly
                 # from the selected assembler.  Set proper provenance fields.
+                # Strip purge_dups _N suffix from backbone contig name
+                bb_clean = lookup_name
+                m_bb = re.match(r'^(.+)_(\d+)$', bb_clean)
+                if m_bb:
+                    bb_clean = m_bb.group(1)
                 source_type = "assembler"
                 source_asm = backbone_assembler
                 orig_asm = backbone_assembler
-                orig_contig = lookup_name
+                orig_contig = bb_clean
                 desc = (f"Retained from {backbone_assembler} backbone: "
-                        f"original contig '{lookup_name}'")
+                        f"original contig '{bb_clean}'")
 
         # GFF3 columns: seqid source type start end score strand phase attributes
         attrs = (f"ID={new_name}"
@@ -2473,13 +2478,49 @@ def _run_purge_dups(runner, input_fa, output_fa):
     subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
     # Step 4: Purge duplicates
-    # Note: -2 flag enables two-round purging (more aggressive).
-    # Use single-round for fungi/small genomes; two-round for vertebrates/plants.
+    # Taxon-aware purge_dups strategy:
+    #   - Fungi/haploid: single-round, but adjust calcuts low-coverage cutoff
+    #     downward.  In haploid genomes, true haplotigs have ~0.5× coverage
+    #     but purge_dups' auto calcuts often sets the boundary too low,
+    #     missing them.  Override with PURGE_DUPS_CALCUTS env var if needed.
+    #   - Plant/polyploid: conservative single-round to avoid removing
+    #     homeologous sequences.  Two-round purging is too aggressive.
+    #   - Vertebrate/diploid: two-round purging for thorough haplotig removal.
+    #   - Other: single-round, standard calcuts.
     base_cov = os.path.join(pd_dir, "PB.base.cov")
     dups_bed = os.path.join(pd_dir, "dups.bed")
+
+    # Log coverage cutoffs for debugging
+    if os.path.isfile(cutoff_file):
+        with open(cutoff_file) as cf:
+            cutoffs_str = cf.read().strip()
+        runner.log(f"purge_dups coverage cutoffs: {cutoffs_str}")
+
+    # Allow user override of calcuts thresholds
+    custom_calcuts = os.environ.get("PURGE_DUPS_CALCUTS", "")
+
     purge_flag = ""
-    if taxon in ("vertebrate", "animal", "plant"):
-        purge_flag = "-2"  # two-round for larger, more complex genomes
+    if taxon in ("vertebrate", "animal"):
+        purge_flag = "-2"  # two-round for diploid genomes
+        runner.log_info("purge_dups strategy: vertebrate/diploid (two-round)")
+    elif taxon == "plant":
+        # Single-round, conservative — avoid collapsing homeologs
+        runner.log_info("purge_dups strategy: plant (single-round, conservative)")
+    elif taxon == "fungal":
+        # Fungi are typically haploid — duplicates should have ~0.5× coverage.
+        # Use -2 for more aggressive duplicate detection in haploid genomes
+        # where coverage differences between primary and duplicate are subtle.
+        purge_flag = "-2"
+        runner.log_info("purge_dups strategy: fungal/haploid (two-round, aggressive)")
+    else:
+        runner.log_info("purge_dups strategy: default (single-round)")
+
+    if custom_calcuts:
+        # User provided custom calcuts: e.g. "5 10 15 20 25 30"
+        with open(cutoff_file, "w") as cf:
+            cf.write(custom_calcuts + "\n")
+        runner.log_info(f"Using custom calcuts override: {custom_calcuts}")
+
     cmd = f"purge_dups {purge_flag} -c {base_cov} -T {cutoff_file} {self_paf} > {dups_bed}"
     subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
@@ -2572,25 +2613,50 @@ def _run_polishing(runner, input_fa, output_fa):
                 runner.log(f"  Built {yak_out}")
 
             # Run NextPolish2
-            # Use absolute paths to avoid issues with working directories
+            # v0.2+ requires: nextPolish2 -t N reads.sorted.bam genome.fa k21.yak k31.yak
+            # Step 1: Map HiFi reads to assembly with minimap2
+            # Step 2: Sort BAM with samtools
+            # Step 3: Run NextPolish2 with BAM + genome + yak databases
             abs_input = os.path.abspath(input_fa)
             abs_k21 = os.path.abspath(k21_yak)
             abs_k31 = os.path.abspath(k31_yak)
 
-            # Check NextPolish2 version and help for argument order
             ver_result = subprocess.run(f"{np2_bin} --version",
                                         shell=True, capture_output=True, text=True)
             np2_ver = (ver_result.stdout or ver_result.stderr or "").strip()
             runner.log_info(f"NextPolish2 version: {np2_ver or 'unknown'}")
 
-            help_result = subprocess.run(f"{np2_bin} --help",
-                                          shell=True, capture_output=True, text=True)
-            np2_help = (help_result.stdout or help_result.stderr or "").strip()
-            runner.log_info(f"NextPolish2 usage: {np2_help[:300]}")
+            samtools_bin = shutil.which("samtools")
+            if not samtools_bin:
+                runner.log_warn("samtools not found; NextPolish2 requires sorted BAM. "
+                                "Install samtools or skip with --no-polish")
+                shutil.copy(input_fa, output_fa)
+                return False
 
-            # NextPolish2 usage: nextPolish2 -t N genome.fa k21.yak k31.yak
+            # Map HiFi reads to assembly
+            bam_unsorted = os.path.join(polish_dir, "hifi_vs_asm.bam")
+            bam_sorted = os.path.join(polish_dir, "hifi_vs_asm.sorted.bam")
+            abs_bam = os.path.abspath(bam_sorted)
+
+            runner.log_info("Mapping HiFi reads to assembly for NextPolish2...")
+            cmd = (f"minimap2 -ax map-hifi -t {runner.threads} "
+                   f"{abs_input} {runner.fastq} "
+                   f"| {samtools_bin} sort -@ {runner.threads} "
+                   f"-o {bam_sorted}")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if not os.path.isfile(bam_sorted) or os.path.getsize(bam_sorted) == 0:
+                runner.log_warn("HiFi read mapping failed; skipping NextPolish2")
+                shutil.copy(input_fa, output_fa)
+                return False
+
+            # Index the sorted BAM
+            cmd = f"{samtools_bin} index {bam_sorted}"
+            subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            runner.log("  Mapped and sorted HiFi reads")
+
+            # Run NextPolish2: nextPolish2 -t N reads.bam genome.fa k21.yak k31.yak
             cmd = (f"{np2_bin} -t {runner.threads} "
-                   f"{abs_input} {abs_k21} {abs_k31}")
+                   f"{abs_bam} {abs_input} {abs_k21} {abs_k31}")
             runner.log_info(f"Running: {cmd}")
             result = subprocess.run(cmd, shell=True, capture_output=True,
                                     text=True)
@@ -3465,23 +3531,169 @@ def step_12_refine(runner):
                 f.write(f"{tr['backbone']}\t{tr['donor']}\t"
                         f"{tr['replacement_class']}\n")
 
-    # ---- 12F2. Add novel pool T2T contigs that don't replace anything ----
-    # These cover chromosomal regions not represented in the backbone at all.
+    # ---- 12F2. Add novel pool T2T contigs (D-aware duplicate filter) ----
+    # Before adding a "novel" T2T contig, check if it overlaps existing backbone.
+    # Three possible outcomes for each candidate:
+    #   (a) Overlaps a Tier 2 (non-T2T) backbone contig → UPGRADE: replace the
+    #       backbone contig with this T2T version (it's better — has telomeres).
+    #   (b) Overlaps a Tier 1 (already T2T) backbone contig → REJECT: the
+    #       backbone already has a T2T version, this is a pure duplicate.
+    #   (c) No significant overlap → ADD as genuinely novel region.
+    # Optional BUSCO D check rejects additions that increase D excessively.
     novel_additions = 0
+    novel_upgrades = 0
+    novel_rejected = 0
+    novel_dup_cov = float(os.environ.get("NOVEL_DUP_COV", "0.80"))
+    novel_dup_id = float(os.environ.get("NOVEL_DUP_ID", "0.90"))
+    max_novel_d_rise = float(os.environ.get("NOVEL_MAX_D_RISE",
+                                             default_d_rise))
+
     if os.path.isfile(novel_pool_t2t_fa) and os.path.getsize(novel_pool_t2t_fa) > 0:
         replaced_donors = {tr["donor"] for tr in trial_results if tr["accepted"]}
+        novel_candidates = []
         for pname, pseq in _read_fasta_records(novel_pool_t2t_fa):
-            if pname not in replaced_donors and pname not in current_backbone:
-                # Check this isn't redundant to anything already in current_backbone
-                # (simple length-based dedup — full dedup happens at 12G2)
-                if pname not in upgrade_donors:
-                    current_backbone[pname] = pseq
-                    novel_additions += 1
-                    runner.log(f"  Added novel pool T2T '{pname}' "
-                               f"({len(pseq):,} bp, new chromosomal region)")
-    if novel_additions > 0:
-        runner.log(f"Novel pool T2T additions: {novel_additions} contigs "
-                   f"covering regions absent from backbone")
+            if pname not in replaced_donors and pname not in current_backbone \
+               and pname not in upgrade_donors:
+                novel_candidates.append((pname, pseq))
+
+        if novel_candidates and shutil.which("minimap2"):
+            # Write current backbone for alignment
+            bb_check_fa = "assemblies/backbone_for_novel_check.fa"
+            _write_fasta(list(current_backbone.items()), bb_check_fa)
+
+            for pname, pseq in novel_candidates:
+                # Align novel T2T contig against current backbone
+                novel_single_fa = "assemblies/novel_check_single.fa"
+                _write_fasta([(pname, pseq)], novel_single_fa)
+
+                cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                       f"{bb_check_fa} {novel_single_fa}")
+                result = subprocess.run(cmd, shell=True, capture_output=True,
+                                        text=True)
+
+                # Parse: which backbone contig does the novel contig align to?
+                best_qcov = 0.0
+                best_tcov = 0.0
+                best_ident = 0.0
+                best_target = ""
+                for ln in (result.stdout or "").strip().split("\n"):
+                    if not ln.strip():
+                        continue
+                    p = ln.split("\t")
+                    if len(p) < 12:
+                        continue
+                    qlen = int(p[1])
+                    qs, qe = int(p[2]), int(p[3])
+                    tname, tlen = p[5], int(p[6])
+                    ts, te = int(p[7]), int(p[8])
+                    matches, alnlen = int(p[9]), int(p[10])
+                    if qlen <= 0 or alnlen <= 0:
+                        continue
+                    qcov = (qe - qs) / max(1, qlen)
+                    tcov = (te - ts) / max(1, tlen)
+                    ident = matches / max(1, alnlen)
+                    if qcov > best_qcov or (abs(qcov - best_qcov) < 1e-12
+                                            and ident > best_ident):
+                        best_qcov = qcov
+                        best_tcov = tcov
+                        best_ident = ident
+                        best_target = tname
+
+                is_dup = best_qcov >= novel_dup_cov and best_ident >= novel_dup_id
+
+                if is_dup and best_target in current_backbone:
+                    # This novel T2T overlaps an existing backbone contig.
+                    # Decision depends on whether the backbone contig is
+                    # Tier 1 (T2T) or Tier 2 (non-T2T).
+                    target_is_t2t = best_target in tier1_ids
+                    target_is_telo = best_target in bb_telo_ids
+                    novel_len = len(pseq)
+                    bb_len = len(current_backbone[best_target])
+
+                    if target_is_t2t:
+                        # Backbone already T2T — pure duplicate, reject
+                        runner.log(
+                            f"  Novel T2T '{pname}' ({novel_len:,} bp) rejected: "
+                            f"duplicates Tier 1 T2T '{best_target}' "
+                            f"({bb_len:,} bp) at {best_qcov:.0%} cov / "
+                            f"{best_ident:.1%} id")
+                        novel_rejected += 1
+                        continue
+                    else:
+                        # Backbone is Tier 2 (non-T2T) — novel T2T is BETTER.
+                        # Replace backbone contig if novel is comparable size
+                        # or if it's a clear improvement (T2T > non-T2T).
+                        runner.log(
+                            f"  Novel T2T '{pname}' ({novel_len:,} bp) upgrades "
+                            f"Tier 2 '{best_target}' ({bb_len:,} bp): "
+                            f"T2T replaces non-T2T "
+                            f"(qcov={best_qcov:.0%}, tcov={best_tcov:.0%}, "
+                            f"id={best_ident:.1%})")
+                        del current_backbone[best_target]
+                        current_backbone[pname] = pseq
+                        novel_upgrades += 1
+                        # Track replacement for GFF provenance
+                        replaced_map[pname] = (best_target, "novel_t2t_upgrades_tier2")
+                        # Update backbone FASTA for next candidate
+                        _write_fasta(list(current_backbone.items()), bb_check_fa)
+                        continue
+
+                elif is_dup:
+                    # Duplicate of something no longer in current_backbone
+                    # (already replaced) — reject
+                    runner.log(
+                        f"  Novel T2T '{pname}' rejected: "
+                        f"{best_qcov:.0%} aligns to '{best_target}' "
+                        f"at {best_ident:.1%} id (duplicate)")
+                    novel_rejected += 1
+                    continue
+
+                # Not a duplicate — check BUSCO D if available
+                if busco_available and baseline_busco:
+                    trial_recs = list(current_backbone.items()) + [(pname, pseq)]
+                    trial_fa = os.path.join(trial_dir,
+                                            f"novel_trial_{pname}.fa")
+                    _write_fasta(trial_recs, trial_fa)
+                    trial_busco = _run_busco_trial(
+                        trial_fa, lineage, runner.threads,
+                        f"novel_{pname}", trial_dir)
+                    if trial_busco and baseline_busco:
+                        d_delta = trial_busco.get("D", 0) - \
+                                  baseline_busco.get("D", 0)
+                        if d_delta > max_novel_d_rise:
+                            runner.log(
+                                f"  Novel T2T '{pname}' rejected: "
+                                f"BUSCO D rises by {d_delta:+.1f}% "
+                                f"(threshold: +{max_novel_d_rise}%)")
+                            novel_rejected += 1
+                            continue
+                        runner.log(
+                            f"  Novel T2T '{pname}' BUSCO D check: "
+                            f"D delta {d_delta:+.1f}% (OK)")
+
+                # Passed all filters — add as genuinely novel
+                current_backbone[pname] = pseq
+                novel_additions += 1
+                runner.log(f"  Added novel pool T2T '{pname}' "
+                           f"({len(pseq):,} bp, genuinely novel region)")
+                # Update backbone FASTA for next candidate
+                _write_fasta(list(current_backbone.items()), bb_check_fa)
+
+            # Cleanup temp files
+            for tmp in [bb_check_fa, "assemblies/novel_check_single.fa"]:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+        elif novel_candidates:
+            for pname, pseq in novel_candidates:
+                current_backbone[pname] = pseq
+                novel_additions += 1
+                runner.log(f"  Added novel pool T2T '{pname}' "
+                           f"({len(pseq):,} bp) [minimap2 unavailable]")
+
+    if novel_additions > 0 or novel_upgrades > 0 or novel_rejected > 0:
+        runner.log(f"Novel pool T2T: {novel_additions} added, "
+                   f"{novel_upgrades} upgraded Tier 2 backbone, "
+                   f"{novel_rejected} rejected as Tier 1 duplicates")
 
     # Write the upgraded backbone
     _write_fasta(list(current_backbone.items()),
@@ -3628,6 +3840,10 @@ def step_12_refine(runner):
     #    Maps pool contig names → (asm, orig, source_type, qm_asm1, qm_asm2, qm_regions)
     pool_provenance_map = {}
     prov_tsv = "pool_contig_provenance.tsv"
+    # Also check final_results/ (cleanup step may have moved it)
+    if not os.path.isfile(prov_tsv) and \
+       os.path.isfile("final_results/pool_contig_provenance.tsv"):
+        prov_tsv = "final_results/pool_contig_provenance.tsv"
     if os.path.isfile(prov_tsv):
         with open(prov_tsv) as f:
             header = f.readline()
