@@ -5,6 +5,81 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.1] — 2026-04-23
+
+### Overview
+
+Version 1.2.1 fixes critical assembly quality issues in Step 12 and introduces
+smarter decision-making for telomere-aware contig upgrades.
+
+### Key changes
+
+- **Fixed** pool T2T upgrade coverage direction bug: the upgrade check now
+  verifies BOTH query coverage (pool contig) AND target coverage (backbone
+  contig ≥80%).  Previously only checked query coverage, allowing a 1.06M
+  pool T2T to "upgrade" a 1.73M backbone contig (losing 667K bp of content
+  and ~77 BUSCO genes).
+- **New** D-aware duplicate filter (12F2) with three-tier logic for novel
+  pool T2T contigs:
+  - Overlaps Tier 1 (T2T) backbone: reject (pure duplicate).
+  - Overlaps Tier 2 (non-T2T) backbone at ≥80% target coverage: upgrade
+    (replace backbone with T2T — better telomere evidence).
+  - Overlaps Tier 2 at 50–80% target coverage: **read-coverage diagnostic**
+    — maps HiFi reads to backbone contig and compares median coverage in
+    the T2T-covered region vs the uncovered region.  If uncovered region
+    has < 30% of covered region's coverage → backbone is chimeric, replace
+    with T2T.  If normal → backbone is real, reject novel (would increase D).
+    Configurable via `CHIMERIC_COV_RATIO` (default 0.30).
+  - Overlaps Tier 2 at < 50%: reject (insufficient overlap).
+  - No overlap: add as genuinely novel (with optional BUSCO D check).
+- **New** diagnostic logging for un-upgraded Tier 2 backbone contigs
+  (12D2b): reports which Tier 2 contigs have no full T2T upgrade and
+  identifies partial T2T hits, flagging potentially chimeric backbone.
+- **Disabled** backbone self-dedup by default.  purge_dups handles haplotig
+  removal using read-coverage evidence.  Re-enable with `SELFDEDUP_ENABLE=1`.
+- **Improved** purge_dups taxon strategy: fungi now use two-round purging
+  (`-2`) for aggressive duplicate detection in haploid genomes.  Plants use
+  conservative single-round.  Coverage cutoffs logged.  Override with
+  `PURGE_DUPS_CALCUTS`.
+- **Fixed** NextPolish2 v0.2.2: requires sorted BAM as first argument.
+  TACO now maps reads with minimap2, sorts with samtools, passes BAM correctly.
+- **Fixed** Step 13 BUSCO caching: always clears stale results before rerun.
+- **Fixed** GFF provenance: backbone contigs show clean names (purge_dups
+  suffix stripped), `source_type=assembler`; provenance TSV lookup checks
+  `final_results/` fallback.
+- **Fixed** cleanup file move: uses explicit remove-then-copy to avoid silent
+  failures.
+- **New** final assembly coverage QC (Step 12K): maps HiFi reads to the final
+  assembly and computes sliding-window coverage (default 5 kb window).  Detects
+  zero-coverage gaps, very low coverage regions (< 15% of global median), and
+  mixed low-coverage windows.  Outputs two reports:
+  `coverage_qc/coverage_summary.tsv` (per-contig: median, mean, min, max,
+  zero/low bp counts) and `coverage_qc/weak_regions.tsv` (per-window: flagged
+  regions with coordinates, coverage ratio, and flag type: ZERO_GAP, VERY_LOW,
+  LOW, MIXED_LOW).  Warns in log for contigs with weak spots.  Configure window
+  size with `COV_QC_WINDOW` (default 5000) and low-coverage threshold with
+  `COV_QC_LOW` (default 5).
+- **Fixed** BUSCO trial `busco_available`: no longer requires `--busco` flag.
+- **Fixed** `_write_candidates_tsv` KeyError for pool T2T upgrade candidates.
+- **Fixed** post-upgrade dedup: protects all backbone contigs, not just
+  telomere-bearing ones.
+
+### Environment variables (new)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NOVEL_DUP_COV` | 0.80 | Min query coverage to consider novel T2T a duplicate |
+| `NOVEL_DUP_ID` | 0.90 | Min identity for duplicate detection |
+| `NOVEL_UPGRADE_TCOV` | 0.80 | Min backbone coverage for T2T upgrade |
+| `NOVEL_MAX_D_RISE` | taxon default | Max BUSCO D rise allowed for novel additions |
+| `CHIMERIC_COV_RATIO` | 0.30 | If uncovered region coverage < this × covered → chimeric |
+| `PURGE_DUPS_CALCUTS` | auto | Override calcuts coverage thresholds |
+| `SELFDEDUP_ENABLE` | 0 | Set to 1 to re-enable backbone self-dedup |
+| `COV_QC_WINDOW` | 5000 | Sliding window size (bp) for coverage QC |
+| `COV_QC_LOW` | 5 | Reads below this depth counted as low-coverage |
+
+---
+
 ## [1.2.0] — 2026-04-15
 
 ### Overview

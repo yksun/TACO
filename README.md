@@ -309,7 +309,15 @@ The maximum number of accepted rescue candidates per run is taxon-aware: fungi a
 
 ### D-Aware Duplicate Filter (Step 12F2)
 
-Before adding "novel" pool T2T contigs, TACO checks each candidate against the current backbone with minimap2. Three outcomes are possible: (a) if the novel T2T overlaps a Tier 2 (non-T2T) backbone contig at ≥80% query coverage and ≥90% identity, it REPLACES the backbone contig — the T2T version is better (has telomeres, higher confidence chromosome ends); (b) if it overlaps a Tier 1 (already T2T) backbone contig, it's rejected as a pure duplicate; (c) if no significant overlap exists, it's added as a genuinely novel chromosomal region. An optional BUSCO D check (when BUSCO is available) rejects additions that increase duplication beyond the taxon-specific threshold. Thresholds are configurable: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID` (default 0.90), `NOVEL_MAX_D_RISE` (default: taxon D threshold).
+Before adding "novel" pool T2T contigs, TACO checks each candidate against the current backbone with minimap2 and applies a five-tier decision:
+
+1. **Overlaps Tier 1 (T2T) backbone** → reject (pure duplicate, backbone already has T2T).
+2. **Overlaps Tier 2 (non-T2T) backbone at ≥80% target coverage** → upgrade (replace backbone with T2T — better telomere evidence, comparable size).
+3. **Overlaps Tier 2 at 50–80% target coverage** → read-coverage diagnostic. TACO maps HiFi reads to the backbone contig and compares median coverage in the T2T-covered region vs the uncovered region. If the uncovered region has very low coverage (< 30% of covered), the backbone is chimeric and the T2T is the real chromosome — TACO replaces the backbone. If coverage is normal, the backbone is real — TACO rejects the novel contig (adding it would increase BUSCO D). Configurable via `CHIMERIC_COV_RATIO` (default 0.30).
+4. **Overlaps Tier 2 at < 50%** → reject (insufficient overlap for any useful decision).
+5. **No significant overlap** → add as genuinely novel chromosomal region (with optional BUSCO D check: `NOVEL_MAX_D_RISE`).
+
+Thresholds: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID` (default 0.90), `NOVEL_UPGRADE_TCOV` (default 0.80).
 
 ### Taxon-Specific purge_dups Behaviour (Step 12H)
 
@@ -343,6 +351,7 @@ Backbone contigs are preserved by default to maintain BUSCO completeness — pur
 8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
 9. **12I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
 10. **12J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
+11. **12K** — final assembly coverage QC: maps HiFi reads to the final assembly, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv` (per-contig stats) and `weak_regions.tsv` (per-window flags: ZERO_GAP, VERY_LOW, LOW, MIXED_LOW with coordinates). Weak spots may indicate misjoins, collapsed repeats, or chimeric regions. Configure with `COV_QC_WINDOW` and `COV_QC_LOW`.
 
 ### BUSCO Trial Validation
 
@@ -384,6 +393,8 @@ project_directory/
 │   ├── final_assembly.fasta             # Refined assembly (full mode)
 │   ├── final.merged.provenance.gff3     # GFF3 provenance: full assembler tracing per contig
 │   ├── pool_contig_provenance.tsv       # Pool contig → assembler + original name mapping
+│   ├── coverage_summary.tsv            # Per-contig coverage stats (median, mean, zero/low bp)
+│   ├── weak_regions.tsv                # Flagged weak windows (ZERO_GAP, VERY_LOW, LOW, coords)
 │   └── assembly_only_result.csv         # Comparison summary (assembly-only)
 ├── telomere_pool/                       # Telomere pool intermediates
 ├── quast_results/                       # QUAST output
