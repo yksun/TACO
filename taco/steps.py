@@ -2046,6 +2046,12 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
                 desc = (f"Retained from {source_asm} ({backbone_assembler} backbone): "
                         f"original contig '{orig_contig}'")
             else:
+                # This is a backbone contig not in the pool — it comes directly
+                # from the selected assembler.  Set proper provenance fields.
+                source_type = "assembler"
+                source_asm = backbone_assembler
+                orig_asm = backbone_assembler
+                orig_contig = lookup_name
                 desc = (f"Retained from {backbone_assembler} backbone: "
                         f"original contig '{lookup_name}'")
 
@@ -2333,9 +2339,18 @@ def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir):
     if os.path.isdir(trial_out):
         shutil.rmtree(trial_out)
 
+    # Try --offline first, fall back to normal mode if lineage not cached
     cmd = (f"busco -o {trial_label} -i {trial_fa} -l {lineage} "
            f"-m genome -c {threads} --out_path {out_dir} --offline")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        # Retry without --offline (lineage may need download)
+        if os.path.isdir(trial_out):
+            shutil.rmtree(trial_out)
+        cmd = (f"busco -o {trial_label} -i {trial_fa} -l {lineage} "
+               f"-m genome -c {threads} --out_path {out_dir}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
     # Parse BUSCO summary
     for root_dir in [trial_out, os.path.join(out_dir, f"run_{trial_label}")]:
@@ -2366,6 +2381,16 @@ def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir):
                             "M": float(m.group(5))}
             except Exception:
                 continue
+
+    # Last resort: parse from BUSCO stdout (contains summary line)
+    for output in [result.stdout or "", result.stderr or ""]:
+        m = re.search(r"C:(\d+(?:\.\d+)?)%.*?S:(\d+(?:\.\d+)?)%.*?"
+                      r"D:(\d+(?:\.\d+)?)%.*?F:(\d+(?:\.\d+)?)%.*?"
+                      r"M:(\d+(?:\.\d+)?)%", output, re.S)
+        if m:
+            return {"C": float(m.group(1)), "S": float(m.group(2)),
+                    "D": float(m.group(3)), "F": float(m.group(4)),
+                    "M": float(m.group(5))}
     return None
 
 
@@ -2552,15 +2577,18 @@ def _run_polishing(runner, input_fa, output_fa):
             abs_k21 = os.path.abspath(k21_yak)
             abs_k31 = os.path.abspath(k31_yak)
 
-            # Check NextPolish2 version for argument order
+            # Check NextPolish2 version and help for argument order
             ver_result = subprocess.run(f"{np2_bin} --version",
                                         shell=True, capture_output=True, text=True)
             np2_ver = (ver_result.stdout or ver_result.stderr or "").strip()
             runner.log_info(f"NextPolish2 version: {np2_ver or 'unknown'}")
 
-            # NextPolish2 v0.2+ uses: nextPolish2 -t N genome.fa k21.yak k31.yak
-            # Some builds require the reads FOFN: nextPolish2 -t N -r reads genome k21 k31
-            # Try standard invocation first
+            help_result = subprocess.run(f"{np2_bin} --help",
+                                          shell=True, capture_output=True, text=True)
+            np2_help = (help_result.stdout or help_result.stderr or "").strip()
+            runner.log_info(f"NextPolish2 usage: {np2_help[:300]}")
+
+            # NextPolish2 usage: nextPolish2 -t N genome.fa k21.yak k31.yak
             cmd = (f"{np2_bin} -t {runner.threads} "
                    f"{abs_input} {abs_k21} {abs_k31}")
             runner.log_info(f"Running: {cmd}")
@@ -2935,8 +2963,12 @@ def step_12_refine(runner):
         redundant_to_tier1 = set()
         upgrade_donors = {}  # pool_contig -> best backbone Tier 2 target
 
-        # Parse PAF to find which backbone contig each pool contig maps to
-        pool_to_target = {}  # pool_name -> (backbone_name, cov, ident)
+        # Parse PAF to find which backbone contig each pool contig maps to.
+        # Track BOTH query coverage (pool) and target coverage (backbone).
+        # For upgrade decisions, the backbone coverage matters — we must not
+        # replace a large backbone contig with a smaller pool contig that only
+        # covers part of it.
+        pool_to_target = {}  # pool_name -> (backbone_name, qcov, tcov, ident)
         if os.path.isfile(pool_vs_bb_paf):
             with open(pool_vs_bb_paf) as f:
                 for ln in f:
@@ -2947,40 +2979,55 @@ def step_12_refine(runner):
                         continue
                     qname, qlen = p[0], int(p[1])
                     qs, qe = int(p[2]), int(p[3])
-                    tname = p[5]
+                    tname, tlen = p[5], int(p[6])
+                    ts, te = int(p[7]), int(p[8])
                     matches, alnlen = int(p[9]), int(p[10])
                     if qlen <= 0 or alnlen <= 0:
                         continue
                     ident = matches / max(1, alnlen)
-                    cov = (qe - qs) / max(1, qlen)
-                    cur = pool_to_target.get(qname, ("", 0.0, 0.0))
-                    if cov > cur[1] or (abs(cov - cur[1]) < 1e-12 and ident > cur[2]):
-                        pool_to_target[qname] = (tname, cov, ident)
+                    qcov = (qe - qs) / max(1, qlen)   # how much of pool contig aligns
+                    tcov = (te - ts) / max(1, tlen)    # how much of backbone contig is covered
+                    cur = pool_to_target.get(qname, ("", 0.0, 0.0, 0.0))
+                    if qcov > cur[1] or (abs(qcov - cur[1]) < 1e-12 and ident > cur[3]):
+                        pool_to_target[qname] = (tname, qcov, tcov, ident)
 
         pool_recs = list(_read_fasta_records(pool_t2t_fa))
         novel_recs = []
         for pname, pseq in pool_recs:
             if pname in pool_to_target:
-                target, cov, ident = pool_to_target[pname]
-                if target in bb_t2t_ids and cov >= 0.80 and ident >= 0.90:
+                target, qcov, tcov, ident = pool_to_target[pname]
+                if target in bb_t2t_ids and qcov >= 0.80 and ident >= 0.90:
                     # Pool T2T covers same chromosome as backbone T2T → redundant
                     redundant_to_tier1.add(pname)
                     runner.log(f"  Pool T2T '{pname}' redundant to backbone "
-                               f"T2T '{target}' (cov={cov:.2f}, id={ident:.2f})")
-                elif target not in bb_t2t_ids and cov >= 0.60 and ident >= 0.85:
-                    # Pool T2T covers a Tier 2 backbone contig → upgrade donor
+                               f"T2T '{target}' (qcov={qcov:.2f}, tcov={tcov:.2f}, "
+                               f"id={ident:.2f})")
+                elif target not in bb_t2t_ids and qcov >= 0.60 and \
+                     tcov >= 0.80 and ident >= 0.85:
+                    # Pool T2T covers a Tier 2 backbone contig:
+                    # - qcov >= 0.60: pool contig aligns substantially
+                    # - tcov >= 0.80: pool contig covers most of backbone contig
+                    #   (prevents replacing large backbone with smaller pool contig)
+                    # - ident >= 0.85: alignment quality
                     upgrade_donors[pname] = target
                     novel_recs.append((pname, pseq))
                     novel_pool_ids.add(pname)
                     runner.log(f"  Pool T2T '{pname}' can upgrade backbone "
-                               f"Tier 2 '{target}' (cov={cov:.2f}, id={ident:.2f})")
+                               f"Tier 2 '{target}' (qcov={qcov:.2f}, tcov={tcov:.2f}, "
+                               f"id={ident:.2f})")
                 else:
                     # Pool T2T has low coverage against backbone — may cover a
                     # new region not in backbone at all → add as novel
                     novel_recs.append((pname, pseq))
                     novel_pool_ids.add(pname)
-                    runner.log(f"  Pool T2T '{pname}' covers novel region "
-                               f"(best bb hit: {target}, cov={cov:.2f})")
+                    if tcov < 0.80 and target not in bb_t2t_ids:
+                        runner.log(f"  Pool T2T '{pname}' rejected as upgrade for "
+                                   f"'{target}': only covers {tcov:.0%} of backbone contig "
+                                   f"(need ≥80%); added as novel instead")
+                    else:
+                        runner.log(f"  Pool T2T '{pname}' covers novel region "
+                                   f"(best bb hit: {target}, qcov={qcov:.2f}, "
+                                   f"tcov={tcov:.2f})")
             else:
                 # No alignment to backbone at all → novel region
                 novel_recs.append((pname, pseq))
