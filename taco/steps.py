@@ -3089,7 +3089,7 @@ def step_12_refine(runner):
                     if tcov < 0.80 and target not in bb_t2t_ids:
                         runner.log(f"  Pool T2T '{pname}' rejected as upgrade for "
                                    f"'{target}': only covers {tcov:.0%} of backbone contig "
-                                   f"(need ≥80%); added as novel instead")
+                                   f"(need ≥80%); D-aware filter will evaluate")
                     else:
                         runner.log(f"  Pool T2T '{pname}' covers novel region "
                                    f"(best bb hit: {target}, qcov={qcov:.2f}, "
@@ -3105,6 +3105,33 @@ def step_12_refine(runner):
                    f"{len(redundant_to_tier1)} redundant to backbone T2T, "
                    f"{len(upgrade_donors)} upgrade donors, "
                    f"{len(novel_pool_ids) - len(upgrade_donors)} novel additions")
+        # ---- 12D2b. Report un-upgraded Tier 2 backbone contigs ----
+        # For Tier 2 contigs that no pool T2T covers ≥80%, log a diagnostic
+        # to help identify potential chimeric backbone contigs.
+        upgraded_bb = set(upgrade_donors.values())
+        unupgraded_tier2 = [n for n in backbone_seqs
+                            if n not in bb_t2t_ids and n not in upgraded_bb]
+        if unupgraded_tier2:
+            runner.log_info(f"Tier 2 backbone contigs without T2T upgrade: "
+                            f"{len(unupgraded_tier2)}")
+            for bbname in unupgraded_tier2:
+                bblen = len(backbone_seqs[bbname])
+                # Check if any pool T2T partially covers this contig
+                partial_hits = [(pn, qc, tc, idt)
+                                for pn, (tgt, qc, tc, idt) in pool_to_target.items()
+                                if tgt == bbname and qc >= 0.50]
+                if partial_hits:
+                    best = max(partial_hits, key=lambda x: x[2])
+                    runner.log_info(
+                        f"  '{bbname}' ({bblen:,} bp): best partial T2T hit "
+                        f"'{best[0]}' covers {best[2]:.0%} of backbone "
+                        f"(qcov={best[1]:.0%}, id={best[3]:.1%}). "
+                        f"Backbone may be chimeric or contain extra sequence. "
+                        f"No replacement available — keeping backbone as-is")
+                else:
+                    runner.log_info(
+                        f"  '{bbname}' ({bblen:,} bp): no T2T contig in pool "
+                        f"covers this region — no telomere improvement possible")
     else:
         if not shutil.which("minimap2"):
             runner.log_warn("minimap2 not found; cannot compare pool T2T to backbone")
@@ -3610,26 +3637,29 @@ def step_12_refine(runner):
 
                 if is_dup and best_target in current_backbone:
                     # This novel T2T overlaps an existing backbone contig.
-                    # Decision depends on whether the backbone contig is
-                    # Tier 1 (T2T) or Tier 2 (non-T2T).
+                    # Decision depends on:
+                    #   1. Whether backbone is Tier 1 (T2T) or Tier 2 (non-T2T)
+                    #   2. How much of the BACKBONE the novel contig covers (tcov)
                     target_is_t2t = best_target in tier1_ids
-                    target_is_telo = best_target in bb_telo_ids
                     novel_len = len(pseq)
                     bb_len = len(current_backbone[best_target])
+
+                    # Minimum backbone coverage required for replacement
+                    min_upgrade_tcov = float(os.environ.get(
+                        "NOVEL_UPGRADE_TCOV", "0.80"))
 
                     if target_is_t2t:
                         # Backbone already T2T — pure duplicate, reject
                         runner.log(
                             f"  Novel T2T '{pname}' ({novel_len:,} bp) rejected: "
                             f"duplicates Tier 1 T2T '{best_target}' "
-                            f"({bb_len:,} bp) at {best_qcov:.0%} cov / "
-                            f"{best_ident:.1%} id")
+                            f"({bb_len:,} bp) at qcov={best_qcov:.0%} / "
+                            f"id={best_ident:.1%}")
                         novel_rejected += 1
                         continue
-                    else:
-                        # Backbone is Tier 2 (non-T2T) — novel T2T is BETTER.
-                        # Replace backbone contig if novel is comparable size
-                        # or if it's a clear improvement (T2T > non-T2T).
+                    elif best_tcov >= min_upgrade_tcov:
+                        # Novel T2T covers ≥80% of Tier 2 backbone →
+                        # safe to upgrade (replacement preserves most content)
                         runner.log(
                             f"  Novel T2T '{pname}' ({novel_len:,} bp) upgrades "
                             f"Tier 2 '{best_target}' ({bb_len:,} bp): "
@@ -3639,10 +3669,23 @@ def step_12_refine(runner):
                         del current_backbone[best_target]
                         current_backbone[pname] = pseq
                         novel_upgrades += 1
-                        # Track replacement for GFF provenance
-                        replaced_map[pname] = (best_target, "novel_t2t_upgrades_tier2")
-                        # Update backbone FASTA for next candidate
+                        replaced_map[pname] = (best_target,
+                                               "novel_t2t_upgrades_tier2")
                         _write_fasta(list(current_backbone.items()), bb_check_fa)
+                        continue
+                    else:
+                        # Novel T2T only partially covers Tier 2 backbone
+                        # (e.g., 61% of a 1.7M contig).  Cannot upgrade
+                        # (would lose backbone content) and cannot add as
+                        # novel (would increase BUSCO D).  Reject entirely.
+                        runner.log(
+                            f"  Novel T2T '{pname}' ({novel_len:,} bp) rejected: "
+                            f"partially covers Tier 2 '{best_target}' "
+                            f"({bb_len:,} bp, tcov={best_tcov:.0%}). "
+                            f"Too small to replace backbone "
+                            f"(need ≥{min_upgrade_tcov:.0%} tcov); "
+                            f"adding as novel would increase BUSCO D")
+                        novel_rejected += 1
                         continue
 
                 elif is_dup:
