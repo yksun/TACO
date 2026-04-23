@@ -3195,14 +3195,15 @@ def step_12_refine(runner):
         # ---- 12D2b. Report un-upgraded Tier 2 backbone contigs ----
         # For Tier 2 contigs that no pool T2T covers ≥80%, log a diagnostic
         # to help identify potential chimeric backbone contigs.
+        bb_name_lens = {n: len(s) for n, s in _read_fasta_records(backbone_fa)}
         upgraded_bb = set(upgrade_donors.values())
-        unupgraded_tier2 = [n for n in backbone_seqs
+        unupgraded_tier2 = [n for n in bb_name_lens
                             if n not in bb_t2t_ids and n not in upgraded_bb]
         if unupgraded_tier2:
             runner.log_info(f"Tier 2 backbone contigs without T2T upgrade: "
                             f"{len(unupgraded_tier2)}")
             for bbname in unupgraded_tier2:
-                bblen = len(backbone_seqs[bbname])
+                bblen = bb_name_lens.get(bbname, 0)
                 # Check if any pool T2T partially covers this contig
                 partial_hits = [(pn, qc, tc, idt)
                                 for pn, (tgt, qc, tc, idt) in pool_to_target.items()
