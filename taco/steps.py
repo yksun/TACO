@@ -2531,8 +2531,11 @@ def _run_polishing(runner, input_fa, output_fa):
                     runner.log(f"  Removing suspect yak file {yak_out} "
                                f"({os.path.getsize(yak_out)} bytes)")
                     os.remove(yak_out)
+                # yak count requires reads passed TWICE for two-pass counting
+                # (first pass: count k-mers, second pass: build database)
                 cmd = (f"{yak_bin} count -k {ksize} -b 37 "
-                       f"-t {runner.threads} -o {yak_out} {runner.fastq}")
+                       f"-t {runner.threads} -o {yak_out} "
+                       f"{runner.fastq} {runner.fastq}")
                 result = subprocess.run(cmd, shell=True, capture_output=True,
                                         text=True)
                 if result.returncode != 0:
@@ -2548,9 +2551,19 @@ def _run_polishing(runner, input_fa, output_fa):
             abs_input = os.path.abspath(input_fa)
             abs_k21 = os.path.abspath(k21_yak)
             abs_k31 = os.path.abspath(k31_yak)
+
+            # Check NextPolish2 version for argument order
+            ver_result = subprocess.run(f"{np2_bin} --version",
+                                        shell=True, capture_output=True, text=True)
+            np2_ver = (ver_result.stdout or ver_result.stderr or "").strip()
+            runner.log_info(f"NextPolish2 version: {np2_ver or 'unknown'}")
+
+            # NextPolish2 v0.2+ uses: nextPolish2 -t N genome.fa k21.yak k31.yak
+            # Some builds require the reads FOFN: nextPolish2 -t N -r reads genome k21 k31
+            # Try standard invocation first
             cmd = (f"{np2_bin} -t {runner.threads} "
                    f"{abs_input} {abs_k21} {abs_k31}")
-            runner.log_info(f"Running: {np2_bin} -t {runner.threads} ...")
+            runner.log_info(f"Running: {cmd}")
             result = subprocess.run(cmd, shell=True, capture_output=True,
                                     text=True)
 
@@ -2985,59 +2998,43 @@ def step_12_refine(runner):
         with open(novel_pool_t2t_fa, "w") as f:
             pass
 
-    # ---- 12D3. Self-dedup backbone Tier 2 (internal redundancy) ----
-    # Conservative thresholds: only remove contigs that are almost entirely
-    # contained in another (95%/95%), to avoid dropping contigs with unique
-    # BUSCO genes.  Override with SELFDEDUP_COV / SELFDEDUP_ID env vars.
-    if taxon == "fungal":
-        default_sd_cov, default_sd_id = "0.95", "0.95"
-    elif taxon in ("plant", "vertebrate", "animal"):
-        default_sd_cov, default_sd_id = "0.95", "0.95"
-    else:
-        default_sd_cov, default_sd_id = "0.95", "0.95"
-
-    # Work on a copy of the backbone
+    # ---- 12D3. Backbone internal redundancy ----
+    # Backbone self-dedup is DISABLED by default.  Even conservative thresholds
+    # (95%/95%) can remove contigs whose 5% unique region contains BUSCO genes,
+    # causing significant completeness loss (e.g. C drops from 97.4% to 92.9%
+    # when 2 "redundant" contigs carry ~77 unique genes).  purge_dups at Step
+    # 12H handles haplotig removal more safely using read-coverage evidence.
+    #
+    # Enable with SELFDEDUP_ENABLE=1 if you have known internal duplications
+    # that purge_dups does not catch.
     shutil.copy(backbone_fa, "assemblies/backbone.working.fa")
     working_backbone_fa = "assemblies/backbone.working.fa"
 
-    n_self_dedup = _self_dedup_non_telomeric(
-        working_backbone_fa, bb_telo_ids,
-        "assemblies/backbone.selfdedup.fa",
-        runner.threads,
-        cov_thr=float(os.environ.get("SELFDEDUP_COV", default_sd_cov)),
-        id_thr=float(os.environ.get("SELFDEDUP_ID", default_sd_id)),
-    )
-    if n_self_dedup > 0:
-        runner.log(f"Tier 2 self-dedup (taxon={taxon}): removed "
-                   f"{n_self_dedup} redundant non-telomeric contigs")
-        shutil.copy("assemblies/backbone.selfdedup.fa", working_backbone_fa)
+    if os.environ.get("SELFDEDUP_ENABLE", "0") == "1":
+        if taxon == "fungal":
+            default_sd_cov, default_sd_id = "0.95", "0.95"
+        elif taxon in ("plant", "vertebrate", "animal"):
+            default_sd_cov, default_sd_id = "0.95", "0.95"
+        else:
+            default_sd_cov, default_sd_id = "0.95", "0.95"
 
-        # BUSCO safety check: warn if self-dedup caused significant gene loss
-        busco_available = shutil.which("busco") is not None and runner.run_busco
-        if busco_available:
-            lineage = runner.busco_lineage or "ascomycota_odb10"
-            sd_trial_dir = "assemblies/selfdedup_busco_check"
-            os.makedirs(sd_trial_dir, exist_ok=True)
-
-            bb_busco = _run_busco_trial(backbone_fa, lineage,
-                                         runner.threads, "pre_selfdedup", sd_trial_dir)
-            sd_busco = _run_busco_trial(working_backbone_fa, lineage,
-                                         runner.threads, "post_selfdedup", sd_trial_dir)
-            if bb_busco and sd_busco:
-                c_drop = sd_busco["C"] - bb_busco["C"]
-                max_c_drop = float(os.environ.get("SELFDEDUP_MAX_BUSCO_C_DROP", "2.0"))
-                runner.log(f"Self-dedup BUSCO check: C {bb_busco['C']:.1f}% → "
-                           f"{sd_busco['C']:.1f}% (delta {c_drop:+.1f}%)")
-                if c_drop < -max_c_drop:
-                    runner.log_warn(
-                        f"Self-dedup caused BUSCO C drop of {c_drop:.1f}% "
-                        f"(threshold: {max_c_drop}%). Reverting self-dedup to "
-                        f"preserve gene completeness.")
-                    shutil.copy(backbone_fa, working_backbone_fa)
-                    n_self_dedup = 0
+        n_self_dedup = _self_dedup_non_telomeric(
+            working_backbone_fa, bb_telo_ids,
+            "assemblies/backbone.selfdedup.fa",
+            runner.threads,
+            cov_thr=float(os.environ.get("SELFDEDUP_COV", default_sd_cov)),
+            id_thr=float(os.environ.get("SELFDEDUP_ID", default_sd_id)),
+        )
+        if n_self_dedup > 0:
+            runner.log(f"Tier 2 self-dedup (taxon={taxon}): removed "
+                       f"{n_self_dedup} redundant non-telomeric contigs")
+            shutil.copy("assemblies/backbone.selfdedup.fa", working_backbone_fa)
+        else:
+            runner.log(f"Tier 2 self-dedup (taxon={taxon}): "
+                       f"no redundant contigs found")
     else:
-        runner.log(f"Tier 2 self-dedup (taxon={taxon}): "
-                   f"no redundant contigs found")
+        runner.log(f"Backbone self-dedup: skipped (preserving all backbone contigs "
+                   f"for BUSCO completeness; purge_dups handles haplotig removal)")
 
     # ---- 12E. Telomere upgrade: replace Tier 2 with pool T2T donors ----
     # Two types of upgrades:
