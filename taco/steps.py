@@ -1985,7 +1985,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
             orig_asm, orig_contig, source_type = prov[0], prov[1], prov[2]
         else:
             orig_asm = "unknown"
-            orig_contig = old_name
+            orig_contig = lookup_name
             source_type = "unknown"
 
         # Determine role, source assembler, and build description
@@ -2047,7 +2047,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
                         f"original contig '{orig_contig}'")
             else:
                 desc = (f"Retained from {backbone_assembler} backbone: "
-                        f"original contig '{old_name}'")
+                        f"original contig '{lookup_name}'")
 
         # GFF3 columns: seqid source type start end score strand phase attributes
         attrs = (f"ID={new_name}"
@@ -3249,7 +3249,7 @@ def step_12_refine(runner):
     max_busco_d_rise = float(os.environ.get("STEP12_MAX_BUSCO_D_RISE", default_d_rise))
 
     lineage = runner.busco_lineage or "ascomycota_odb10"
-    busco_available = shutil.which("busco") is not None and runner.run_busco
+    busco_available = shutil.which("busco") is not None
 
     trial_dir = "assemblies/rescue_trials"
     os.makedirs(trial_dir, exist_ok=True)
@@ -3447,33 +3447,20 @@ def step_12_refine(runner):
     shutil.copy("assemblies/backbone.telomere_rescued.fa", raw_out)
 
     # ---- 12G2. Post-upgrade dedup (safety net) ----
-    # Remove any remaining redundancy between novel additions and backbone
+    # Only check if novel additions are redundant to existing backbone contigs.
+    # Protect ALL backbone contigs (including non-telomeric Tier 2) to avoid
+    # BUSCO completeness loss.  purge_dups at 12H handles true haplotig removal.
     if novel_additions > 0 and shutil.which("minimap2"):
-        dedup_paf = "assemblies/post_upgrade_dedup.paf"
-        cmd = (f"minimap2 -x asm20 -t {runner.threads} "
-               f"{raw_out} {raw_out}")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        with open(dedup_paf, "w") as f:
-            f.write(result.stdout)
+        # Protect everything that was in the backbone (all original names)
+        all_backbone_names = set(backbone_seqs.keys())
+        # Also protect upgrade donors that replaced backbone contigs
+        for tr in trial_results:
+            if tr["accepted"]:
+                all_backbone_names.add(tr["donor"])
+                all_backbone_names.discard(tr["backbone"])  # replaced, not in assembly
 
-        # Only remove contigs that are fully contained (95%/95%) in another
-        # AND are shorter (i.e., they are fragments of a larger contig)
-        best = _parse_paf_best_hits(dedup_paf)
-        recs = list(_read_fasta_records(raw_out))
-        rec_lens = {n: len(s) for n, s in recs}
-        self_drop = set()
-        for qname, (cov, ident) in best.items():
-            # PAF self-hits are excluded naturally (coverage = 1.0 but it's
-            # the query hitting itself) — minimap2 -x asm20 maps query to ref
-            # so we need to check the target is different
-            if cov >= 0.95 and ident >= 0.95 and qname not in tier1_ids:
-                # This contig is well-covered by something — could be self-hit
-                # Only drop if there exists a LARGER contig covering it
-                pass  # _filter_redundant_to_protected handles this below
-
-        # Use existing dedup function (safe — protects Tier 1)
         n_post_dedup = _self_dedup_non_telomeric(
-            raw_out, tier1_ids | bb_telo_ids,
+            raw_out, all_backbone_names,
             "assemblies/final_merge.deduped.fa",
             runner.threads,
             cov_thr=0.95, id_thr=0.95,
@@ -3653,19 +3640,15 @@ def step_13_busco_final(runner):
 
     lineage = runner.busco_lineage or "ascomycota_odb10"
 
-    def has_final_metrics():
-        for d in ["busco/final", "busco/run_final"]:
-            if os.path.isdir(d):
-                files = glob.glob(f"{d}/**/short_summary*.json", recursive=True) + \
-                        glob.glob(f"{d}/**/short_summary*.txt", recursive=True) + \
-                        glob.glob(f"{d}/**/full_table*.tsv", recursive=True)
-                if files:
-                    return True
-        return False
+    # Always re-run BUSCO on final assembly — stale cached results from
+    # previous runs cause incorrect metrics in the comparison table.
+    # Remove old BUSCO output so we get fresh results.
+    for old_dir in ["busco/final", "busco/run_final"]:
+        if os.path.isdir(old_dir):
+            shutil.rmtree(old_dir)
+            runner.log(f"  Removed stale BUSCO cache: {old_dir}")
 
-    if has_final_metrics():
-        runner.log("Found existing BUSCO metrics for final")
-    else:
+    if True:
         busco_bin = shutil.which("busco")
         if not busco_bin:
             runner.log_error("Missing final BUSCO metrics and 'busco' is not available")
@@ -4133,6 +4116,8 @@ def step_17_cleanup(runner):
             pass
 
     # Move key results to final_results/
+    # Use shutil.copy + os.remove instead of shutil.move to avoid silent
+    # failures when destination already exists from a previous run.
     for src in [
         "assemblies/final.merged.fasta",
         "assemblies/final.merged.provenance.gff3",
@@ -4148,10 +4133,14 @@ def step_17_cleanup(runner):
         "protected_telomere_mode.txt",
     ]:
         if os.path.isfile(src):
+            dst = os.path.join("final_results", os.path.basename(src))
             try:
-                shutil.move(src, "final_results/")
-            except Exception:
-                pass
+                if os.path.isfile(dst):
+                    os.remove(dst)
+                shutil.copy2(src, dst)
+                os.remove(src)
+            except Exception as e:
+                runner.log_warn(f"Could not move {src} to final_results/: {e}")
 
     runner.log("Cleanup complete.")
 
