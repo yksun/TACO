@@ -46,16 +46,21 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 
 ## Features
 
-- Runs six long-read assemblers (HiCanu, NextDenovo, Peregrine, IPA, Flye, Hifiasm) from a single command
-- Supports PacBio HiFi, Oxford Nanopore, and PacBio CLR reads via `--platform`
+- Runs up to nine long-read assemblers (HiCanu, NextDenovo, Peregrine, IPA, Flye, Hifiasm, LJA, MBG, Raven) from a single command
+- Supports PacBio HiFi, Oxford Nanopore, and PacBio CLR reads via `--platform`; automatically selects compatible assemblers per platform
+- Input QC (Step 0): validates reads, estimates coverage, warns for low depth
 - Standardizes assembly outputs for direct cross-assembler comparison
 - Hybrid telomere detection with de novo k-mer discovery, built-in motif families, and per-end composite scoring
 - Three-tier telomere classification: strict T2T, single-end strong, and telomere-supported
-- Benchmarks assemblies with BUSCO, QUAST, telomere metrics, and optional Merqury
-- Biologically informed automatic backbone selection (smart scoring)
-- Assembly-only mode for convenient benchmarking without refinement
-- Telomere-aware backbone refinement with redundancy reduction and telomeric end rescue
-- Machine-readable benchmark logs for reproducible reporting
+- Benchmarks assemblies with BUSCO, QUAST, telomere metrics, and Merqury (auto-enabled for HiFi; builds reads.meryl automatically)
+- Taxon-aware scoring: BUSCO S rewarded, BUSCO D penalized, Merqury QV/completeness, telomere metrics, N50, contig count, and genome size deviation — with per-taxon weights for fungal, plant, vertebrate, insect, and other genomes
+- Taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota, `--taxon plant` → embryophyta, etc.
+- Assembly-only mode (`--assembly-only`) for convenient benchmarking without refinement
+- Conservative telomere-aware backbone refinement: D-aware duplicate filter, read-coverage diagnostic for partial overlaps, BUSCO trial validation, and "do no harm" safety comparison
+- Structural quickmerge validation with parent alignment checks
+- Coverage QC: sliding-window read depth analysis with GFF3 output for genome browser visualization
+- Full provenance tracking: GFF3 annotation tracing every contig to its original assembler, with quickmerge region-level mapping
+- Machine-readable benchmark logs, decision tables, and version tracking for reproducible reporting
 
 ## Installation
 
