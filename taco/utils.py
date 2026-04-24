@@ -6,6 +6,14 @@ import re
 from collections import defaultdict
 
 
+# Canonical assembler list — all downstream code should import this instead
+# of hardcoding assembler names.  "reference" is included for optional
+# user-provided reference assembly comparison.
+ALL_ASSEMBLERS = [
+    "canu", "reference", "flye", "ipa", "nextDenovo",
+    "peregrine", "hifiasm", "lja", "mbg", "raven",
+]
+
 ASSEMBLER_PLATFORMS = {
     "canu": {"pacbio-hifi": "-pacbio-hifi", "nanopore": "-nanopore", "pacbio": "-pacbio"},
     "nextDenovo": {"pacbio-hifi": "hifi", "nanopore": "ont", "pacbio": "clr"},

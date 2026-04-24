@@ -82,8 +82,9 @@ def parse_args():
     parser.add_argument('--busco', type=str, help='BUSCO lineage database (e.g., ascomycota_odb10); if not provided, defaults based on --taxon')
     parser.add_argument('--merqury', action='store_true')
     parser.add_argument('--merqury-db', type=str)
-    parser.add_argument('--merqury-k', type=int, default=21,
-                        help='K-mer size for Merqury database (default: 21)')
+    parser.add_argument('--merqury-k', type=str, default="21",
+                        help='K-mer size for Merqury database (default: 21; '
+                             'use "auto" to let meryl choose based on genome size)')
     parser.add_argument('--no-merqury', action='store_true')
     parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
     parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')

@@ -19,6 +19,7 @@ from collections import defaultdict
 
 from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
+from taco.utils import ALL_ASSEMBLERS
 
 
 def _parse_genome_size(size_str):
@@ -277,7 +278,7 @@ def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None
 def _build_busco_csv(runner):
     """Build assembly.busco.csv from BUSCO results."""
     out_csv = os.path.join("assemblies", "assembly.busco.csv")
-    desired = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    desired = ALL_ASSEMBLERS
 
     def newest(paths):
         return max(paths, key=os.path.getmtime) if paths else None
@@ -397,7 +398,7 @@ def _build_quast_csv(runner):
     out = os.path.join("assemblies", "assembly.quast.csv")
     treport = os.path.join("quast_out", "transposed_report.tsv")
     report = os.path.join("quast_out", "report.tsv")
-    desired = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    desired = ALL_ASSEMBLERS
 
     def norm(s):
         return (s or "").lower().replace("-", "").replace("_", "").replace(".result", "").replace(".fasta", "").strip()
@@ -961,7 +962,7 @@ def step_09_telomere(runner):
         runner.log_error("No assemblies found in ./assemblies. Run step 7 first or supply --reference.")
         raise RuntimeError("No assemblies found")
 
-    cols = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    cols = ALL_ASSEMBLERS
     tdouble = {}
     tsingle = {}
     tsupported = {}
@@ -1806,7 +1807,17 @@ def _run_merqury_preselection(runner):
     # Auto-build .meryl from reads if needed and meryl is available
     meryl_bin = shutil.which("meryl")
     if not db and meryl_bin and hasattr(runner, 'fastq') and runner.fastq:
-        k = getattr(runner, 'merqury_k', 21)
+        k_val = getattr(runner, 'merqury_k', 21)
+        if k_val == "auto":
+            # Use meryl's recommended k based on genome size
+            expected = _parse_genome_size(runner.genomesize)
+            if expected > 0:
+                import math as _math
+                k_val = max(17, min(31, int(_math.log(expected * 3) / _math.log(4))))
+            else:
+                k_val = 21
+            runner.log_info(f"Merqury auto k-mer size: {k_val}")
+        k = int(k_val)
         os.makedirs("merqury", exist_ok=True)
         db = f"merqury/reads.k{k}.meryl"
         if not os.path.isdir(db):
@@ -1844,7 +1855,7 @@ def _run_merqury_preselection(runner):
 
 def _write_merqury_csv():
     """Write assemblies/assembly.merqury.csv from Merqury output files."""
-    assemblers = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+    assemblers = ALL_ASSEMBLERS
     rows = [["Metric"] + assemblers, ["Merqury QV"], ["Merqury completeness (%)"]]
 
     def parse_first_float(path):
@@ -3241,7 +3252,7 @@ def step_12_refine(runner):
             runner.log_warn("Auto-selection failed; using first available assembler as fallback")
 
     if not assembler:
-        for asm in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm", "reference"]:
+        for asm in ALL_ASSEMBLERS:
             if os.path.isfile(f"assemblies/{asm}.result.fasta") and \
                os.path.getsize(f"assemblies/{asm}.result.fasta") > 0:
                 assembler = asm
@@ -3315,7 +3326,7 @@ def step_12_refine(runner):
         if shutil.which("minimap2") and len(protected_recs) > 0:
             # Collect all assembler result FASTAs (excluding the selected backbone)
             asm_fastas = []
-            for asm_name in ["canu", "flye", "nextDenovo", "peregrine", "ipa", "hifiasm"]:
+            for asm_name in [a for a in ALL_ASSEMBLERS if a != "reference"]:
                 for suffix in [".result.fasta", ".telo.fasta"]:
                     af = f"assemblies/{asm_name}{suffix}"
                     if os.path.isfile(af) and os.path.getsize(af) > 0:

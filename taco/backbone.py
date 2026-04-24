@@ -5,7 +5,8 @@ import argparse
 import csv
 import math
 
-ASSEMBLERS = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+from taco.utils import ALL_ASSEMBLERS
+ASSEMBLERS = ALL_ASSEMBLERS
 
 TAXON_WEIGHTS = {
     "fungal": {"dup_penalty": 600, "t2t_weight": 350, "n50_weight": 150, "frag_penalty": 30},

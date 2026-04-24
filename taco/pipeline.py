@@ -98,7 +98,14 @@ class PipelineRunner:
         # --merqury or --merqury-db.  Otherwise, auto-enable when merqury.sh
         # is on PATH and a .meryl directory is discoverable.
         self.merqury_db = getattr(args, 'merqury_db', None)
-        self.merqury_k = getattr(args, 'merqury_k', 21)
+        mk = getattr(args, 'merqury_k', "21")
+        if mk == "auto":
+            self.merqury_k = "auto"
+        else:
+            try:
+                self.merqury_k = int(mk)
+            except (ValueError, TypeError):
+                self.merqury_k = 21
         self.merqury_build_db = False
         if getattr(args, 'no_merqury', False):
             self.merqury_enable = False
@@ -214,36 +221,82 @@ class PipelineRunner:
     # ------------------------------------------------------------------ #
     # Version logging
     # ------------------------------------------------------------------ #
+    # Per-tool version extraction: (tool_name, binary, flags_to_try)
+    # Some tools don't support --version; each entry specifies the best strategy.
+    VERSION_COMMANDS = [
+        # Assemblers
+        ("canu",           "canu",             ["--version"]),
+        ("nextDenovo",     "nextDenovo",       ["--version"]),
+        ("peregrine",      "pg_asm",           ["--version"]),
+        ("ipa",            "ipa",              ["--version"]),
+        ("flye",           "flye",             ["--version"]),
+        ("hifiasm",        "hifiasm",          ["--version"]),
+        ("lja",            "lja",              ["--version"]),
+        ("mbg",            "MBG",              ["--version"]),
+        ("raven",          "raven",            ["--version"]),
+        # Analysis
+        ("busco",          "busco",            ["--version"]),
+        ("quast",          "quast",            ["--version"]),
+        ("minimap2",       "minimap2",         ["--version"]),
+        ("samtools",       "samtools",         ["--version"]),
+        ("seqtk",          "seqtk",            []),  # seqtk prints version on bare call
+        ("bwa",            "bwa",              []),   # bwa prints version on bare call
+        # Merging / dedup / polishing
+        ("merge_wrapper",  "merge_wrapper.py", ["--version"]),
+        ("purge_dups",     "purge_dups",       []),   # prints version on bare call
+        ("nextPolish2",    "nextPolish2",      ["--version"]),
+        ("yak",            "yak",              ["version"]),
+        ("racon",          "racon",            ["--version"]),
+        ("medaka",         "medaka",           ["--version"]),
+        # Merqury / Meryl
+        ("merqury",        "merqury.sh",       []),   # no version flag
+        ("meryl",          "meryl",            ["--version"]),
+        # Runtime
+        ("python",         "python3",          ["--version"]),
+    ]
+
     def log_version(self, label, cmd):
-        """Try to capture the version of *cmd* and return the first line."""
-        # Some tools (seqtk, bwa) print usage on stderr when given any flag
-        # and exit non-zero.  We try common flags in order, accept output from
-        # any, and fall back to capturing the first useful stderr line.
-        for flag in ["--version", "-V", "-v", "version", ""]:
+        """Extract version string from a tool, handling various output formats."""
+        import re as _re
+
+        # Try each flag; also try bare command (some tools print version on stderr
+        # when invoked without arguments)
+        flags_to_try = ["--version", "-V", "-v", "version", ""]
+        for flag in flags_to_try:
             try:
                 r = subprocess.run(
                     f"{cmd} {flag}".strip(),
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
+                    shell=True, capture_output=True, text=True, timeout=10,
                 )
-                out = (r.stdout or "").strip()
-                err = (r.stderr or "").strip()
-                # Prefer stdout, fall back to stderr
-                text = out or err
-                if text:
-                    first = text.split("\n")[0]
-                    # Skip lines that are just "Usage:" or "unrecognized command"
-                    if "unrecognized command" in first or first.startswith("Usage"):
-                        # Try to find a version-like line
-                        for line in text.split("\n"):
-                            if any(kw in line.lower() for kw in
-                                   ["version", "v0.", "v1.", "v2.", "v3."]):
-                                return line.strip()
-                        # Return first non-empty line as fallback
-                        return first
+                text = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+                if not text:
+                    continue
+
+                # Search for version-like patterns in output
+                # Match: tool_name X.Y.Z, vX.Y.Z, Version X.Y, etc.
+                m = _re.search(
+                    r'(?:version[:\s]*|v)(\d+\.\d+(?:\.\d+)?(?:[-.]\S*)?)',
+                    text, _re.IGNORECASE)
+                if m:
+                    return m.group(0).strip()
+
+                # Match: bare version number at start of line
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m2 = _re.match(r'^(\d+\.\d+(?:\.\d+)?(?:[-.]\S*)?)', line)
+                    if m2:
+                        return m2.group(1)
+
+                # If we got output but no version pattern, check for useful first line
+                first = text.split("\n")[0].strip()
+                if first and "unrecognized" not in first.lower() \
+                   and "invalid option" not in first.lower() \
+                   and "unknown command" not in first.lower() \
+                   and not first.lower().startswith("usage:"):
                     return first
+
             except Exception:
                 pass
         return "unknown"
@@ -259,25 +312,16 @@ class PipelineRunner:
             "",
             "Software versions:",
         ]
-        tools = [
-            "canu", "nextDenovo", "pg_asm", "ipa", "flye", "hifiasm",
-            "seqtk", "busco", "minimap2", "bwa", "samtools",
-            "merge_wrapper.py", "python3", "purge_dups", "nextPolish2",
-            "yak", "racon", "medaka", "merqury.sh",
-        ]
-        for t in tools:
-            if shutil.which(t) or shutil.which(t.replace(".py", "")):
-                ver = self.log_version(t, t)
-                lines.append(f"{t}: {ver}")
+        for label, binary, flags in self.VERSION_COMMANDS:
+            bin_path = shutil.which(binary)
+            if not bin_path:
+                # Try lowercase variant
+                bin_path = shutil.which(binary.lower())
+            if bin_path:
+                ver = self.log_version(label, bin_path)
+                lines.append(f"  {label}: {ver}")
             else:
-                lines.append(f"{t}: NOT FOUND")
-        # quast special case
-        qcmd = shutil.which("quast.py") or shutil.which("quast")
-        if qcmd:
-            ver = self.log_version("quast", qcmd)
-            lines.append(f"quast: {ver}")
-        else:
-            lines.append("quast: NOT FOUND")
+                lines.append(f"  {label}: not installed")
         with open(vf, "w") as f:
             f.write("\n".join(lines) + "\n")
 
