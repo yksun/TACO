@@ -71,7 +71,7 @@ Override the BUSCO lineage with `--busco <lineage_name>` if your organism needs 
 
 ## Running TACO
 
-TACO runs 19 steps (0-18). Step 0 (Input QC) always runs first — it validates the FASTQ, estimates coverage, and logs compatible assemblers. In full mode (Steps 0-17), TACO assembles, benchmarks, selects a backbone, refines it, and produces a final assembly. In assembly-only mode (Steps 0-12, 14, 18), TACO benchmarks all assemblers without refinement.
+TACO runs 17 public steps (0-16). Step 0 (Input QC) always runs first — it validates the FASTQ, estimates coverage, and logs compatible assemblers. In full mode (Steps 0-15), TACO assembles, runs combined assembly QC/comparison, builds the telomere pool, selects a backbone, refines it, and produces a final assembly. In assembly-only mode (Steps 0-11 and 16), TACO benchmarks all assemblers without refinement.
 
 ```bash
 mkdir -p my_project && cd my_project
@@ -89,7 +89,7 @@ taco -g 2.5g -t 32 --fastq /path/to/reads.fastq.gz --taxon vertebrate --platform
 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --assembly-only
 
 # Resume from a specific step (e.g., rerun from refinement)
-taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal -s 15-17
+taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal -s 13-15
 ```
 
 **Alternative (without pip install):** Use the shell wrapper which sets PYTHONPATH automatically:

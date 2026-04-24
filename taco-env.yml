@@ -29,12 +29,12 @@ dependencies:
   - quast>=5.2
   - minimap2>=2.24
   - samtools>=1.15
-  # Contig merging (telomere-aware validated merge in Step 13)
-  # quickmerge provides merge_wrapper.py used by Step 13
+  # Contig merging (telomere-aware validated merge in Step 12)
+  # quickmerge provides merge_wrapper.py used by Step 12
   - quickmerge
-  # Post-assembly haplotig/duplicate purging (Step 15)
+  # Post-assembly haplotig/duplicate purging (Step 13)
   - purge_dups
-  # Polishing (auto-selected by --platform in Step 15)
+  # Polishing (auto-selected by --platform in Step 13)
   - nextpolish2
   - yak
   - racon

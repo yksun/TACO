@@ -22,24 +22,24 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **New** Step 0 — Input QC: validates FASTQ exists, estimates coverage,
   warns for low coverage per-platform (HiFi <25×, ONT <40×, CLR <50×),
   logs compatible assemblers.  Runs in both full and assembly-only modes.
-- **Renumbered** pipeline steps from 18 to 19 steps (0-18):
+- **Renumbered** public pipeline steps to 17 steps (0-16) and moved the
+  telomere pool after the full assembler QC/comparison pass:
   - Steps 1-6: original assemblers (Canu, NextDenovo, Peregrine, IPA, Flye, Hifiasm)
   - Steps 7-9: **new** assemblers (LJA, MBG, Raven)
   - Step 10: normalize (was Step 7)
-  - Steps 11-12: BUSCO + telomere on all assemblies (were Steps 8-9)
-  - Step 13: telomere pool (was Step 10)
-  - Step 14: QUAST comparison (was Step 11)
-  - Step 15: backbone selection + refinement (was Step 12)
-  - Step 16: **combined** final QC (BUSCO + Telomere + QUAST on final; were Steps 13-15)
-  - Step 17: **combined** final report + cleanup (were Steps 16-17)
-  - Step 18: assembly-only comparison + cleanup (was Step 18)
+  - Step 11: **combined** assembler QC/comparison (BUSCO + telomere + QUAST + optional Merqury; were Steps 11, 12, and 14)
+  - Step 12: telomere pool (after comparison QC; was Step 13)
+  - Step 13: backbone selection + refinement (was Step 15)
+  - Step 14: **combined** final QC (BUSCO + Telomere + QUAST on final; was Step 16)
+  - Step 15: **combined** final report + cleanup (was Step 17)
+  - Step 16: assembly-only comparison + cleanup (was Step 18)
 - **Unified** assembler lists: all downstream code (BUSCO CSV, QUAST CSV,
   Merqury CSV, assembly_info, backbone selection, chimera check) now imports
   `ALL_ASSEMBLERS` from `utils.py` instead of hardcoding names.  Adding a
   new assembler requires only one change in `utils.py`.
-- **Assembly-only mode** (`--assembly-only`) now runs Steps 0-12, 14, 18
-  (all assemblers + normalize + BUSCO + telomere + QUAST + comparison report).
-  Full mode runs Steps 0-17.
+- **Assembly-only mode** (`--assembly-only`) now runs Steps 0-11 and 16
+  (all assemblers + normalize + combined QC/comparison + assembly-only report).
+  Full mode runs Steps 0-15.
 - **New** taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota_odb10,
   `--taxon plant` → embryophyta_odb10, `--taxon vertebrate` → vertebrata_odb10,
   `--taxon insect` → insecta_odb10, `--taxon other` → requires explicit `--busco`.
@@ -55,12 +55,12 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **Improved** replacement safety: candidates must pass sufficient target
   coverage, query coverage, BUSCO validation (C/D/M), size sanity, and
   read coverage support before replacing backbone.
-- **New** Step 10 quickmerge structural validation: parent alignment identity,
+- **New** Step 12 quickmerge structural validation: parent alignment identity,
   query coverage, union coverage, unexplained gap check.  Decision table
   written to `quickmerge_validation.tsv` and `telomere_pool_decisions.tsv`.
 - **New** `--merqury-k` flag for configurable Merqury k-mer size (default 21).
   Auto-build names database `reads.k{K}.meryl`.
-- **New** Step 15L "do no harm" comparison: after refinement, compares final
+- **New** Step 13L "do no harm" comparison: after refinement, compares final
   vs backbone for size, telomere count, and genome size deviation.  If quality
   degraded, saves both assemblies + `refinement_warning.txt`.
 
@@ -71,21 +71,21 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   contig ≥80%).  Previously only checked query coverage, allowing a 1.06M
   pool T2T to "upgrade" a 1.73M backbone contig (losing 667K bp of content
   and ~77 BUSCO genes).
-- **New** D-aware duplicate filter (15F2) with three-tier logic for novel
+- **New** D-aware duplicate filter (13F2) with three-tier logic for novel
   pool T2T contigs:
   - Overlaps Tier 1 (T2T) backbone: reject (pure duplicate).
   - Overlaps Tier 2 (non-T2T) backbone at ≥80% target coverage: upgrade
     (replace backbone with T2T — better telomere evidence).
   - Overlaps Tier 2 at 50–80% target coverage: **read-coverage diagnostic**
-    — maps HiFi reads to backbone contig and compares median coverage in
-    the T2T-covered region vs the uncovered region.  If uncovered region
+    — maps input reads with a platform-specific minimap2 preset and compares
+    median coverage in the T2T-covered region vs the uncovered region.  If uncovered region
     has < 30% of covered region's coverage → backbone is chimeric, replace
     with T2T.  If normal → backbone is real, reject novel (would increase D).
     Configurable via `CHIMERIC_COV_RATIO` (default 0.30).
   - Overlaps Tier 2 at < 50%: reject (insufficient overlap).
   - No overlap: add as genuinely novel (with optional BUSCO D check).
 - **New** diagnostic logging for un-upgraded Tier 2 backbone contigs
-  (15D2b): reports which Tier 2 contigs have no full T2T upgrade and
+  (13D2b): reports which Tier 2 contigs have no full T2T upgrade and
   identifies partial T2T hits, flagging potentially chimeric backbone.
 - **Disabled** backbone self-dedup by default.  purge_dups handles haplotig
   removal using read-coverage evidence.  Re-enable with `SELFDEDUP_ENABLE=1`.
@@ -96,13 +96,13 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **Fixed** NextPolish2 v0.2.2: requires sorted BAM as first argument.
   TACO now maps reads with minimap2, sorts with samtools, passes BAM correctly.
 - **Fixed** final BUSCO caching: always clears stale results before rerun
-  (previously Step 13, now part of Step 16 final QC).
+  (now part of Step 14 final QC).
 - **Fixed** GFF provenance: backbone contigs show clean names (purge_dups
   suffix stripped), `source_type=assembler`; provenance TSV lookup checks
   `final_results/` fallback.
 - **Fixed** cleanup file move: uses explicit remove-then-copy to avoid silent
   failures.
-- **New** final assembly coverage QC (Step 15K): maps HiFi reads to the final
+- **New** final assembly coverage QC (Step 13K): maps reads to the final
   assembly and computes sliding-window coverage (default 5 kb window).  Detects
   zero-coverage gaps, very low coverage regions (< 15% of global median), and
   mixed low-coverage windows.  Three output files in `final_results/`:
@@ -133,6 +133,11 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 | `NOVEL_DUP_ID` | 0.90 | Min identity for duplicate detection |
 | `NOVEL_UPGRADE_TCOV` | 0.80 | Min backbone coverage for T2T upgrade |
 | `NOVEL_MAX_D_RISE` | taxon default | Max BUSCO D rise allowed for novel additions |
+| `STEP13_MAX_ACCEPTED` | taxon default | Max accepted rescue candidates in refinement |
+| `STEP13_MIN_BP_RATIO` | 0.90 | Min donor/backbone bp ratio for replacement candidates |
+| `STEP13_MAX_BUSCO_C_DROP` | taxon default | Max BUSCO C% drop allowed during trial validation |
+| `STEP13_MAX_BUSCO_M_RISE` | taxon default | Max BUSCO M% rise allowed during trial validation |
+| `STEP13_MAX_BUSCO_D_RISE` | taxon default | Max BUSCO D% rise allowed during trial validation |
 | `CHIMERIC_COV_RATIO` | 0.30 | If uncovered region coverage < this × covered → chimeric |
 | `PURGE_DUPS_CALCUTS` | auto | Override calcuts coverage thresholds |
 | `SELFDEDUP_ENABLE` | 0 | Set to 1 to re-enable backbone self-dedup |
@@ -163,13 +168,13 @@ is an optional override.
 - **New** T2T-first assembly philosophy: T2T contigs from all assemblers
   form the primary foundation.  Backbone contigs serve as gap-fill only
   for chromosomal regions not covered by T2T contigs.
-- **New** backbone telomere classification (15D3): after initial dedup, all
+- **New** backbone telomere classification (12D3): after initial dedup, all
   remaining backbone contigs are classified by telomere status.  Contigs with
   telomere signal are protected from aggressive dedup.
-- **New** aggressive non-telomeric dedup (15D4): backbone contigs lacking
+- **New** aggressive non-telomeric dedup (12D4): backbone contigs lacking
   telomere support that overlap the T2T pool at 70%/85% are removed.  Configurable
   via `AGGR_NONTELO_COV` and `AGGR_NONTELO_ID` environment variables.
-- **New** non-telomeric self-dedup (15D5): when two non-telomeric backbone contigs
+- **New** non-telomeric self-dedup (12D5): when two non-telomeric backbone contigs
   overlap at 80%/90%, the shorter one is removed.  Telomere-bearing contigs
   are always kept.  Configurable via `SELFDEDUP_COV` and `SELFDEDUP_ID`.
 - **New** donor telomere verification: rescue candidates must carry verified
@@ -180,7 +185,7 @@ is an optional override.
   length gain, and composite structural score.
 - **New** BUSCO trial validation: each plausible candidate is tested by building
   a trial assembly and running BUSCO.  Rejection thresholds are taxon-aware.
-- **New** telomere-aware genome-size pruning (15J): telomere-bearing contigs
+- **New** telomere-aware genome-size pruning (12J): telomere-bearing contigs
   are never pruned, only non-telomeric fragments are removed when assembly
   exceeds the genome size budget.
 - **New** output files: `single_tel.replaced.debug.tsv` (all hits),
@@ -189,7 +194,7 @@ is an optional override.
 - **New** provenance GFF3: `final.merged.provenance.gff3` documents each
   contig's full provenance with attributes: `source_assembler`, `role`
   (backbone / upgrade_donor / novel_t2t), `assembler_contig` (original
-  assembler contig name before Step 10 pool renaming), `source_type`
+  assembler contig name before telomere-pool renaming), `source_type`
   (assembler / quickmerge), `replacement_class`, `replaced_contig`, and
   `description` (human-readable provenance summary showing exactly which
   assembler contig replaced which backbone contig and how).
@@ -214,7 +219,7 @@ is an optional override.
   (pool contig) AND target coverage (backbone contig ≥80%).  Previously only
   checked query coverage, allowing a small pool contig to "upgrade" a much
   larger backbone contig, losing unique content and BUSCO genes.
-- **New** D-aware duplicate filter for novel T2T additions (15F2): before
+- **New** D-aware duplicate filter for novel T2T additions (12F2): before
   adding a "novel" pool T2T contig, aligns it against the current backbone.
   Three outcomes: (a) if it overlaps a Tier 2 (non-T2T) backbone contig, it
   REPLACES the backbone (upgrade — T2T is better than non-T2T); (b) if it
@@ -236,7 +241,7 @@ is an optional override.
   argument (`nextPolish2 -t N reads.sorted.bam genome.fa k21.yak k31.yak`).
   TACO now maps HiFi reads with `minimap2 -ax map-hifi`, sorts with
   `samtools sort`, and passes the BAM correctly.  Requires `samtools`.
-- **Fixed** Step 13 BUSCO caching: always clears stale `busco/final/` results
+- **Fixed** final BUSCO caching: always clears stale `busco/final/` results
   before rerunning, preventing silent reuse of outdated metrics.
 - **Fixed** cleanup file move: uses explicit remove-then-copy instead of
   `shutil.move` to avoid silent failures when destination already exists.
@@ -257,7 +262,7 @@ is an optional override.
 
 ### Post-dedup BUSCO safety check
 
-- **New** after strict dedup (15D), the pipeline runs BUSCO on the combined
+- **New** after strict dedup (12D), the pipeline runs BUSCO on the combined
   assembly (protected T2T + remaining backbone) and compares to the backbone
   alone.  If BUSCO C drops > 3% (configurable via `DEDUP_MAX_BUSCO_C_DROP`),
   a prominent warning is logged with remediation suggestions (raise
@@ -305,7 +310,8 @@ is an optional override.
   polyploidy); vertebrate 3% / 0.5% / 4%.
 - **New** BUSCO D-rise (duplicated %) threshold: catches rescue candidates
   that introduce redundant copies of single-copy orthologs.  Configurable
-  via `STEP12_MAX_BUSCO_D_RISE` environment variable.
+  via `STEP13_MAX_BUSCO_D_RISE` environment variable (`STEP12_*` names remain
+  accepted for compatibility).
 - **New** two-tier confidence model: Tier 1 (immutable T2T contigs) and
   Tier 2 (editable backbone contigs).  Tier 1 contigs are never replaced
   during rescue unless `--allow-t2t-replace` is explicitly set.
@@ -315,8 +321,8 @@ is an optional override.
   recorded in `rescue_trial_summary.tsv` and `replaced.ids`.
 - **New** taxon-aware rescue limits: fungi 20, vertebrate 10, plant 8,
   other 15.  Prevents runaway replacement in complex genomes.
-- **New** taxon-aware 15D4/15D5 dedup thresholds: fungi 70%/85% (15D4)
-  and 80%/90% (15D5); plant/vertebrate 85%/92% and 90%/95%; other
+- **New** taxon-aware 13D4/13D5 dedup thresholds: fungi 70%/85% (13D4)
+  and 80%/90% (13D5); plant/vertebrate 85%/92% and 90%/95%; other
   75%/88% and 85%/92%.
 - **New** telomere-evidence safety check: `replace_single_with_better`
   candidates are rejected if telomere evidence weakens at either end
@@ -725,9 +731,9 @@ structural problems that made it increasingly fragile:
 taco/                    (2,934 lines total)
 ├── __init__.py          version string
 ├── __main__.py          entry point for `python3 -m taco` and `taco`
-├── cli.py               argparse — all flags for all 18 steps
+├── cli.py               argparse — all flags for all public steps
 ├── pipeline.py          PipelineRunner class — logging, run_cmd, version checks
-├── steps.py             all 18 step functions + FASTA helpers
+├── steps.py             step functions + FASTA helpers
 ├── utils.py             ASSEMBLER_PLATFORMS dict, FASTA I/O utilities
 ├── telomere_detect.py   hybrid telomere detection (MOTIF_FAMILIES, scoring)
 ├── telomere_pool.py     three-tier pool classification
@@ -903,7 +909,7 @@ detection system introduced in this development series.
   best single-end representatives using minimap2 clustering.
 - Added `telomere_cluster_summary.tsv` and updated telomere support
   summary for representative-contig selection.
-- Updated backbone refinement to use the optimized Step 10 pool.
+- Updated backbone refinement to use the optimized telomere pool.
 - Increased telomere contribution in smart scoring.
 
 ---

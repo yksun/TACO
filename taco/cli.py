@@ -15,14 +15,12 @@ STEP_NAMES = {
     8: "MBG assembly",
     9: "Raven assembly",
     10: "Copy and normalize all assemblies",
-    11: "BUSCO on all assemblies",
-    12: "Telomere detection and scoring",
-    13: "Build optimized telomere pool",
-    14: "QUAST for assembler comparison",
-    15: "Backbone selection and refinement",
-    16: "Final QC (BUSCO + Telomere + QUAST on final)",
-    17: "Final comparison report and cleanup",
-    18: "Assembly-only comparison and cleanup",
+    11: "Assembly QC and comparison (BUSCO + telomere + QUAST)",
+    12: "Build optimized telomere pool",
+    13: "Backbone selection and refinement",
+    14: "Final QC (BUSCO + Telomere + QUAST on final)",
+    15: "Final comparison report and cleanup",
+    16: "Assembly-only comparison and cleanup",
 }
 
 
@@ -112,17 +110,17 @@ def parse_args():
         args.merqury = True
     
     if args.assembly_only:
-        # Steps 0-12, 14, 18 (assemblers + normalize + BUSCO + telomere + QUAST + assembly-only report)
-        args.steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 18]
+        # Steps 0-11, 16 (assemblers + normalize + combined QC + assembly-only report)
+        args.steps = list(range(0, 12)) + [16]
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
         except ValueError as e:
             parser.error(str(e))
     else:
-        args.steps = list(range(0, 18))  # Steps 0-17 for full mode
+        args.steps = list(range(0, 16))  # Steps 0-15 for full mode
     
     for s in args.steps:
-        if s < 0 or s > 18:
+        if s < 0 or s > 16:
             parser.error(f"Invalid step: {s}")
     return args
