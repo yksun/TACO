@@ -4,6 +4,7 @@ import sys
 
 
 STEP_NAMES = {
+    0: "Input QC and validation",
     1: "HiCanu assembly",
     2: "NextDenovo assembly",
     3: "Peregrine assembly",
@@ -108,16 +109,16 @@ def parse_args():
         args.merqury = True
     
     if args.assembly_only:
-        args.steps = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 18]
+        args.steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 18]
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
         except ValueError as e:
             parser.error(str(e))
     else:
-        args.steps = list(range(1, 18))
+        args.steps = list(range(0, 18))
     
     for s in args.steps:
-        if s < 1 or s > 18:
+        if s < 0 or s > 18:
             parser.error(f"Invalid step: {s}")
     return args

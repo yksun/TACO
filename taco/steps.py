@@ -541,6 +541,115 @@ def _assembler_skip(runner, step_num, name, reason):
     runner.log_warn(f"Step {step_num}: {name} skipped — {reason}")
 
 
+def step_00_input_qc(runner):
+    """Step 0 - Input validation and QC.
+
+    Checks FASTQ exists, estimates read count/total bases/coverage,
+    validates genome size, and warns for low or suspicious coverage.
+    """
+    runner.log("Step 0 - Input QC and validation")
+
+    # Check FASTQ exists and is non-empty
+    fq = runner.fastq
+    if not os.path.isfile(fq):
+        runner.log_error(f"Input FASTQ not found: {fq}")
+        raise RuntimeError("FASTQ file does not exist")
+    fq_size = os.path.getsize(fq)
+    if fq_size == 0:
+        runner.log_error(f"Input FASTQ is empty: {fq}")
+        raise RuntimeError("FASTQ file is empty")
+    runner.log(f"Input FASTQ: {fq} ({fq_size / 1e9:.2f} GB)")
+
+    # Parse genome size
+    expected_size = _parse_genome_size(runner.genomesize)
+    if expected_size <= 0:
+        runner.log_error(f"Invalid genome size: {runner.genomesize}")
+        raise RuntimeError("Genome size must be > 0")
+    runner.log(f"Expected genome size: {expected_size:,} bp")
+
+    # Estimate total read bases and coverage
+    total_bases = 0
+    read_count = 0
+    opener = gzip.open if fq.endswith('.gz') else open
+    try:
+        with opener(fq, 'rt') as f:
+            for i, line in enumerate(f):
+                if i % 4 == 1:  # sequence line
+                    total_bases += len(line.strip())
+                    read_count += 1
+                if read_count >= 100000:
+                    # Sample first 100K reads and extrapolate
+                    break
+        if read_count >= 100000:
+            # Extrapolate from sample
+            bytes_per_read = fq_size / read_count if read_count > 0 else 1
+            est_total_reads = int(fq_size / bytes_per_read)
+            avg_read_len = total_bases / max(1, read_count)
+            est_total_bases = int(est_total_reads * avg_read_len)
+        else:
+            est_total_reads = read_count
+            est_total_bases = total_bases
+    except Exception as e:
+        runner.log_warn(f"Could not estimate read stats: {e}")
+        est_total_reads = 0
+        est_total_bases = 0
+
+    if est_total_bases > 0:
+        coverage = est_total_bases / expected_size
+        runner.log(f"Estimated reads: ~{est_total_reads:,}, "
+                   f"total bases: ~{est_total_bases:,}, "
+                   f"coverage: ~{coverage:.1f}×")
+
+        # Platform-specific coverage warnings
+        platform = runner.platform or "pacbio-hifi"
+        if platform == "pacbio-hifi":
+            if coverage < 15:
+                runner.log_warn(f"Very low HiFi coverage ({coverage:.1f}×). "
+                                f"Assembly quality will be severely impacted. "
+                                f"Recommend ≥25× for small eukaryotic genomes.")
+            elif coverage < 25:
+                runner.log_warn(f"Low HiFi coverage ({coverage:.1f}×). "
+                                f"Some assemblers may produce fragmented results. "
+                                f"Recommend ≥25× for best results.")
+        elif platform == "nanopore":
+            if coverage < 25:
+                runner.log_warn(f"Very low ONT coverage ({coverage:.1f}×). "
+                                f"Recommend ≥40× for small eukaryotic genomes.")
+            elif coverage < 40:
+                runner.log_warn(f"Low ONT coverage ({coverage:.1f}×). "
+                                f"Recommend ≥40× for best results.")
+        elif platform == "pacbio":
+            if coverage < 50:
+                runner.log_warn(f"Low CLR coverage ({coverage:.1f}×). "
+                                f"Recommend ≥50× for CLR assemblies.")
+        if coverage > 500:
+            runner.log_warn(f"Unusually high coverage ({coverage:.1f}×). "
+                            f"Verify genome size estimate ({runner.genomesize}). "
+                            f"Very high coverage may slow assemblers.")
+
+    # Log platform and assembler compatibility
+    from taco.utils import ASSEMBLER_PLATFORMS, is_assembler_compatible
+    platform = runner.platform or "pacbio-hifi"
+    compatible = [a for a in ASSEMBLER_PLATFORMS
+                  if is_assembler_compatible(a, platform)]
+    incompatible = [a for a in ASSEMBLER_PLATFORMS
+                    if not is_assembler_compatible(a, platform)]
+    runner.log(f"Platform: {platform}")
+    runner.log(f"Compatible assemblers: {', '.join(sorted(compatible))}")
+    if incompatible:
+        runner.log_info(f"Skipped assemblers (incompatible): "
+                        f"{', '.join(sorted(incompatible))}")
+
+    # BUSCO lineage check
+    if runner.busco_lineage:
+        runner.log(f"BUSCO lineage: {runner.busco_lineage}")
+    else:
+        runner.log_warn("No BUSCO lineage set. Use --busco <lineage> or "
+                        "--taxon <taxon> to enable BUSCO analysis.")
+
+    runner.log("Input QC complete")
+
+
 def step_01_canu(runner):
     """Step 1 - Assembly using HiCanu (non-fatal)."""
     runner.log("Step 1 - Assembly of the genome using HiCanu")
@@ -1487,7 +1596,11 @@ def step_11_quast(runner):
 
 
 def _run_merqury_preselection(runner):
-    """Run Merqury on all assembler outputs for pre-selection scoring."""
+    """Run Merqury on all assembler outputs for pre-selection scoring.
+
+    If no .meryl database exists but meryl is installed, builds one from
+    the input reads automatically.
+    """
     db = runner.merqury_db
     if not db:
         for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
@@ -1495,11 +1608,32 @@ def _run_merqury_preselection(runner):
                 db = cand
                 break
 
+    # Auto-build .meryl from reads if needed and meryl is available
+    meryl_bin = shutil.which("meryl")
+    if not db and meryl_bin and hasattr(runner, 'fastq') and runner.fastq:
+        k = 21  # standard k-mer size for Merqury
+        os.makedirs("merqury", exist_ok=True)
+        db = "merqury/reads.meryl"
+        if not os.path.isdir(db):
+            runner.log_info(f"Building Merqury k-mer database from reads (k={k})...")
+            cmd = f"{meryl_bin} count k={k} threads={runner.threads} {runner.fastq} output {db}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode != 0 or not os.path.isdir(db):
+                runner.log_warn(f"meryl count failed: {(result.stderr or '').strip()[:200]}")
+                db = None
+            else:
+                runner.log(f"Built {db}")
+                runner.merqury_db = db
+        else:
+            runner.log(f"Reusing existing {db}")
+            runner.merqury_db = db
+
     if db and os.path.isdir(db) and shutil.which("merqury.sh"):
         runner.log_info(f"Running Merqury pre-selection using database: {db}")
         runner.log_version("merqury.sh", "merqury.sh")
 
-        assemblers = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hifiasm"]
+        assemblers = ["canu", "reference", "flye", "ipa", "nextDenovo",
+                      "peregrine", "hifiasm", "lja", "mbg", "raven"]
         for asm in assemblers:
             asm_fa = f"assemblies/{asm}.result.fasta"
             if not os.path.isfile(asm_fa) or os.path.getsize(asm_fa) == 0:
@@ -1590,23 +1724,13 @@ def _auto_select_backbone(runner):
     w_busco_d = 500
 
     if taxon == "fungal":
-        w_busco_d = 600  # penalize duplication more strongly
-        w_t2t = 350      # telomere rescue is strong for small genomes
+        w_busco_d = 600; w_t2t = 350; w_n50 = 150; w_contigs = 30
     elif taxon == "plant":
-        w_contigs = 15   # mild fragmentation penalty (polyploidy = more contigs)
-        w_busco_d = 200  # relax D penalty (polyploidy inflates D)
-        w_t2t = 200      # reduce telomere weight (false signals from repeats)
-        w_n50 = 100
+        w_busco_d = 300; w_t2t = 200; w_n50 = 150; w_contigs = 50
     elif taxon in ("vertebrate", "animal"):
-        w_contigs = 20   # penalize fragmentation moderately
-        w_busco_d = 400
-        w_n50 = 120
-        w_t2t = 250
+        w_busco_d = 500; w_t2t = 200; w_n50 = 200; w_contigs = 40
     elif taxon == "insect":
-        w_busco_d = 500
-        w_t2t = 300
-        w_n50 = 130
-        w_contigs = 25
+        w_busco_d = 500; w_t2t = 300; w_n50 = 150; w_contigs = 30
 
     for idx, asm in enumerate(header[1:], start=1):
         asm = asm.strip()
@@ -2863,7 +2987,7 @@ def _run_polishing(runner, input_fa, output_fa):
 def step_12_refine(runner):
     """Step 12 - T2T-first telomere-aware backbone refinement with BUSCO trial validation.
 
-    v1.2.0 workflow — two-tier confidence model:
+    v1.3.0 workflow — two-tier confidence model:
 
     TIER 1 (immutable): protected strict-T2T contigs from the merged pool.
       These are NEVER replaced or displaced by rescue candidates unless the
@@ -2895,7 +3019,7 @@ def step_12_refine(runner):
       12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 12 - Telomere-aware backbone refinement (v1.2.1)")
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.0)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -3056,7 +3180,7 @@ def step_12_refine(runner):
                        f"cross-assembly mapping OK)")
 
     # ====================================================================
-    # BACKBONE-FIRST STRATEGY (v1.2.0)
+    # BACKBONE-FIRST STRATEGY (v1.3.0)
     #
     # The backbone assembler was selected for the highest composite quality
     # score (BUSCO S, T2T count, N50, contiguity).  Its contigs carry the
@@ -4915,6 +5039,7 @@ def step_18_assembly_only(runner):
 
 
 STEP_FUNCTIONS = {
+    0: step_00_input_qc,
     1: step_01_canu,
     2: step_02_nextdenovo,
     3: step_03_peregrine,

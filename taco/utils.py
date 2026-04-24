@@ -12,7 +12,14 @@ ASSEMBLER_PLATFORMS = {
     "peregrine": {"pacbio-hifi": True, "nanopore": False, "pacbio": True},
     "ipa": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
     "flye": {"pacbio-hifi": "--pacbio-hifi", "nanopore": "--nano-hq", "pacbio": "--pacbio-raw"},
-    "hifiasm": {"pacbio-hifi": True, "nanopore": "--ul", "pacbio": False},  # nanopore: hifiasm-UL mode via --ul flag; does NOT support CLR
+    "hifiasm": {"pacbio-hifi": True, "nanopore": "--ul", "pacbio": False},
+    # hifiasm: HiFi=native, ONT=hifiasm-UL mode (--ul flag), CLR=not supported
+    "lja": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
+    # LJA (La Jolla Assembler): HiFi-only, produces very contiguous assemblies
+    "mbg": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
+    # MBG (Multiplex de Bruijn Graph): HiFi-only, minimizer-based
+    "raven": {"pacbio-hifi": True, "nanopore": True, "pacbio": True},
+    # raven: supports all long-read platforms, fast OLC assembler
 }
 
 

@@ -31,55 +31,17 @@ After installation, the `taco` command is available anywhere within the conda en
 
 The conda environment provides all external bioinformatics tools. The `pip install -e .` step registers the `taco` command so you can run it from any directory.
 
-**Assemblers (via conda):** NextDenovo, Flye, Hifiasm
+**Assemblers (via conda):** Canu, NextDenovo, Flye, Hifiasm, Peregrine, IPA, LJA, Raven
 
 **HiCanu:** The conda environment includes `canu` and `openjdk>=11` to provide a working Java runtime and avoid the `undefined symbol: JLI_StringDup` error. If you still get Java errors (e.g. from a bioconda dev build), download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. If canu is missing or fails, Step 1 is skipped and all other assemblers continue normally.
 
-**Analysis tools (via conda):** BUSCO, QUAST, Minimap2, Funannotate, Seqtk, BWA, Samtools
+**Analysis tools (via conda):** BUSCO, QUAST, Minimap2, Seqtk, BWA, Samtools, purge_dups
 
-**Optional tools (via conda):** Merqury + Meryl (assembly QV scoring), tidk (telomere repeat discovery)
+**Polishing tools (via conda):** NextPolish2, yak, Racon, Medaka
 
-## Manual Installation of Peregrine and IPA
+**QV scoring (via conda):** Merqury, Meryl (auto-enabled for HiFi data; builds reads.meryl from input reads if no pre-built database exists)
 
-Peregrine and IPA are not reliably available through current bioconda channels and may require manual installation.
-
-### Peregrine
-
-```bash
-# Clone and build from source
-git clone https://github.com/cschin/peregrine-2021.git
-cd peregrine-2021
-# Follow the build instructions in the repository
-```
-
-Ensure `pg_asm` is on your PATH after installation. If Peregrine is not installed, TACO will skip Step 3 with a warning.
-
-### IPA (PacBio Improved Phased Assembler)
-
-```bash
-# Try conda first
-conda install -c bioconda pbipa
-
-# Or install from source
-# https://github.com/PacificBiosciences/pbipa
-```
-
-IPA only supports PacBio HiFi reads. If not installed, TACO will skip Step 4 with a warning.
-
-## Running TACO
-
-After installation, simply use the `taco` command:
-
-```bash
-mkdir -p my_project && cd my_project
-taco -g 12m -t 16 --fastq /path/to/reads.fastq -m TTAGGG
-```
-
-**Alternative (without pip install):** Use the shell wrapper which sets PYTHONPATH automatically:
-
-```bash
-~/opt/TACO/run_taco -g 12m -t 16 --fastq /path/to/reads.fastq
-```
+**Optional manual install:** MBG (Multiplex de Bruijn Graph, HiFi-only). Build from source: `git clone https://github.com/maickrau/MBG && cd MBG && make`. Place the `MBG` binary on PATH.
 
 ## Sequencing Platform Support
 
@@ -87,11 +49,49 @@ TACO supports three sequencing platforms via the `--platform` flag:
 
 | Platform | Flag | Assemblers Used |
 |----------|------|-----------------|
-| PacBio HiFi | `--platform pacbio-hifi` (default) | All 6 assemblers |
-| Oxford Nanopore | `--platform nanopore` | canu, nextDenovo, flye, hifiasm |
-| PacBio CLR | `--platform pacbio` | canu, nextDenovo, peregrine, flye, hifiasm |
+| PacBio HiFi | `--platform pacbio-hifi` (default) | canu, nextDenovo, flye, hifiasm, peregrine, ipa, lja, mbg, raven |
+| Oxford Nanopore | `--platform nanopore` | canu, nextDenovo, flye, hifiasm (UL mode), raven |
+| PacBio CLR | `--platform pacbio` | canu, nextDenovo, flye, peregrine, raven |
 
 Incompatible or missing assemblers are automatically skipped with a warning.
+
+## Taxon-Aware Defaults
+
+TACO automatically selects appropriate BUSCO lineage, scoring weights, and telomere motifs based on `--taxon`:
+
+| Taxon | Default BUSCO | Telomere Motifs |
+|-------|--------------|-----------------|
+| `--taxon fungal` | ascomycota_odb10 | TTAGGG + TG1-3 + Candida |
+| `--taxon plant` | embryophyta_odb10 | TTTAGGG |
+| `--taxon vertebrate` | vertebrata_odb10 | TTAGGG |
+| `--taxon insect` | insecta_odb10 | TTAGG |
+| `--taxon other` | requires `--busco` | all known motif families |
+
+Override the BUSCO lineage with `--busco <lineage_name>` if your organism needs a more specific database.
+
+## Running TACO
+
+```bash
+mkdir -p my_project && cd my_project
+
+# Fungal genome (HiFi reads)
+taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal
+
+# Plant genome (HiFi reads)
+taco -g 500m -t 32 --fastq /path/to/reads.fastq.gz --taxon plant
+
+# Vertebrate genome (ONT reads)
+taco -g 2.5g -t 32 --fastq /path/to/reads.fastq.gz --taxon vertebrate --platform nanopore
+
+# Assembly-only comparison (no refinement)
+taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --assembly-only
+```
+
+**Alternative (without pip install):** Use the shell wrapper which sets PYTHONPATH automatically:
+
+```bash
+~/opt/TACO/run_taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal
+```
 
 ## Troubleshooting
 
@@ -105,7 +105,10 @@ Run `pip install -e .` from the TACO repository directory, or use `./run_taco` i
 TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and run `pip install -e .` again.
 
 **Merqury not working:**
-Merqury is optional. Install with `conda install -c bioconda merqury meryl` or use `--no-merqury` to skip.
+For HiFi data, Merqury is auto-enabled if `merqury.sh` and `meryl` are installed. The reads.meryl database is built automatically. If you have a pre-built database, provide it with `--merqury-db path/to/reads.meryl`. Disable with `--no-merqury`.
+
+**NextPolish2 requires samtools:**
+NextPolish2 v0.2+ needs a sorted BAM file. TACO maps reads with minimap2 and sorts with samtools. Ensure `samtools` is installed in the conda env.
 
 **Canu reports `master +XX changes` or Step 1 fails with a Java error:**
-The conda environment now includes `openjdk>=11` to provide a working Java runtime. If you still see this error, the bioconda canu package may be a dev build. Download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. TACO detects dev builds and warns you. If canu fails, the pipeline continues with the remaining assemblers.
+The conda environment includes `openjdk>=11`. If you still see Java errors, download a stable canu binary from https://github.com/marbl/canu/releases. TACO detects dev builds and warns you. If canu fails, the pipeline continues with the remaining assemblers.

@@ -9,11 +9,11 @@ ASSEMBLERS = ["canu", "reference", "flye", "ipa", "nextDenovo", "peregrine", "hi
 
 TAXON_WEIGHTS = {
     "fungal": {"dup_penalty": 600, "t2t_weight": 350, "n50_weight": 150, "frag_penalty": 30},
-    "plant": {"dup_penalty": 200, "t2t_weight": 200, "n50_weight": 100, "frag_penalty": 15},
-    "vertebrate": {"dup_penalty": 400, "t2t_weight": 250, "n50_weight": 120, "frag_penalty": 20},
-    "animal": {"dup_penalty": 400, "t2t_weight": 250, "n50_weight": 120, "frag_penalty": 20},
-    "insect": {"dup_penalty": 500, "t2t_weight": 300, "n50_weight": 130, "frag_penalty": 25},
-    "other": {"dup_penalty": 400, "t2t_weight": 300, "n50_weight": 150, "frag_penalty": 30},
+    "plant":      {"dup_penalty": 300, "t2t_weight": 200, "n50_weight": 150, "frag_penalty": 50},
+    "vertebrate": {"dup_penalty": 500, "t2t_weight": 200, "n50_weight": 200, "frag_penalty": 40},
+    "animal":     {"dup_penalty": 500, "t2t_weight": 200, "n50_weight": 200, "frag_penalty": 40},
+    "insect":     {"dup_penalty": 500, "t2t_weight": 300, "n50_weight": 150, "frag_penalty": 30},
+    "other":      {"dup_penalty": 500, "t2t_weight": 300, "n50_weight": 150, "frag_penalty": 30},
 }
 
 

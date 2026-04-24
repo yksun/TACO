@@ -8,6 +8,10 @@ TACO is a telomere-aware all-in-one multi-assembler comparison and refinement pi
 
 TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natural History**.
 
+**What TACO is:** TACO compares multiple long-read assemblies generated from a single dataset, selects the best backbone assembly, and conservatively improves it using telomere-supported contigs from all assemblers. It produces a primary-style chromosome-level assembly with full provenance tracking and coverage QC.
+
+**What TACO is not:** TACO does not perform Hi-C scaffolding (no YaHS/3D-DNA), does not require Hi-C data, and does not attempt full chromosome scaffolding. It is not a diploid/polyploid phasing tool. For scaffolding, use TACO's output as input to a dedicated scaffolder.
+
 ![Latest Version](https://img.shields.io/github/v/tag/yksun/TACO?sort=semver&label=Latest%20Version)
 ![Last Commit](https://img.shields.io/github/last-commit/yksun/TACO)
 ![Issues](https://img.shields.io/github/issues/yksun/TACO)
@@ -188,7 +192,7 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 | **Merqury** | auto if HiFi | auto if HiFi | auto if HiFi | auto if HiFi |
 | **Telomere motifs** | TTAGGG + TG1-3 + Candida | TTTAGGG | TTAGGG | TTAGG (insect) / all (other) |
 | **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
-| **Backbone scoring** | S×1000 - D×600 + T2T×350 | S×1000 - D×200 + T2T×200 | S×1000 - D×400 + T2T×250 | S×1000 - D×500 + T2T×300 |
+| **Backbone scoring** | S×1000 - D×600 + T2T×350 | S×1000 - D×300 + T2T×200 | S×1000 - D×500 + T2T×200 | S×1000 - D×500 + T2T×300 |
 | **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2% (default) |
 | **purge_dups mode** | two-round (haploid-aggressive) | single-round + polyploid warning | two-round | single-round |
 | **Polishing (HiFi)** | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) |
@@ -218,7 +222,7 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 | 17 | Cleanup into structured output folders |
 | 18 | Assembly-only comparison summary |
 
-With `--assembly-only`, TACO follows the comparison path (Steps 1-11, 18) and stops before backbone refinement.
+With `--assembly-only`, TACO runs Steps 1-9, 11, and 18 (skips Step 10 which builds the refinement telomere pool) and stops before backbone refinement.
 
 ## Telomere Detection
 
