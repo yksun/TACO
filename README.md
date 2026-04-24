@@ -199,7 +199,7 @@ Incompatible assemblers are automatically skipped with a warning.
 | **Telomere motifs** | TTAGGG + TG1-3 + Candida | TTTAGGG | TTAGGG | TTAGG (insect) / all (other) |
 | **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
 | **Backbone scoring** | S×1000 - D×600 + T2T×350 | S×1000 - D×300 + T2T×200 | S×1000 - D×500 + T2T×200 | S×1000 - D×500 + T2T×300 |
-| **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2% (default) |
+| **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2.5% (default) |
 | **purge_dups mode** | two-round (haploid-aggressive) | single-round + polyploid warning | two-round | single-round |
 | **Polishing (HiFi)** | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) |
 | **Polishing (ONT)** | Medaka → Racon | Medaka → Racon | Medaka → Racon | Medaka → Racon |
@@ -315,19 +315,19 @@ When validating rescue candidates via BUSCO trial, the maximum acceptable C% dro
 
 A D-rise (duplicated BUSCO increase) check catches cases where a rescue introduces redundant copies of single-copy orthologs — a sign of retained haplotigs or mis-joined contigs. All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP`, `STEP12_MAX_BUSCO_M_RISE`, and `STEP12_MAX_BUSCO_D_RISE` environment variables.
 
-Additional environment variables for fine-tuning Step 12: `PROTECT_COV` / `PROTECT_ID` (strict dedup thresholds, default 0.95/0.95), `DEDUP_MAX_BUSCO_C_DROP` (maximum tolerated BUSCO C drop after dedup, default 3.0%), `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `AGGR_NONTELO_COV` / `AGGR_NONTELO_ID` (taxon-aware non-telo dedup), `SELFDEDUP_COV` / `SELFDEDUP_ID` (self-dedup thresholds).
+Additional environment variables for fine-tuning Step 15: `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `SELFDEDUP_ENABLE` plus `SELFDEDUP_COV` / `SELFDEDUP_ID` (optional self-dedup), `RESCUE_MIN_IDENT`, `RESCUE_MIN_ALN_BP`, `RESCUE_MIN_COV_BB`, `RESCUE_MIN_COV_DONOR`, `RESCUE_MIN_EXT`, `NOVEL_DUP_COV`, `NOVEL_DUP_ID`, `NOVEL_UPGRADE_TCOV`, and `NOVEL_MAX_D_RISE`.
 
 ### Taxon-Specific Rescue Limits (Step 15F)
 
 The maximum number of accepted rescue candidates per run is taxon-aware: fungi allow up to 20 rescues (many small chromosomes), vertebrates 10, plants 8 (conservative due to polyploidy risk), and other taxa 15. This prevents runaway replacement in complex genomes.
 
-### D-Aware Duplicate Filter (Step 12F2)
+### D-Aware Duplicate Filter (Step 15F2)
 
 Before adding "novel" pool T2T contigs, TACO checks each candidate against the current backbone with minimap2 and applies a five-tier decision:
 
 1. **Overlaps Tier 1 (T2T) backbone** → reject (pure duplicate, backbone already has T2T).
 2. **Overlaps Tier 2 (non-T2T) backbone at ≥80% target coverage** → upgrade (replace backbone with T2T — better telomere evidence, comparable size).
-3. **Overlaps Tier 2 at 50–80% target coverage** → read-coverage diagnostic. TACO maps HiFi reads to the backbone contig and compares median coverage in the T2T-covered region vs the uncovered region. If the uncovered region has very low coverage (< 30% of covered), the backbone is chimeric and the T2T is the real chromosome — TACO replaces the backbone. If coverage is normal, the backbone is real — TACO rejects the novel contig (adding it would increase BUSCO D). Configurable via `CHIMERIC_COV_RATIO` (default 0.30).
+3. **Overlaps Tier 2 at 50–80% target coverage** → read-coverage diagnostic. TACO maps the input reads to the backbone contig with a platform-specific minimap2 preset and compares median coverage in the T2T-covered region vs the uncovered region. If the uncovered region has very low coverage (< 30% of covered), the backbone is chimeric and the T2T is the real chromosome — TACO replaces the backbone. If coverage is normal, the backbone is real — TACO rejects the novel contig (adding it would increase BUSCO D). Configurable via `CHIMERIC_COV_RATIO` (default 0.30).
 4. **Overlaps Tier 2 at < 50%** → reject (insufficient overlap for any useful decision).
 5. **No significant overlap** → add as genuinely novel chromosomal region (with optional BUSCO D check: `NOVEL_MAX_D_RISE`).
 
@@ -341,9 +341,9 @@ purge_dups strategy is taxon-aware. Fungi and other haploid genomes use two-roun
 
 `--auto-mode n50` selects the assembly with the highest N50. This reproduces legacy behavior but may favor contiguous assemblies that lack completeness.
 
-## Step 15 — T2T-First Telomere-Aware Backbone Refinement
+## Step 15 — Backbone-First Telomere-Aware Refinement
 
-Step 15 (backbone refinement) adopts a T2T-first assembly philosophy with a **two-tier confidence model**:
+Step 15 (backbone refinement) adopts a backbone-first assembly philosophy with a **two-tier confidence model**:
 
 - **Tier 1 (Immutable)**: T2T contigs — contigs with verified telomere signal at both ends. These are treated as protected chromosomal anchors and are never replaced during rescue, unless `--allow-t2t-replace` is explicitly set. This protects the highest-confidence contigs from accidental degradation.
 - **Tier 2 (Editable)**: Backbone contigs — gap-fill contigs that cover chromosomal regions not represented by T2T contigs. These may be replaced by telomere-bearing rescue donors if the replacement passes BUSCO trial validation.
@@ -356,16 +356,16 @@ Backbone contigs are preserved by default to maintain BUSCO completeness — pur
 2. **15B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
 3. **15C** — prepare cleaned backbone + chimera safety using two strategies: (a) **size gate** — contigs > 1.5× the largest individual assembler contig are flagged; (b) **cross-assembly mapping** — each protected contig is aligned against all other assembler outputs; contigs not well-covered (≥60%) by any single assembler's contig are flagged as potential chimeras. Configurable via `CHIMERA_MIN_CROSS_COV`.
 4. **15D** — backbone-first classification and pool T2T analysis:
-   - **12D1** backbone telomere classification: classify backbone contigs as Tier 1 (T2T, immutable) or Tier 2 (non-T2T, upgradeable).
-   - **12D2** pool T2T analysis: align pool T2T contigs against backbone. Pool T2T redundant to Tier 1 backbone are discarded. Pool T2T that cover a Tier 2 backbone contig (≥80% target coverage, ≥85% identity) become upgrade donors. Others are candidate novel additions.
-   - **12D3** backbone self-dedup: disabled by default (preserves BUSCO completeness). purge_dups at 15H handles haplotig removal. Re-enable with `SELFDEDUP_ENABLE=1`.
+   - **15D1** backbone telomere classification: classify backbone contigs as Tier 1 (T2T, immutable) or Tier 2 (non-T2T, upgradeable).
+   - **15D2** pool T2T analysis: align pool T2T contigs against backbone. Pool T2T redundant to Tier 1 backbone are discarded. Pool T2T that cover a Tier 2 backbone contig (≥80% target coverage, ≥85% identity) become upgrade donors. Others are candidate novel additions.
+   - **15D3** backbone self-dedup: disabled by default (preserves BUSCO completeness). purge_dups at 15H handles haplotig removal. Re-enable with `SELFDEDUP_ENABLE=1`.
 5. **15E** — telomere upgrade: pool T2T donors replace Tier 2 backbone contigs. Tier 1 (T2T) contigs are immutable — candidates targeting them are rejected unless `--allow-t2t-replace` is set. Each replacement is assigned a class: `upgrade_tier2_to_t2t`, `replace_single_with_better`, etc.
-6. **15F** — BUSCO trial validation: for each candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). D-aware novel filter (12F2): novel T2T contigs that overlap Tier 2 backbone REPLACE the backbone (upgrade); those overlapping Tier 1 are rejected as duplicates; those with no overlap are added as genuinely novel. Optional BUSCO D check rejects additions that increase duplication excessively.
+6. **15F** — BUSCO trial validation: for each candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). D-aware novel filter (15F2): novel T2T contigs that overlap Tier 2 backbone REPLACE the backbone (upgrade); those overlapping Tier 1 are rejected as duplicates; those with no overlap are added as genuinely novel. Optional BUSCO D check rejects additions that increase duplication excessively.
 7. **15G** — final combine: backbone (with upgrades) + novel additions. Post-upgrade dedup protects all backbone contigs; only novel additions can be removed if redundant.
 8. **15H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
 9. **15I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
 10. **15J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
-11. **15K** — final assembly coverage QC: maps HiFi reads to the final assembly, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv`, `weak_regions.tsv`, and `weak_regions.gff3` (loadable in IGV).
+11. **15K** — final assembly coverage QC: maps the input reads to the final assembly with a platform-specific minimap2 preset, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv`, `weak_regions.tsv`, and `weak_regions.gff3` (loadable in IGV).
 12. **15L** — "do no harm" safety comparison: compares final assembly vs original backbone for size, telomere count, and genome size deviation. If refinement degraded quality, both assemblies are preserved with a `refinement_warning.txt` explaining the issues.
 
 ### BUSCO Trial Validation
@@ -390,7 +390,7 @@ A companion file `pool_contig_provenance.tsv` maps every pool contig back to its
 
 ### Coverage QC GFF3 and Reports
 
-TACO maps HiFi reads back to the final assembly (Step 15K) and scans for assembly errors using a sliding-window coverage analysis (default 5 kb window). Three output files are produced:
+TACO maps the input reads back to the final assembly (Step 15K) and scans for assembly errors using a platform-specific minimap2 preset and a sliding-window coverage analysis (default 5 kb window). Three output files are produced:
 
 `coverage_summary.tsv` — per-contig coverage statistics: median, mean, min, max, zero-coverage bases, and low-coverage bases. Use this to identify contigs with overall poor read support.
 

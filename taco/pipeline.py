@@ -330,18 +330,42 @@ class PipelineRunner:
     # ------------------------------------------------------------------ #
     def check_requirements(self):
         """Check that all required tools are available."""
-        required = [
-            "python3", "canu", "nextDenovo", "pg_asm", "ipa",
-            "flye", "hifiasm", "seqtk", "busco", "minimap2",
-            "bwa", "samtools",
-        ]
-        missing = [c for c in required if not shutil.which(c)]
-        # quast can be quast.py or quast
+        from taco.utils import is_assembler_compatible
+
+        core_required = ["python3", "minimap2", "samtools"]
+        if self.run_busco:
+            core_required.append("busco")
         if not shutil.which("quast.py") and not shutil.which("quast"):
-            missing.append("quast.py/quast")
+            core_required.append("quast.py/quast")
+
+        assembler_bins = {
+            "canu": "canu",
+            "nextDenovo": "nextDenovo",
+            "peregrine": "pg_asm",
+            "ipa": "ipa",
+            "flye": "flye",
+            "hifiasm": "hifiasm",
+            "lja": "lja",
+            "mbg": "MBG",
+            "raven": "raven",
+        }
+        platform_bins = []
+        for asm, binary in assembler_bins.items():
+            if is_assembler_compatible(asm, self.platform):
+                if asm == "mbg":
+                    if not shutil.which("MBG") and not shutil.which("mbg"):
+                        platform_bins.append("MBG/mbg")
+                else:
+                    platform_bins.append(binary)
+
+        missing = [c for c in core_required if "/" in c or not shutil.which(c)]
+        missing.extend(c for c in platform_bins if "/" in c or not shutil.which(c))
+        # quast can be quast.py or quast
+        missing = sorted(set(missing))
         if missing:
             self.log_warn(
-                f"Missing tools in the active environment: {', '.join(missing)}"
+                f"Missing tools for selected platform ({self.platform}): "
+                f"{', '.join(missing)}"
             )
             self.log_warn(
                 "Some steps may fail. Create and activate the TACO conda "

@@ -28,15 +28,13 @@ dependencies:
   - busco>=5.4
   - quast>=5.2
   - minimap2>=2.24
-  - seqtk>=1.3
-  - bwa>=0.7
   - samtools>=1.15
-  # Contig merging (telomere-aware validated merge in Step 10)
-  # quickmerge provides merge_wrapper.py used by Step 10
+  # Contig merging (telomere-aware validated merge in Step 13)
+  # quickmerge provides merge_wrapper.py used by Step 13
   - quickmerge
-  # Post-assembly haplotig/duplicate purging (Step 12)
+  # Post-assembly haplotig/duplicate purging (Step 15)
   - purge_dups
-  # Polishing (auto-selected by --platform in Step 12)
+  # Polishing (auto-selected by --platform in Step 15)
   - nextpolish2
   - yak
   - racon

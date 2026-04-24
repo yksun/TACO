@@ -21,9 +21,9 @@ ASSEMBLER_PLATFORMS = {
     "ipa": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
     "flye": {"pacbio-hifi": "--pacbio-hifi", "nanopore": "--nano-hq", "pacbio": "--pacbio-raw"},
     "hifiasm": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
-    # hifiasm: HiFi-only as primary input. ONT ultra-long reads can supplement
-    # HiFi via --ul flag but require HiFi as primary — use --enable-hifiasm-ul
-    # with paired HiFi+ONT data (not implemented in TACO auto-mode yet).
+    # TACO currently wires hifiasm only for PacBio HiFi. Recent hifiasm ONT
+    # support should be added as a separate Nanopore mode with its own flags
+    # and output expectations rather than silently reusing the HiFi command.
     "lja": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
     # LJA (La Jolla Assembler): HiFi-only, produces very contiguous assemblies
     "mbg": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
