@@ -4128,6 +4128,27 @@ def step_12_refine(runner):
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
         if os.path.isfile(depth_file) and os.path.getsize(depth_file) > 0:
+            # Build source assembler lookup for each final contig
+            # name_map, pool_provenance_map, pool_asm_map are in scope from GFF section
+            contig_source = {}  # final_contig_name -> (source_assembler, source_type)
+            contig_total_len = {}  # final_contig_name -> length
+            for cname, cseq in _read_fasta_records(final_fa):
+                contig_total_len[cname] = len(cseq)
+                old = name_map.get(cname, cname)
+                # Strip purge_dups suffix for lookup
+                lk = old
+                m_s = re.match(r'^(.+)_(\d+)$', lk)
+                if m_s:
+                    lk = m_s.group(1)
+                prov = pool_provenance_map.get(lk)
+                if prov:
+                    contig_source[cname] = (prov[0],
+                                            prov[2] if len(prov) >= 3 else "unknown")
+                elif lk in pool_asm_map:
+                    contig_source[cname] = (pool_asm_map[lk], "assembler")
+                else:
+                    contig_source[cname] = (assembler, "assembler")
+
             # Parse depths and compute sliding window stats
             window_size = int(os.environ.get("COV_QC_WINDOW", "5000"))
             low_cov_threshold = float(os.environ.get("COV_QC_LOW", "5"))
@@ -4203,8 +4224,12 @@ def step_12_refine(runner):
                         flag = "MIXED_LOW"
 
                     if flag:
+                        src_asm, src_type = contig_source.get(ctg, ("unknown", "unknown"))
                         weak_regions.append({
                             "contig": ctg,
+                            "contig_length": contig_total_len.get(ctg, ctg_len),
+                            "source_assembler": src_asm,
+                            "source_type": src_type,
                             "start": wstart + 1, "end": wend,
                             "window_median": w_median,
                             "global_median": global_median,
@@ -4228,14 +4253,53 @@ def step_12_refine(runner):
             weak_tsv = os.path.join(cov_dir, "weak_regions.tsv")
             with open(weak_tsv, "w", newline="") as f:
                 w = csv.writer(f, delimiter="\t")
-                w.writerow(["contig", "start", "end", "window_median",
+                w.writerow(["contig", "contig_length", "source_assembler",
+                            "source_type", "start", "end", "window_median",
                             "global_median", "ratio", "zero_bp", "low_bp",
                             "flag"])
                 for r in weak_regions:
-                    w.writerow([r["contig"], r["start"], r["end"],
+                    w.writerow([r["contig"], r["contig_length"],
+                                r["source_assembler"], r["source_type"],
+                                r["start"], r["end"],
                                 r["window_median"], r["global_median"],
                                 r["ratio"], r["zero_bp"], r["low_bp"],
                                 r["flag"]])
+
+            # Write weak regions GFF3 for visualization in genome browsers
+            weak_gff = os.path.join(cov_dir, "weak_regions.gff3")
+            with open(weak_gff, "w") as f:
+                f.write("##gff-version 3\n")
+                f.write("# TACO coverage QC — weak regions in final assembly\n")
+                f.write(f"# Global median coverage: {global_median}×\n")
+                f.write(f"# Window size: {window_size} bp\n")
+                f.write("#\n")
+                # sequence-region pragmas
+                for cname in sorted(contig_total_len.keys()):
+                    f.write(f"##sequence-region {cname} 1 "
+                            f"{contig_total_len[cname]}\n")
+                # One GFF record per weak window
+                for i, r in enumerate(weak_regions, 1):
+                    src_asm = r["source_assembler"]
+                    src_type = r["source_type"]
+                    score = r["window_median"]
+                    attrs = (
+                        f"ID=weak_{i}"
+                        f";flag={r['flag']}"
+                        f";window_median={r['window_median']}"
+                        f";global_median={r['global_median']}"
+                        f";ratio={r['ratio']}"
+                        f";zero_bp={r['zero_bp']}"
+                        f";low_bp={r['low_bp']}"
+                        f";contig_length={r['contig_length']}"
+                        f";source_assembler={src_asm}"
+                        f";source_type={src_type}"
+                        f";description={r['flag']}: median coverage "
+                        f"{r['window_median']}x vs global "
+                        f"{r['global_median']}x "
+                        f"(ratio {r['ratio']})")
+                    f.write(f"{r['contig']}\tTACO_QC\t"
+                            f"coverage_warning\t{r['start']}\t{r['end']}\t"
+                            f"{score}\t.\t.\t{attrs}\n")
 
             # Log summary
             runner.log(f"Coverage QC: global median {global_median}×, "
@@ -4280,7 +4344,7 @@ def step_12_refine(runner):
                         f"zero={r['zero_bp']:,} bp, "
                         f"low={r['low_bp']:,} bp")
 
-            runner.log(f"Coverage QC reports: {summary_tsv}, {weak_tsv}")
+            runner.log(f"Coverage QC reports: {summary_tsv}, {weak_tsv}, {weak_gff}")
         else:
             runner.log_warn("Coverage QC: read mapping produced no depth data")
     elif not samtools_bin or not minimap2_bin:
@@ -4790,6 +4854,7 @@ def step_17_cleanup(runner):
         "assemblies/merged.telo.csv",
         "assemblies/coverage_qc/coverage_summary.tsv",
         "assemblies/coverage_qc/weak_regions.tsv",
+        "assemblies/coverage_qc/weak_regions.gff3",
         "telomere_cluster_summary.tsv",
         "telomere_support_summary.csv",
         "protected_telomere_mode.txt",

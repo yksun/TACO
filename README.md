@@ -373,6 +373,25 @@ For quickmerge-derived contigs, the GFF3 includes additional contig-level attrib
 
 A companion file `pool_contig_provenance.tsv` maps every pool contig back to its source assembler and original contig name, with extended columns for quickmerge contigs: `qm_assembler1`, `qm_assembler2`, and `qm_regions` (semicolon-delimited `start-end:assembler:contig` entries).
 
+### Coverage QC GFF3 and Reports
+
+TACO maps HiFi reads back to the final assembly (Step 12K) and scans for assembly errors using a sliding-window coverage analysis (default 5 kb window). Three output files are produced:
+
+`coverage_summary.tsv` — per-contig coverage statistics: median, mean, min, max, zero-coverage bases, and low-coverage bases. Use this to identify contigs with overall poor read support.
+
+`weak_regions.tsv` — every flagged window with precise coordinates, contig total length, source assembler, source type, window median coverage, global median coverage, coverage ratio, and a flag classifying the issue: `ZERO_GAP` (>50% of window has zero coverage — likely a misjoin), `VERY_LOW` (window median < 15% of global — possibly chimeric), `LOW` (< 30% of global — suspicious drop), `MIXED_LOW` (>30% of bases at zero or below threshold — intermittent problems).
+
+`weak_regions.gff3` — the same weak regions as a GFF3 annotation file that can be loaded directly in genome browsers (IGV, JBrowse, etc.) alongside the final assembly FASTA. Each record has `type=coverage_warning` with the window median coverage as the score column (for color-coding by severity). Attributes include `flag`, `window_median`, `global_median`, `ratio`, `source_assembler`, `source_type`, and a human-readable `description`. Load `final.merged.fasta` as the genome and `weak_regions.gff3` as an annotation track to visually inspect problem regions.
+
+Example workflow for inspecting weak spots:
+```
+# In IGV or JBrowse:
+# 1. Load final_results/final.merged.fasta as genome
+# 2. Load final_results/final.merged.provenance.gff3 as track (provenance)
+# 3. Load final_results/weak_regions.gff3 as track (coverage warnings)
+# 4. Navigate to flagged regions to inspect assembly quality
+```
+
 ## Output Structure
 
 ```
@@ -393,8 +412,9 @@ project_directory/
 │   ├── final_assembly.fasta             # Refined assembly (full mode)
 │   ├── final.merged.provenance.gff3     # GFF3 provenance: full assembler tracing per contig
 │   ├── pool_contig_provenance.tsv       # Pool contig → assembler + original name mapping
-│   ├── coverage_summary.tsv            # Per-contig coverage stats (median, mean, zero/low bp)
-│   ├── weak_regions.tsv                # Flagged weak windows (ZERO_GAP, VERY_LOW, LOW, coords)
+│   ├── coverage_summary.tsv             # Per-contig coverage stats (median, mean, zero/low bp)
+│   ├── weak_regions.tsv                 # Flagged weak windows with coords, source assembler, flag
+│   ├── weak_regions.gff3                # GFF3 coverage warnings: load in IGV to see weak spots
 │   └── assembly_only_result.csv         # Comparison summary (assembly-only)
 ├── telomere_pool/                       # Telomere pool intermediates
 ├── quast_results/                       # QUAST output
