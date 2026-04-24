@@ -44,9 +44,13 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   `--taxon plant` → embryophyta_odb10, `--taxon vertebrate` → vertebrata_odb10,
   `--taxon insect` → insecta_odb10, `--taxon other` → requires explicit `--busco`.
   No more fungal-biased default for non-fungal genomes.
-- **New** Merqury auto-enable for HiFi: when `--platform pacbio-hifi` and
-  `merqury.sh` + `meryl` are installed, Merqury is enabled by default (builds
-  reads.meryl from input reads).  ONT runs get a warning about QV reliability.
+- **New** Merqury auto-enabled for ALL platforms: when `merqury.sh` + `meryl`
+  are installed, Merqury is enabled by default for HiFi, ONT, and CLR.  TACO
+  builds a reads.meryl database automatically from input reads, runs Merqury
+  on every assembler output (Step 11), and on the final refined assembly
+  (Step 14).  For non-HiFi platforms, a warning is logged: QV values may
+  underestimate true quality, but Merqury completeness and relative QV ranking
+  across assemblers remain informative.  Disable with `--no-merqury`.
 - **Improved** backbone scoring with taxon-aware weights: BUSCO_S × 1000 -
   BUSCO_D × taxon_penalty + MerquryComp × 200 + MerquryQV × 20 + T2T ×
   taxon_t2t + single × 150 + log10(N50) × taxon_n50 - contigs × taxon_frag -

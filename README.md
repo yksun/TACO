@@ -52,7 +52,7 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 - Standardizes assembly outputs for direct cross-assembler comparison
 - Hybrid telomere detection with de novo k-mer discovery, built-in motif families, and per-end composite scoring
 - Three-tier telomere classification: strict T2T, single-end strong, and telomere-supported
-- Benchmarks assemblies with BUSCO, QUAST, telomere metrics, and Merqury (auto-enabled for HiFi; builds reads.meryl automatically)
+- Benchmarks all assembler outputs AND the final refined assembly with BUSCO, QUAST, telomere metrics, and Merqury QV/completeness (auto-enabled for all platforms when `merqury.sh` + `meryl` installed; builds reads.meryl automatically)
 - Taxon-aware scoring: BUSCO S rewarded, BUSCO D penalized, Merqury QV/completeness, telomere metrics, N50, contig count, and genome size deviation — with per-taxon weights for fungal, plant, vertebrate, insect, and other genomes
 - Taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota, `--taxon plant` → embryophyta, etc.
 - Assembly-only mode (`--assembly-only`) for convenient benchmarking without refinement
@@ -106,9 +106,13 @@ taco -g 12m -t 16 \
   --assembly-only
 ```
 
-**With Merqury QV scoring (optional, auto-detected if installed):**
+**Merqury QV scoring (enabled by default):**
 
-Merqury is automatically enabled when `merqury.sh` is on PATH and a `.meryl` database is found in the working directory. You can also specify the database explicitly:
+Merqury is automatically enabled for all platforms when `merqury.sh` and `meryl` are installed. TACO builds a reads.meryl k-mer database from input reads, runs Merqury on every assembler output (Step 11), and on the final refined assembly (Step 14). Merqury QV and completeness are included in backbone scoring and the final comparison table.
+
+**Accuracy note:** Merqury QV is most accurate with high-accuracy reads (PacBio HiFi or Illumina). With Nanopore or PacBio CLR reads, QV values may underestimate true assembly quality because read errors inflate k-mer error counts. However, Merqury completeness and relative QV ranking across assemblers remain informative for all platforms. TACO logs a warning when using non-HiFi reads. Disable with `--no-merqury`.
+
+You can also provide a pre-built database:
 
 ```bash
 taco -g 12m -t 16 \
@@ -195,7 +199,7 @@ Incompatible assemblers are automatically skipped with a warning.
 | Component | Fungal | Plant | Vertebrate/Animal | Insect/Other |
 |---|---|---|---|---|
 | **Default BUSCO lineage** | ascomycota_odb10 | embryophyta_odb10 | vertebrata_odb10 / metazoa_odb10 | insecta_odb10 / requires `--busco` |
-| **Merqury** | auto if HiFi | auto if HiFi | auto if HiFi | auto if HiFi |
+| **Merqury** | auto (all platforms) | auto (all platforms) | auto (all platforms) | auto (all platforms) |
 | **Telomere motifs** | TTAGGG + TG1-3 + Candida | TTTAGGG | TTAGGG | TTAGG (insect) / all (other) |
 | **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
 | **Backbone scoring** | S×1000 - D×600 + T2T×350 | S×1000 - D×300 + T2T×200 | S×1000 - D×500 + T2T×200 | S×1000 - D×500 + T2T×300 |
@@ -215,7 +219,7 @@ Incompatible assemblers are automatically skipped with a warning.
 | 11 | Assembly QC and comparison: BUSCO + telomere + QUAST + optional Merqury | Comparison |
 | 12 | Build optimized telomere contig pool (pairwise quickmerge + validation) | Telomere pool |
 | 13 | Backbone selection and telomere-aware refinement | Refinement |
-| 14 | Final QC: BUSCO + Telomere + QUAST on refined assembly | Final QC |
+| 14 | Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
 | 15 | Final comparison report + cleanup into `final_results/` | Report + Cleanup |
 | 16 | Assembly-only comparison summary + cleanup (used by `--assembly-only`) | Assembly-only |
 
@@ -268,7 +272,7 @@ When `--choose` is not provided, TACO automatically selects the backbone assembl
 
 ### Smart Scoring (default)
 
-TACO ranks assemblies using a composite score. Merqury QV and completeness are included when available (optional — auto-detected if `merqury.sh` is installed and a `.meryl` database is found; otherwise these terms contribute 0):
+TACO ranks assemblies using a composite score. Merqury QV and completeness are included by default when `merqury.sh` + `meryl` are installed (otherwise these terms contribute 0):
 
 ```
 score = BUSCO_S × w_busco_s + T2T × w_t2t + single_tel × w_single
@@ -483,7 +487,7 @@ TACO/
 
 **Missing Python modules:** TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and the `taco/` directory is alongside `TACO.sh`.
 
-**Merqury not working:** Merqury is optional. Install with `conda install -c bioconda merqury meryl` or use `--no-merqury` to skip.
+**Merqury not working:** Merqury is enabled by default when `merqury.sh` + `meryl` are installed. The reads.meryl database is built automatically from input reads. If you have a pre-built database, use `--merqury-db path/to/reads.meryl`. Install with `conda install -c bioconda merqury meryl`. Disable with `--no-merqury`.
 
 ## Citation
 

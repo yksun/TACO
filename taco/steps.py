@@ -5510,12 +5510,40 @@ def _assembly_only_summary(runner):
     runner.log("Wrote assemblies/assembly_info.csv")
 
 
+def _final_merqury_qc(runner):
+    """Run Merqury on the final refined assembly."""
+    if not runner.merqury_enable:
+        runner.log_info("Merqury disabled for final assembly")
+        return
+
+    db = runner.merqury_db
+    if not db:
+        for cand in (["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"]
+                     + glob.glob("merqury/reads.k*.meryl") + glob.glob("*.meryl")):
+            if os.path.isdir(cand):
+                db = cand
+                break
+    if not db or not os.path.isdir(db) or not shutil.which("merqury.sh"):
+        runner.log_warn("Merqury: no .meryl database or merqury.sh not found; "
+                        "skipping final Merqury")
+        return
+
+    final_fa = "assemblies/final.merged.fasta"
+    if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
+        return
+
+    runner.log_info("Running Merqury on final assembly")
+    cmd = f"merqury.sh {db} {final_fa} merqury/final"
+    runner.run_cmd(cmd, desc="Merqury on final assembly", check=False)
+
+
 def step_14_final_qc(runner):
-    """Step 14 - Final QC: BUSCO + Telomere + QUAST on final assembly."""
-    runner.log("Step 14 - Final QC (BUSCO + Telomere + QUAST on final assembly)")
+    """Step 14 - Final QC: BUSCO + Telomere + QUAST + Merqury on final assembly."""
+    runner.log("Step 14 - Final QC (BUSCO + Telomere + QUAST + Merqury on final)")
     _final_busco_qc(runner)
     _final_telomere_qc(runner)
     _final_quast_qc(runner)
+    _final_merqury_qc(runner)
 
 
 def step_15_report_cleanup(runner):

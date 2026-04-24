@@ -133,20 +133,28 @@ class PipelineRunner:
             else:
                 self.merqury_enable = False
 
-        # For HiFi data, enable Merqury by default if merqury.sh is installed
-        # (even if no pre-built .meryl db exists — we'll build one from reads)
-        if not self.merqury_enable and self.platform == "pacbio-hifi":
+        # Auto-enable Merqury for ALL platforms when merqury.sh + meryl are
+        # installed.  Merqury is most accurate with HiFi reads but still useful
+        # for ONT/CLR as a relative comparison metric across assemblers.
+        if not self.merqury_enable:
             merqury_bin = shutil.which("merqury.sh")
             meryl_bin = shutil.which("meryl")
             if merqury_bin and meryl_bin:
                 self.merqury_enable = True
-                self.merqury_build_db = True  # flag to build .meryl from reads
-                self.log_info("Merqury auto-enabled for HiFi data (will build reads.meryl)")
+                self.merqury_build_db = True
+                self.log_info(f"Merqury auto-enabled for {self.platform} "
+                              f"(will build reads.meryl from input reads)")
             elif merqury_bin:
-                self.log_warn("merqury.sh found but meryl not installed — Merqury disabled")
-        elif self.platform == "nanopore" and self.merqury_enable:
-            self.log_warn("Merqury QV is most reliable with high-accuracy reads (HiFi/Illumina); "
-                          "ONT results may underestimate QV")
+                self.log_warn("merqury.sh found but meryl not installed — "
+                              "Merqury disabled")
+        # Warn for non-HiFi platforms
+        if self.merqury_enable and self.platform != "pacbio-hifi":
+            self.log_warn(
+                f"Merqury QV estimates are most reliable with high-accuracy "
+                f"reads (PacBio HiFi or Illumina). With {self.platform} reads, "
+                f"QV values may underestimate true assembly quality. "
+                f"Merqury completeness and relative QV ranking across "
+                f"assemblers remain useful. Disable with --no-merqury.")
 
         # Derived paths
         fastq_name = os.path.basename(self.fastq)
