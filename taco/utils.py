@@ -12,7 +12,7 @@ ASSEMBLER_PLATFORMS = {
     "peregrine": {"pacbio-hifi": True, "nanopore": False, "pacbio": True},
     "ipa": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
     "flye": {"pacbio-hifi": "--pacbio-hifi", "nanopore": "--nano-hq", "pacbio": "--pacbio-raw"},
-    "hifiasm": {"pacbio-hifi": True, "nanopore": True, "pacbio": True},
+    "hifiasm": {"pacbio-hifi": True, "nanopore": "--ul", "pacbio": False},  # nanopore: hifiasm-UL mode via --ul flag; does NOT support CLR
 }
 
 

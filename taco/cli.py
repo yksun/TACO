@@ -47,9 +47,19 @@ def expand_steps(step_str):
     return sorted(list(steps))
 
 
+TAXON_BUSCO_LINEAGE = {
+    "fungal": "ascomycota_odb10",
+    "plant": "embryophyta_odb10",
+    "vertebrate": "vertebrata_odb10",
+    "animal": "metazoa_odb10",
+    "insect": "insecta_odb10",
+    "other": None,  # require explicit --busco or warn
+}
+
+
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.2.0 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.0 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -68,20 +78,28 @@ def parse_args():
     parser.add_argument('--telo-kmer-max', type=int, default=30)
     parser.add_argument('--auto-mode', choices=['smart', 'n50'], default='smart')
     parser.add_argument('--choose', nargs='?', const='__prompt__')
-    parser.add_argument('--busco', nargs='?', const='ascomycota_odb10')
+    parser.add_argument('--busco', type=str, help='BUSCO lineage database (e.g., ascomycota_odb10); if not provided, defaults based on --taxon')
     parser.add_argument('--merqury', action='store_true')
     parser.add_argument('--merqury-db', type=str)
     parser.add_argument('--no-merqury', action='store_true')
     parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
     parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')
+    parser.add_argument('--no-coverage-qc', action='store_true', help='Skip final coverage QC')
     parser.add_argument('--allow-t2t-replace', action='store_true',
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.2.0')
+    parser.add_argument('--version', action='version', version='TACO v1.3.0')
     
     args = parser.parse_args()
-    
+
+    # Set default BUSCO lineage based on taxon if not explicitly provided
+    if args.busco is None:
+        default_lineage = TAXON_BUSCO_LINEAGE.get(args.taxon)
+        if default_lineage:
+            args.busco = default_lineage
+        # if "other" taxon with no --busco, leave as None (pipeline will warn)
+
     if args.telomere_mode == 'known' and not args.motif:
         parser.error("--telomere-mode known requires --motif")
     if args.no_merqury:

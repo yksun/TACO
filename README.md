@@ -184,10 +184,11 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 
 | Component | Fungal | Plant | Vertebrate/Animal | Insect/Other |
 |---|---|---|---|---|
+| **Default BUSCO lineage** | ascomycota_odb10 | embryophyta_odb10 | vertebrata_odb10 / metazoa_odb10 | insecta_odb10 / requires `--busco` |
+| **Merqury** | auto if HiFi | auto if HiFi | auto if HiFi | auto if HiFi |
 | **Telomere motifs** | TTAGGG + TG1-3 + Candida | TTTAGGG | TTAGGG | TTAGG (insect) / all (other) |
 | **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
-| **Backbone T2T weight** | 350 (high) | 200 (reduced) | 200 (reduced) | 300 (default) |
-| **BUSCO D penalty** | 600 (strict) | 300 (relaxed) | 500 (default) | 500 (default) |
+| **Backbone scoring** | S×1000 - D×600 + T2T×350 | S×1000 - D×200 + T2T×200 | S×1000 - D×400 + T2T×250 | S×1000 - D×500 + T2T×300 |
 | **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2% (default) |
 | **purge_dups mode** | two-round (haploid-aggressive) | single-round + polyploid warning | two-round | single-round |
 | **Polishing (HiFi)** | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) |
@@ -221,7 +222,7 @@ With `--assembly-only`, TACO follows the comparison path (Steps 1-11, 18) and st
 
 ## Telomere Detection
 
-TACO v1.2.0 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.0 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -433,7 +434,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.2.0)
+│   ├── __init__.py         # Package metadata (v1.3.0)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking

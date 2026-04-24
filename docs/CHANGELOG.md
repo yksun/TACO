@@ -5,12 +5,33 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.2.1] — 2026-04-23
+## [1.3.0] — 2026-04-24
 
 ### Overview
 
-Version 1.2.1 fixes critical assembly quality issues in Step 12 and introduces
-smarter decision-making for telomere-aware contig upgrades.
+Version 1.3.0 is a comprehensive overhaul addressing platform compatibility,
+scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
+
+### Architecture and platform changes
+
+- **Fixed** hifiasm platform compatibility: HiFi = native, ONT = hifiasm-UL
+  mode (`--ul` flag), CLR = disabled.  Previous versions incorrectly marked
+  hifiasm as compatible with all platforms.
+- **New** taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota_odb10,
+  `--taxon plant` → embryophyta_odb10, `--taxon vertebrate` → vertebrata_odb10,
+  `--taxon insect` → insecta_odb10, `--taxon other` → requires explicit `--busco`.
+  No more fungal-biased default for non-fungal genomes.
+- **New** Merqury auto-enable for HiFi: when `--platform pacbio-hifi` and
+  `merqury.sh` + `meryl` are installed, Merqury is enabled by default (builds
+  reads.meryl from input reads).  ONT runs get a warning about QV reliability.
+- **Improved** backbone scoring with taxon-aware weights: BUSCO_S × 1000 -
+  BUSCO_D × taxon_penalty + MerquryComp × 200 + MerquryQV × 20 + T2T ×
+  taxon_t2t + single × 150 + log10(N50) × taxon_n50 - contigs × taxon_frag -
+  size_deviation_penalty.  Insect weights added.  Size deviation penalty
+  discourages assemblies far from expected genome size.
+- **Improved** replacement safety: candidates must pass sufficient target
+  coverage, query coverage, BUSCO validation (C/D/M), Merqury completeness
+  check, size sanity, and read coverage support before replacing backbone.
 
 ### Key changes
 

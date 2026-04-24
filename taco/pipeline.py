@@ -36,7 +36,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.2.0"
+    PIPELINE_NAME = "TACO-1.3.0"
 
     def __init__(self, args):
         # Core parameters
@@ -72,6 +72,7 @@ class PipelineRunner:
         # Post-refinement options
         self.no_purge_dups = getattr(args, 'no_purge_dups', False)
         self.no_polish = getattr(args, 'no_polish', False)
+        self.no_coverage_qc = getattr(args, 'no_coverage_qc', False)
         self.allow_t2t_replace = getattr(args, 'allow_t2t_replace', False)
 
         # Backbone selection
@@ -84,14 +85,20 @@ class PipelineRunner:
                 self.assembler = args.choose
 
         # BUSCO
-        self.busco_lineage = args.busco if args.busco else "ascomycota_odb10"
+        self.busco_lineage = args.busco  # may be None if --taxon other and no --busco
         self.run_busco = args.busco is not None
+        if self.busco_lineage is None and self.taxon != "other":
+            # Fallback: use taxon default (should be set in cli.py)
+            from taco.cli import TAXON_BUSCO_LINEAGE
+            self.busco_lineage = TAXON_BUSCO_LINEAGE.get(self.taxon, "ascomycota_odb10")
+            self.run_busco = True
 
         # Merqury — auto-detect if installed and a .meryl database is found.
         # Explicitly disabled with --no-merqury; explicitly enabled with
         # --merqury or --merqury-db.  Otherwise, auto-enable when merqury.sh
         # is on PATH and a .meryl directory is discoverable.
         self.merqury_db = getattr(args, 'merqury_db', None)
+        self.merqury_build_db = False
         if getattr(args, 'no_merqury', False):
             self.merqury_enable = False
         elif args.merqury or self.merqury_db:
@@ -117,6 +124,21 @@ class PipelineRunner:
                 self.merqury_db = auto_db
             else:
                 self.merqury_enable = False
+
+        # For HiFi data, enable Merqury by default if merqury.sh is installed
+        # (even if no pre-built .meryl db exists — we'll build one from reads)
+        if not self.merqury_enable and self.platform == "pacbio-hifi":
+            merqury_bin = shutil.which("merqury.sh")
+            meryl_bin = shutil.which("meryl")
+            if merqury_bin and meryl_bin:
+                self.merqury_enable = True
+                self.merqury_build_db = True  # flag to build .meryl from reads
+                self.log_info("Merqury auto-enabled for HiFi data (will build reads.meryl)")
+            elif merqury_bin:
+                self.log_warn("merqury.sh found but meryl not installed — Merqury disabled")
+        elif self.platform == "nanopore" and self.merqury_enable:
+            self.log_warn("Merqury QV is most reliable with high-accuracy reads (HiFi/Illumina); "
+                          "ONT results may underestimate QV")
 
         # Derived paths
         fastq_name = os.path.basename(self.fastq)
