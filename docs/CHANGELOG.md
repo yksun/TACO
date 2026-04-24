@@ -52,13 +52,21 @@ smarter decision-making for telomere-aware contig upgrades.
 - **New** final assembly coverage QC (Step 12K): maps HiFi reads to the final
   assembly and computes sliding-window coverage (default 5 kb window).  Detects
   zero-coverage gaps, very low coverage regions (< 15% of global median), and
-  mixed low-coverage windows.  Outputs two reports:
-  `coverage_qc/coverage_summary.tsv` (per-contig: median, mean, min, max,
-  zero/low bp counts) and `coverage_qc/weak_regions.tsv` (per-window: flagged
-  regions with coordinates, coverage ratio, and flag type: ZERO_GAP, VERY_LOW,
-  LOW, MIXED_LOW).  Warns in log for contigs with weak spots.  Configure window
-  size with `COV_QC_WINDOW` (default 5000) and low-coverage threshold with
-  `COV_QC_LOW` (default 5).
+  mixed low-coverage windows.  Three output files in `final_results/`:
+  - `coverage_summary.tsv` — per-contig stats: median, mean, min, max
+    coverage, zero-coverage bp, low-coverage bp.
+  - `weak_regions.tsv` — every flagged window with coordinates, contig total
+    length, source assembler, source type (assembler/quickmerge), window
+    median, global median, coverage ratio, and flag (ZERO_GAP, VERY_LOW,
+    LOW, MIXED_LOW).
+  - `weak_regions.gff3` — GFF3 annotation track for genome browsers (IGV,
+    JBrowse).  Each record has `type=coverage_warning`, score = window median
+    coverage (for color-coding), and attributes: `flag`, `window_median`,
+    `global_median`, `ratio`, `source_assembler`, `source_type`, `description`.
+    Load alongside `final.merged.fasta` and `final.merged.provenance.gff3`
+    to visualize both provenance and coverage quality in one view.
+  Configure window size with `COV_QC_WINDOW` (default 5000) and low-coverage
+  threshold with `COV_QC_LOW` (default 5).
 - **Fixed** BUSCO trial `busco_available`: no longer requires `--busco` flag.
 - **Fixed** `_write_candidates_tsv` KeyError for pool T2T upgrade candidates.
 - **Fixed** post-upgrade dedup: protects all backbone contigs, not just
