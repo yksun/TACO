@@ -158,28 +158,29 @@ Use `--assembly-only` when the goal is assembler benchmarking and comparison wit
 
 TACO supports three sequencing platforms. Each assembler receives platform-appropriate flags automatically. The platform also determines the default polishing strategy: HiFi assemblies are polished with NextPolish2 by default (k-mer-based, safe for high-accuracy reads; requires `yak` for k-mer database construction), Nanopore assemblies use Medaka (neural-network polisher; falls back to Racon), and CLR assemblies use Racon.
 
-| Platform | `--platform` | Assemblers Used | Notes |
+| Platform | `--platform` | Assemblers (Steps 1-9) | Skipped |
 |---|---|---|---|
-| PacBio HiFi | `pacbio-hifi` (default) | canu, nextDenovo, peregrine, IPA, flye, hifiasm | All 6 assemblers |
-| Oxford Nanopore | `nanopore` | canu, nextDenovo, flye | Peregrine, IPA, hifiasm skipped |
-| PacBio CLR | `pacbio` | canu, nextDenovo, peregrine, flye | IPA, hifiasm skipped |
+| PacBio HiFi | `pacbio-hifi` (default) | canu, nextDenovo, peregrine, ipa, flye, hifiasm, lja, mbg, raven | none |
+| Oxford Nanopore | `nanopore` | canu, nextDenovo, flye, raven | peregrine, ipa, hifiasm, lja, mbg |
+| PacBio CLR | `pacbio` | canu, nextDenovo, peregrine, flye, raven | ipa, hifiasm, lja, mbg |
 
-Incompatible assemblers are automatically skipped with a warning. IPA and hifiasm only support PacBio HiFi reads. Peregrine does not support Nanopore reads.
+Incompatible assemblers are automatically skipped with a warning.
 
-### Platform-Specific Assembler Flags
+### Platform-Specific Assembler Compatibility
 
-Each assembler receives the appropriate read-type flag automatically:
+| Assembler | HiFi | Nanopore | CLR | Notes |
+|---|---|---|---|---|
+| Canu | `-pacbio-hifi` | `-nanopore` | `-pacbio` | All platforms supported |
+| Flye | `--pacbio-hifi` | `--nano-hq` (Q20+) | `--pacbio-raw` | All platforms; set `FLYE_ONT_FLAG=--nano-raw` for older ONT |
+| Hifiasm | default mode | skipped | skipped | HiFi-only as primary input |
+| IPA | default mode | skipped | skipped | HiFi-only (PacBio tool) |
+| Peregrine | default mode | skipped | default mode | HiFi and CLR only |
+| NextDenovo | via config file | via config file | via config file | All platforms; config auto-generated |
+| LJA | default mode | skipped | skipped | HiFi-only; very contiguous assemblies |
+| MBG | default mode | skipped | skipped | HiFi-only; minimizer-based; manual install |
+| Raven | default mode | default mode | default mode | All platforms; fast OLC assembler |
 
-| Assembler | HiFi | Nanopore | CLR |
-|---|---|---|---|
-| Canu | `-pacbio-hifi` | `-nanopore` | `-pacbio` |
-| Flye | `--pacbio-hifi` | `--nano-hq` (Q20+) | `--pacbio-raw` |
-| Hifiasm | default mode | skipped | skipped |
-| IPA | default mode | skipped | skipped |
-| Peregrine | default mode | skipped | default mode |
-| NextDenovo | via config file | via config file | via config file |
-
-For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` in the environment.
+**Platform summary:** HiFi runs up to 9 assemblers, Nanopore runs 4 (Canu, Flye, NextDenovo, Raven), CLR runs 5 (Canu, Flye, NextDenovo, Peregrine, Raven).
 
 ### Platform-Specific Polishing Strategy
 
@@ -206,28 +207,31 @@ For older ONT data that is not Q20+ basecalled, set `FLYE_ONT_FLAG=--nano-raw` i
 
 ## Pipeline Steps
 
-| Step | Description |
-|---|---|
-| 1 | HiCanu assembly |
-| 2 | NextDenovo assembly |
-| 3 | Peregrine assembly |
-| 4 | IPA assembly |
-| 5 | Flye assembly |
-| 6 | Hifiasm assembly |
-| 7 | Copy and normalize all assemblies |
-| 8 | BUSCO on all assemblies |
-| 9 | Telomere contig detection and telomere metrics |
-| 10 | Build optimized telomere pool across assemblies |
-| 11 | QUAST for assembler comparison |
-| 12 | Backbone selection and telomere-aware refinement |
-| 13 | BUSCO on final assembly |
-| 14 | Telomere analysis of final assembly |
-| 15 | QUAST on final assembly |
-| 16 | Final comparison report |
-| 17 | Cleanup into structured output folders |
-| 18 | Assembly-only comparison summary |
+| Step | Description | Phase |
+|---|---|---|
+| 0 | Input QC and validation | Setup |
+| 1-9 | Run assemblers: Canu, NextDenovo, Peregrine, IPA, Flye, Hifiasm, LJA, MBG, Raven | Assembly |
+| 10 | Copy and normalize all assembler outputs | Normalization |
+| 11 | BUSCO on all assemblies | Pre-comparison QC |
+| 12 | Telomere detection and scoring on all assemblies | Pre-comparison QC |
+| 13 | Build optimized telomere contig pool (pairwise quickmerge + validation) | Telomere pool |
+| 14 | QUAST for cross-assembler comparison | Comparison |
+| 15 | Backbone selection and telomere-aware refinement | Refinement |
+| 16 | Final QC: BUSCO + Telomere + QUAST on refined assembly | Final QC |
+| 17 | Final comparison report + cleanup into `final_results/` | Report + Cleanup |
+| 18 | Assembly-only comparison summary + cleanup (used by `--assembly-only`) | Assembly-only |
 
-With `--assembly-only`, TACO runs Steps 1-9, 11, and 18 (skips Step 10 which builds the refinement telomere pool) and stops before backbone refinement.
+### Step 0 — Input QC
+
+Step 0 runs automatically before assembly. It validates that the FASTQ file exists and is non-empty, parses the genome size, estimates total read bases and coverage by sampling the first 100K reads, and warns if coverage is below recommended thresholds (HiFi: 25×, ONT: 40×, CLR: 50×). It also logs which assemblers are compatible with the selected platform and confirms the BUSCO lineage setting. Step 0 runs in both full and assembly-only modes.
+
+### Full Refinement Mode (default)
+
+Steps 0-17: runs all assemblers, normalizes, evaluates with BUSCO + telomere + QUAST, builds the telomere pool, selects and refines the backbone, runs final QC, and produces the comparison report.
+
+### Assembly-Only Mode (`--assembly-only`)
+
+Steps 0-12, 14, 18: runs all assemblers, normalizes, evaluates with BUSCO + telomere + QUAST comparison, then produces the assembly-only comparison table at `final_results/assembly_only_result.csv`. Skips the telomere pool (Step 13), refinement (Step 15), and final QC (Step 16). This mode is designed for benchmarking and decision-making without modifying any assembly.
 
 ## Telomere Detection
 
@@ -300,7 +304,7 @@ BUSCO single-copy completeness (S%) is used instead of total completeness (C%) t
 
 The default telomere score window also varies by taxon to match typical telomere array lengths: fungi use 300 bp (fungal telomere arrays are short, often 50–300 bp), plants and vertebrates use 1000 bp (longer repeat arrays), and other taxa use 500 bp (balanced default).
 
-### Taxon-Specific BUSCO Trial Thresholds (Step 12F)
+### Taxon-Specific BUSCO Trial Thresholds (Step 15F)
 
 When validating rescue candidates via BUSCO trial, the maximum acceptable C% drop, M% rise, and D% rise depend on taxon:
 
@@ -313,7 +317,7 @@ A D-rise (duplicated BUSCO increase) check catches cases where a rescue introduc
 
 Additional environment variables for fine-tuning Step 12: `PROTECT_COV` / `PROTECT_ID` (strict dedup thresholds, default 0.95/0.95), `DEDUP_MAX_BUSCO_C_DROP` (maximum tolerated BUSCO C drop after dedup, default 3.0%), `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `AGGR_NONTELO_COV` / `AGGR_NONTELO_ID` (taxon-aware non-telo dedup), `SELFDEDUP_COV` / `SELFDEDUP_ID` (self-dedup thresholds).
 
-### Taxon-Specific Rescue Limits (Step 12F)
+### Taxon-Specific Rescue Limits (Step 15F)
 
 The maximum number of accepted rescue candidates per run is taxon-aware: fungi allow up to 20 rescues (many small chromosomes), vertebrates 10, plants 8 (conservative due to polyploidy risk), and other taxa 15. This prevents runaway replacement in complex genomes.
 
@@ -329,7 +333,7 @@ Before adding "novel" pool T2T contigs, TACO checks each candidate against the c
 
 Thresholds: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID` (default 0.90), `NOVEL_UPGRADE_TCOV` (default 0.80).
 
-### Taxon-Specific purge_dups Behaviour (Step 12H)
+### Taxon-Specific purge_dups Behaviour (Step 15H)
 
 purge_dups strategy is taxon-aware. Fungi and other haploid genomes use two-round purging (`-2` flag) for more aggressive duplicate detection — in haploid genomes, duplicated contigs receive similar read coverage to primary contigs, making them harder to detect with single-round purging. Vertebrate and animal genomes also use two-round purging for thorough haplotig removal. Plant genomes use conservative single-round purging to avoid collapsing homeologous sequences in polyploid species — use `--no-purge-dups` if this is still too aggressive. Coverage cutoffs from `calcuts` are logged for debugging; override with the `PURGE_DUPS_CALCUTS` environment variable if automatic thresholds are incorrect for your dataset.
 
@@ -337,32 +341,32 @@ purge_dups strategy is taxon-aware. Fungi and other haploid genomes use two-roun
 
 `--auto-mode n50` selects the assembly with the highest N50. This reproduces legacy behavior but may favor contiguous assemblies that lack completeness.
 
-## Step 12 — T2T-First Telomere-Aware Backbone Refinement
+## Step 15 — T2T-First Telomere-Aware Backbone Refinement
 
-Step 12 adopts a T2T-first assembly philosophy with a **two-tier confidence model**:
+Step 15 (backbone refinement) adopts a T2T-first assembly philosophy with a **two-tier confidence model**:
 
 - **Tier 1 (Immutable)**: T2T contigs — contigs with verified telomere signal at both ends. These are treated as protected chromosomal anchors and are never replaced during rescue, unless `--allow-t2t-replace` is explicitly set. This protects the highest-confidence contigs from accidental degradation.
 - **Tier 2 (Editable)**: Backbone contigs — gap-fill contigs that cover chromosomal regions not represented by T2T contigs. These may be replaced by telomere-bearing rescue donors if the replacement passes BUSCO trial validation.
 
-Backbone contigs are preserved by default to maintain BUSCO completeness — purge_dups at Step 12H handles haplotig removal using read-coverage evidence. Novel T2T additions undergo a D-aware duplicate filter that either upgrades Tier 2 backbone contigs (replacing non-T2T with T2T) or rejects pure duplicates of Tier 1 contigs. Rescue donors must carry verified telomere signal.
+Backbone contigs are preserved by default to maintain BUSCO completeness — purge_dups at Step 15H handles haplotig removal using read-coverage evidence. Novel T2T additions undergo a D-aware duplicate filter that either upgrades Tier 2 backbone contigs (replacing non-T2T with T2T) or rejects pure duplicates of Tier 1 contigs. Rescue donors must carry verified telomere signal.
 
-### Step 12 Sub-step Flow
+### Step 15 Sub-step Flow
 
-1. **12A** — Merqury QV scoring (optional; auto-detected if installed, or enabled with `--merqury`/`--merqury-db`).
-2. **12B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
-3. **12C** — prepare cleaned backbone + chimera safety using two strategies: (a) **size gate** — contigs > 1.5× the largest individual assembler contig are flagged; (b) **cross-assembly mapping** — each protected contig is aligned against all other assembler outputs; contigs not well-covered (≥60%) by any single assembler's contig are flagged as potential chimeras. Configurable via `CHIMERA_MIN_CROSS_COV`.
-4. **12D** — backbone-first classification and pool T2T analysis:
+1. **15A** — Merqury QV scoring (optional; auto-detected if installed, or enabled with `--merqury`/`--merqury-db`).
+2. **15B** — auto-select backbone assembler (smart scoring with taxon-aware weights).
+3. **15C** — prepare cleaned backbone + chimera safety using two strategies: (a) **size gate** — contigs > 1.5× the largest individual assembler contig are flagged; (b) **cross-assembly mapping** — each protected contig is aligned against all other assembler outputs; contigs not well-covered (≥60%) by any single assembler's contig are flagged as potential chimeras. Configurable via `CHIMERA_MIN_CROSS_COV`.
+4. **15D** — backbone-first classification and pool T2T analysis:
    - **12D1** backbone telomere classification: classify backbone contigs as Tier 1 (T2T, immutable) or Tier 2 (non-T2T, upgradeable).
    - **12D2** pool T2T analysis: align pool T2T contigs against backbone. Pool T2T redundant to Tier 1 backbone are discarded. Pool T2T that cover a Tier 2 backbone contig (≥80% target coverage, ≥85% identity) become upgrade donors. Others are candidate novel additions.
-   - **12D3** backbone self-dedup: disabled by default (preserves BUSCO completeness). purge_dups at 12H handles haplotig removal. Re-enable with `SELFDEDUP_ENABLE=1`.
-5. **12E** — telomere upgrade: pool T2T donors replace Tier 2 backbone contigs. Tier 1 (T2T) contigs are immutable — candidates targeting them are rejected unless `--allow-t2t-replace` is set. Each replacement is assigned a class: `upgrade_tier2_to_t2t`, `replace_single_with_better`, etc.
-6. **12F** — BUSCO trial validation: for each candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). D-aware novel filter (12F2): novel T2T contigs that overlap Tier 2 backbone REPLACE the backbone (upgrade); those overlapping Tier 1 are rejected as duplicates; those with no overlap are added as genuinely novel. Optional BUSCO D check rejects additions that increase duplication excessively.
-7. **12G** — final combine: backbone (with upgrades) + novel additions. Post-upgrade dedup protects all backbone contigs; only novel additions can be removed if redundant.
-8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
-9. **12I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
-10. **12J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
-11. **12K** — final assembly coverage QC: maps HiFi reads to the final assembly, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv`, `weak_regions.tsv`, and `weak_regions.gff3` (loadable in IGV).
-12. **12L** — "do no harm" safety comparison: compares final assembly vs original backbone for size, telomere count, and genome size deviation. If refinement degraded quality, both assemblies are preserved with a `refinement_warning.txt` explaining the issues.
+   - **12D3** backbone self-dedup: disabled by default (preserves BUSCO completeness). purge_dups at 15H handles haplotig removal. Re-enable with `SELFDEDUP_ENABLE=1`.
+5. **15E** — telomere upgrade: pool T2T donors replace Tier 2 backbone contigs. Tier 1 (T2T) contigs are immutable — candidates targeting them are rejected unless `--allow-t2t-replace` is set. Each replacement is assigned a class: `upgrade_tier2_to_t2t`, `replace_single_with_better`, etc.
+6. **15F** — BUSCO trial validation: for each candidate, build a trial assembly and run BUSCO. Rejection thresholds are taxon-aware (fungi: 2% C-drop / 2% D-rise, plant: 4% / 6%, vertebrate: 3% / 4%). D-aware novel filter (12F2): novel T2T contigs that overlap Tier 2 backbone REPLACE the backbone (upgrade); those overlapping Tier 1 are rejected as duplicates; those with no overlap are added as genuinely novel. Optional BUSCO D check rejects additions that increase duplication excessively.
+7. **15G** — final combine: backbone (with upgrades) + novel additions. Post-upgrade dedup protects all backbone contigs; only novel additions can be removed if redundant.
+8. **15H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
+9. **15I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
+10. **15J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
+11. **15K** — final assembly coverage QC: maps HiFi reads to the final assembly, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv`, `weak_regions.tsv`, and `weak_regions.gff3` (loadable in IGV).
+12. **15L** — "do no harm" safety comparison: compares final assembly vs original backbone for size, telomere count, and genome size deviation. If refinement degraded quality, both assemblies are preserved with a `refinement_warning.txt` explaining the issues.
 
 ### BUSCO Trial Validation
 
@@ -386,7 +390,7 @@ A companion file `pool_contig_provenance.tsv` maps every pool contig back to its
 
 ### Coverage QC GFF3 and Reports
 
-TACO maps HiFi reads back to the final assembly (Step 12K) and scans for assembly errors using a sliding-window coverage analysis (default 5 kb window). Three output files are produced:
+TACO maps HiFi reads back to the final assembly (Step 15K) and scans for assembly errors using a sliding-window coverage analysis (default 5 kb window). Three output files are produced:
 
 `coverage_summary.tsv` — per-contig coverage statistics: median, mean, min, max, zero-coverage bases, and low-coverage bases. Use this to identify contigs with overall poor read support.
 

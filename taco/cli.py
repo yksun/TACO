@@ -11,18 +11,18 @@ STEP_NAMES = {
     4: "IPA assembly",
     5: "Flye assembly",
     6: "Hifiasm assembly",
-    7: "Copy and normalize all assemblies",
-    8: "BUSCO on all assemblies",
-    9: "Telomere detection and scoring",
-    10: "Build optimized telomere pool",
-    11: "QUAST for assembler comparison",
-    12: "Backbone selection and refinement",
-    13: "BUSCO on final assembly",
-    14: "Telomere analysis of final assembly",
-    15: "QUAST on final assembly",
-    16: "Final comparison report",
-    17: "Cleanup temporary files",
-    18: "Assembly-only comparison summary",
+    7: "LJA assembly",
+    8: "MBG assembly",
+    9: "Raven assembly",
+    10: "Copy and normalize all assemblies",
+    11: "BUSCO on all assemblies",
+    12: "Telomere detection and scoring",
+    13: "Build optimized telomere pool",
+    14: "QUAST for assembler comparison",
+    15: "Backbone selection and refinement",
+    16: "Final QC (BUSCO + Telomere + QUAST on final)",
+    17: "Final comparison report and cleanup",
+    18: "Assembly-only comparison and cleanup",
 }
 
 
@@ -112,14 +112,15 @@ def parse_args():
         args.merqury = True
     
     if args.assembly_only:
-        args.steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 18]
+        # Steps 0-12, 14, 18 (assemblers + normalize + BUSCO + telomere + QUAST + assembly-only report)
+        args.steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 18]
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
         except ValueError as e:
             parser.error(str(e))
     else:
-        args.steps = list(range(0, 18))
+        args.steps = list(range(0, 18))  # Steps 0-17 for full mode
     
     for s in args.steps:
         if s < 0 or s > 18:

@@ -855,9 +855,107 @@ def step_06_hifiasm(runner):
                         "Assembly may have failed or produced no output.")
 
 
-def step_07_normalize(runner):
-    """Step 7 - Copy and normalize all assemblies."""
-    runner.log("Step 7 - Copy all assemblies")
+def step_07_lja(runner):
+    """Step 7 - Assembly using LJA (non-fatal; HiFi only)."""
+    runner.log("Step 7 - Assembly of the genome using LJA")
+
+    if runner.platform != "pacbio-hifi":
+        _assembler_skip(runner, 7, "lja",
+                        "only supports PacBio HiFi reads")
+        return
+
+    if not shutil.which("lja"):
+        _assembler_skip(runner, 7, "lja",
+                        "binary not found. Install via: conda install -c bioconda lja")
+        return
+
+    os.makedirs("lja_out", exist_ok=True)
+    runner.log_version("lja", "lja")
+
+    cmd = (f"lja -o lja_out --reads {runner.fastq} "
+           f"-t {runner.threads} 2> lja_out/lja.log")
+    result = runner.run_cmd(cmd, desc="Running LJA", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 7: LJA failed. Skipping.")
+        return
+
+    # LJA output: lja_out/assembly.fasta
+    lja_fa = "lja_out/assembly.fasta"
+    if os.path.isfile(lja_fa) and os.path.getsize(lja_fa) > 0:
+        runner.log(f"LJA assembly: {lja_fa}")
+    else:
+        runner.log_warn("Step 7: LJA produced no output.")
+
+
+def step_08_mbg(runner):
+    """Step 8 - Assembly using MBG (non-fatal; HiFi only)."""
+    runner.log("Step 8 - Assembly of the genome using MBG")
+
+    if runner.platform != "pacbio-hifi":
+        _assembler_skip(runner, 8, "mbg",
+                        "only supports PacBio HiFi reads")
+        return
+
+    mbg_bin = shutil.which("MBG") or shutil.which("mbg")
+    if not mbg_bin:
+        _assembler_skip(runner, 8, "mbg",
+                        "binary not found. Build from source: "
+                        "git clone https://github.com/maickrau/MBG && cd MBG && make")
+        return
+
+    os.makedirs("mbg_out", exist_ok=True)
+    runner.log_version("mbg", mbg_bin)
+
+    cmd = (f"{mbg_bin} -i {runner.fastq} -o mbg_out/mbg.gfa "
+           f"-t {runner.threads} 2> mbg_out/mbg.log")
+    result = runner.run_cmd(cmd, desc="Running MBG", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 8: MBG failed. Skipping.")
+        return
+
+    # Convert GFA to FASTA
+    gfa_file = "mbg_out/mbg.gfa"
+    mbg_fa = "mbg_out/mbg.fasta"
+    if os.path.isfile(gfa_file) and os.path.getsize(gfa_file) > 0:
+        cmd = f"awk '/^S/{{print \">\"$2; print $3}}' {gfa_file} > {mbg_fa}"
+        runner.run_cmd(cmd, desc="Converting MBG GFA to FASTA", check=False)
+        if os.path.isfile(mbg_fa) and os.path.getsize(mbg_fa) > 0:
+            runner.log(f"MBG assembly: {mbg_fa}")
+        else:
+            runner.log_warn("Step 8: MBG GFA-to-FASTA conversion produced no output.")
+    else:
+        runner.log_warn("Step 8: MBG produced no GFA output.")
+
+
+def step_09_raven(runner):
+    """Step 9 - Assembly using Raven (non-fatal; all platforms)."""
+    runner.log("Step 9 - Assembly of the genome using Raven")
+
+    if not shutil.which("raven"):
+        _assembler_skip(runner, 9, "raven",
+                        "binary not found. Install via: conda install -c bioconda raven-assembler")
+        return
+
+    os.makedirs("raven_out", exist_ok=True)
+    runner.log_version("raven", "raven")
+
+    cmd = (f"raven -t {runner.threads} {runner.fastq} "
+           f"> raven_out/raven.fasta 2> raven_out/raven.log")
+    result = runner.run_cmd(cmd, desc="Running Raven", check=False)
+    if result.returncode != 0:
+        runner.log_warn("Step 9: Raven failed. Skipping.")
+        return
+
+    raven_fa = "raven_out/raven.fasta"
+    if os.path.isfile(raven_fa) and os.path.getsize(raven_fa) > 0:
+        runner.log(f"Raven assembly: {raven_fa}")
+    else:
+        runner.log_warn("Step 9: Raven produced no output.")
+
+
+def step_10_normalize(runner):
+    """Step 10 - Copy and normalize all assemblies."""
+    runner.log("Step 10 - Copy and normalize all assemblies")
     os.makedirs("assemblies", exist_ok=True)
 
     assembler_paths = [
@@ -867,6 +965,9 @@ def step_07_normalize(runner):
         ("ipa", "./ipa/assembly-results/final.p_ctg.fasta"),
         ("flye", "./flye/assembly.fasta"),
         ("hifiasm", "./hifiasm/hifiasm.fasta"),
+        ("lja", "./lja_out/assembly.fasta"),
+        ("mbg", "./mbg_out/mbg.fasta"),
+        ("raven", "./raven_out/raven.fasta"),
     ]
 
     for prefix, src_path in assembler_paths:
@@ -5308,24 +5409,72 @@ def step_18_assembly_only(runner):
     runner.log("Wrote assemblies/assembly_info.csv")
 
 
+def step_16_final_qc(runner):
+    """Step 16 - Final QC: BUSCO + Telomere + QUAST on final assembly."""
+    runner.log("Step 16 - Final QC (BUSCO + Telomere + QUAST on final assembly)")
+    step_13_busco_final(runner)
+    step_14_telomere_final(runner)
+    step_15_quast_final(runner)
+
+
+def step_17_report_cleanup(runner):
+    """Step 17 - Final comparison report + cleanup."""
+    runner.log("Step 17 - Final comparison report and cleanup")
+    step_16_final_report(runner)
+    step_17_cleanup(runner)
+
+
+def step_18_assembly_only_full(runner):
+    """Step 18 - Assembly-only comparison summary with cleanup.
+
+    Runs Merqury (if enabled), builds the unified comparison table,
+    and cleans up into final_results/.
+    """
+    runner.log("Step 18 - Assembly-only comparison and cleanup")
+    step_18_assembly_only(runner)
+    # Cleanup for assembly-only mode
+    os.makedirs("final_results", exist_ok=True)
+    for src in ["assemblies/assembly_info.csv",
+                "assemblies/assembly.busco.csv",
+                "assemblies/assembly.quast.csv",
+                "assemblies/assembly.telo.csv",
+                "assemblies/assembly.merqury.csv"]:
+        if os.path.isfile(src):
+            dst = os.path.join("final_results", os.path.basename(src))
+            try:
+                if os.path.isfile(dst):
+                    os.remove(dst)
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+    runner.log("Assembly-only results in final_results/")
+
+
 STEP_FUNCTIONS = {
-    0: step_00_input_qc,
-    1: step_01_canu,
-    2: step_02_nextdenovo,
-    3: step_03_peregrine,
-    4: step_04_ipa,
-    5: step_05_flye,
-    6: step_06_hifiasm,
-    7: step_07_normalize,
-    8: step_08_busco,
-    9: step_09_telomere,
-    10: step_10_telomere_pool,
-    11: step_11_quast,
-    12: step_12_refine,
-    13: step_13_busco_final,
-    14: step_14_telomere_final,
-    15: step_15_quast_final,
-    16: step_16_final_report,
-    17: step_17_cleanup,
-    18: step_18_assembly_only,
+    0: step_00_input_qc,           # Input QC and validation
+    # ---- Assemblers (Steps 1-9) ----
+    1: step_01_canu,               # HiCanu assembly
+    2: step_02_nextdenovo,         # NextDenovo assembly
+    3: step_03_peregrine,          # Peregrine assembly
+    4: step_04_ipa,                # IPA assembly
+    5: step_05_flye,               # Flye assembly
+    6: step_06_hifiasm,            # Hifiasm assembly
+    7: step_07_lja,                # LJA assembly
+    8: step_08_mbg,                # MBG assembly
+    9: step_09_raven,              # Raven assembly
+    # ---- Normalize + Pre-comparison QC (Steps 10-12) ----
+    10: step_10_normalize,         # Copy, normalize, FASTA rename
+    11: step_08_busco,             # BUSCO on all assemblies
+    12: step_09_telomere,          # Telomere detection on all assemblies
+    # ---- Telomere pool + comparison (Steps 13-14) ----
+    13: step_10_telomere_pool,     # Build telomere contig pool
+    14: step_11_quast,             # QUAST comparison
+    # ---- Backbone refinement (Step 15) ----
+    15: step_12_refine,            # Backbone selection + refinement
+    # ---- Final QC (Step 16) ----
+    16: step_16_final_qc,          # BUSCO + Telomere + QUAST on final
+    # ---- Report + Cleanup (Step 17) ----
+    17: step_17_report_cleanup,    # Final report + cleanup
+    # ---- Assembly-only mode (Step 18) ----
+    18: step_18_assembly_only_full,  # Assembly-only comparison + cleanup
 }

@@ -49,9 +49,9 @@ TACO supports three sequencing platforms via the `--platform` flag:
 
 | Platform | Flag | Assemblers Used |
 |----------|------|-----------------|
-| PacBio HiFi | `--platform pacbio-hifi` (default) | canu, nextDenovo, flye, hifiasm, peregrine, ipa, lja, mbg, raven |
-| Oxford Nanopore | `--platform nanopore` | canu, nextDenovo, flye, hifiasm (UL mode), raven |
-| PacBio CLR | `--platform pacbio` | canu, nextDenovo, flye, peregrine, raven |
+| PacBio HiFi | `--platform pacbio-hifi` (default) | canu, nextDenovo, flye, hifiasm, peregrine, ipa, lja, mbg, raven (up to 9) |
+| Oxford Nanopore | `--platform nanopore` | canu, nextDenovo, flye, raven (4 assemblers) |
+| PacBio CLR | `--platform pacbio` | canu, nextDenovo, flye, peregrine, raven (5 assemblers) |
 
 Incompatible or missing assemblers are automatically skipped with a warning.
 
@@ -71,20 +71,25 @@ Override the BUSCO lineage with `--busco <lineage_name>` if your organism needs 
 
 ## Running TACO
 
+TACO runs 19 steps (0-18). Step 0 (Input QC) always runs first — it validates the FASTQ, estimates coverage, and logs compatible assemblers. In full mode (Steps 0-17), TACO assembles, benchmarks, selects a backbone, refines it, and produces a final assembly. In assembly-only mode (Steps 0-12, 14, 18), TACO benchmarks all assemblers without refinement.
+
 ```bash
 mkdir -p my_project && cd my_project
 
-# Fungal genome (HiFi reads)
+# Full refinement: fungal genome (HiFi reads)
 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal
 
-# Plant genome (HiFi reads)
+# Full refinement: plant genome (HiFi reads)
 taco -g 500m -t 32 --fastq /path/to/reads.fastq.gz --taxon plant
 
-# Vertebrate genome (ONT reads)
+# Full refinement: vertebrate genome (ONT reads)
 taco -g 2.5g -t 32 --fastq /path/to/reads.fastq.gz --taxon vertebrate --platform nanopore
 
-# Assembly-only comparison (no refinement)
+# Assembly-only comparison (benchmarking only, no refinement)
 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --assembly-only
+
+# Resume from a specific step (e.g., rerun from refinement)
+taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal -s 15-17
 ```
 
 **Alternative (without pip install):** Use the shell wrapper which sets PYTHONPATH automatically:
