@@ -356,7 +356,8 @@ Backbone contigs are preserved by default to maintain BUSCO completeness — pur
 8. **12H** — purge_dups: taxon-aware haplotig/duplicate purging (skip with `--no-purge-dups`).
 9. **12I** — automatic polishing: NextPolish2 for HiFi (k-mer-based via yak; skip with `--no-polish`), Medaka for ONT (Racon fallback), Racon for CLR.
 10. **12J** — telomere-aware genome-size pruning: only non-telomeric contigs are removed when assembly exceeds the size budget. Telomere-bearing contigs are never pruned.
-11. **12K** — final assembly coverage QC: maps HiFi reads to the final assembly, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv` (per-contig stats) and `weak_regions.tsv` (per-window flags: ZERO_GAP, VERY_LOW, LOW, MIXED_LOW with coordinates). Weak spots may indicate misjoins, collapsed repeats, or chimeric regions. Configure with `COV_QC_WINDOW` and `COV_QC_LOW`.
+11. **12K** — final assembly coverage QC: maps HiFi reads to the final assembly, computes sliding-window coverage (default 5 kb), and flags zero-coverage gaps, very-low-coverage regions, and sudden coverage drops. Outputs `coverage_summary.tsv`, `weak_regions.tsv`, and `weak_regions.gff3` (loadable in IGV).
+12. **12L** — "do no harm" safety comparison: compares final assembly vs original backbone for size, telomere count, and genome size deviation. If refinement degraded quality, both assemblies are preserved with a `refinement_warning.txt` explaining the issues.
 
 ### BUSCO Trial Validation
 
@@ -409,6 +410,8 @@ project_directory/
 │   ├── single_tel.replaced.debug.tsv    # All rescue alignment hits
 │   ├── single_tel.candidates.tsv        # Plausible rescue candidates
 │   ├── rescue_rejection_summary.txt     # Rejection reasons
+│   ├── quickmerge_validation.tsv       # Quickmerge structural validation decisions
+│   ├── telomere_pool_decisions.tsv     # Per-contig pool classification decisions
 │   ├── rescue_trial_summary.tsv         # BUSCO trial results (with replacement_class, D%)
 │   ├── final_merge.raw.fasta            # Pre-purge combined assembly
 │   └── *.busco/                         # BUSCO results per assembly
@@ -420,6 +423,8 @@ project_directory/
 │   ├── coverage_summary.tsv             # Per-contig coverage stats (median, mean, zero/low bp)
 │   ├── weak_regions.tsv                 # Flagged weak windows with coords, source assembler, flag
 │   ├── weak_regions.gff3                # GFF3 coverage warnings: load in IGV to see weak spots
+│   ├── {backbone}.backbone.original.fasta  # Original backbone (for do-no-harm comparison)
+│   ├── refinement_warning.txt           # Quality warnings if refinement degraded backbone
 │   └── assembly_only_result.csv         # Comparison summary (assembly-only)
 ├── telomere_pool/                       # Telomere pool intermediates
 ├── quast_results/                       # QUAST output

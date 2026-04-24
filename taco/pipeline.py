@@ -98,6 +98,7 @@ class PipelineRunner:
         # --merqury or --merqury-db.  Otherwise, auto-enable when merqury.sh
         # is on PATH and a .meryl directory is discoverable.
         self.merqury_db = getattr(args, 'merqury_db', None)
+        self.merqury_k = getattr(args, 'merqury_k', 21)
         self.merqury_build_db = False
         if getattr(args, 'no_merqury', False):
             self.merqury_enable = False

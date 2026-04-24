@@ -12,8 +12,10 @@ ASSEMBLER_PLATFORMS = {
     "peregrine": {"pacbio-hifi": True, "nanopore": False, "pacbio": True},
     "ipa": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
     "flye": {"pacbio-hifi": "--pacbio-hifi", "nanopore": "--nano-hq", "pacbio": "--pacbio-raw"},
-    "hifiasm": {"pacbio-hifi": True, "nanopore": "--ul", "pacbio": False},
-    # hifiasm: HiFi=native, ONT=hifiasm-UL mode (--ul flag), CLR=not supported
+    "hifiasm": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
+    # hifiasm: HiFi-only as primary input. ONT ultra-long reads can supplement
+    # HiFi via --ul flag but require HiFi as primary — use --enable-hifiasm-ul
+    # with paired HiFi+ONT data (not implemented in TACO auto-mode yet).
     "lja": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},
     # LJA (La Jolla Assembler): HiFi-only, produces very contiguous assemblies
     "mbg": {"pacbio-hifi": True, "nanopore": False, "pacbio": False},

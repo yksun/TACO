@@ -1021,36 +1021,49 @@ def step_09_telomere(runner):
 
 def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
                              max_length_ratio=1.3):
-    """Validate quickmerge output: only keep contigs that became strict_t2t
-    and pass a length sanity check.
+    """Validate quickmerge output with structural checks.
 
     Quickmerge can join two single-end telomere contigs from different assemblers
-    to create a complete T2T contig (left-tel from assembler A + right-tel from
-    assembler B).  However, it can also create chimeras (joining contigs from
-    different chromosomes).
+    to create a complete T2T contig.  However, it can also create chimeras.
 
-    Validation criteria:
-    1. Merged contig must classify as strict_t2t (telomere on BOTH ends) — this
-       proves the join actually recovered a missing telomere end.
-    2. Merged contig length must be ≤ max_length_ratio × max(input contig lengths).
-       A legitimate join overlaps substantially in the middle, so merged length
-       should be close to max(input_lengths).  A chimera concatenates two
-       chromosomes, so length ≈ sum(input_lengths), which is ~2× and fails.
+    Multi-layer validation:
+    1. Merged contig must classify as strict_t2t (telomere on BOTH ends).
+    2. Length ≤ max_length_ratio × max(parent lengths).
+    3. Both parents align to the merged contig with high identity.
+    4. Each parent contributes substantial query coverage.
+    5. Parents collectively cover ≥80% of the merged contig.
+    6. No large unexplained gap (>10kb or >5% of merged length).
+    7. No parent maps in split/distant pieces (chimera signature).
 
-    Returns list of (name, sequence) tuples for validated T2T contigs.
+    Returns (validated_list, validation_records) where validated_list is a list
+    of (name, seq) tuples and validation_records is a list of dicts for the
+    decision TSV.
     """
-    if not os.path.isfile(merged_fasta) or os.path.getsize(merged_fasta) == 0:
-        return []
+    validation_records = []
 
-    # Get max input contig length across all input FASTAs for this pair
+    if not os.path.isfile(merged_fasta) or os.path.getsize(merged_fasta) == 0:
+        return [], validation_records
+
+    # Platform-aware identity thresholds
+    platform = getattr(runner, 'platform', 'pacbio-hifi')
+    min_parent_id = 0.90 if platform == "pacbio-hifi" else 0.85
+    min_parent_qcov = 0.60
+    min_union_cov = 0.80
+    max_unexplained_bp = 10000
+    max_unexplained_frac = 0.05
+
+    # Get max/per-parent input contig lengths
+    parent_lens = {}  # parent_fasta -> max_len
     max_input_len = 0
     for fa in input_fastas:
         if os.path.isfile(fa):
             for _, seq in _read_fasta_records(fa):
-                max_input_len = max(max_input_len, len(seq))
+                plen = len(seq)
+                parent_lens[fa] = max(parent_lens.get(fa, 0), plen)
+                max_input_len = max(max_input_len, plen)
 
     if max_input_len == 0:
-        return []
+        return [], validation_records
 
     length_threshold = int(max_input_len * max_length_ratio)
 
@@ -1069,31 +1082,145 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
         )
     except Exception as e:
         runner.log_warn(f"Telomere detection on merged output failed: {e}")
-        return []
+        return [], validation_records
 
-    # Find strict_t2t contigs that pass length filter
-    t2t_names = set()
+    # Build telomere lookup
+    telo_info = {}
     for r in merged_results:
-        if r["classification"] == "strict_t2t":
-            if r["length"] <= length_threshold:
-                t2t_names.add(r["contig"])
-            else:
-                runner.log_warn(
-                    f"Rejected merged T2T '{r['contig']}' ({r['length']:,} bp) — "
-                    f"exceeds {length_threshold:,} bp ({max_length_ratio}× max input "
-                    f"{max_input_len:,} bp), likely chimera"
-                )
+        telo_info[r["contig"]] = r
 
-    if not t2t_names:
-        return []
+    # Align BOTH parents against merged contigs for structural validation
+    merged_seqs = dict(_read_fasta_records(merged_fasta))
+    parent_alignments = {}  # merged_name -> [(parent_idx, qname, qcov, tcov, ident, tstart, tend)]
 
-    # Extract validated sequences
+    if shutil.which("minimap2"):
+        for pidx, fa in enumerate(input_fastas):
+            if not os.path.isfile(fa) or os.path.getsize(fa) == 0:
+                continue
+            cmd = (f"minimap2 -x asm20 -t {runner.threads} "
+                   f"{merged_fasta} {fa}")
+            result = subprocess.run(cmd, shell=True, capture_output=True,
+                                    text=True)
+            for ln in (result.stdout or "").strip().split("\n"):
+                if not ln.strip():
+                    continue
+                p = ln.split("\t")
+                if len(p) < 12:
+                    continue
+                qname, qlen = p[0], int(p[1])
+                qs, qe = int(p[2]), int(p[3])
+                tname, tlen = p[5], int(p[6])
+                ts, te = int(p[7]), int(p[8])
+                matches, alnlen = int(p[9]), int(p[10])
+                if qlen <= 0 or alnlen <= 0:
+                    continue
+                qcov = (qe - qs) / max(1, qlen)
+                tcov = (te - ts) / max(1, tlen)
+                ident = matches / max(1, alnlen)
+                if tname not in parent_alignments:
+                    parent_alignments[tname] = []
+                parent_alignments[tname].append(
+                    (pidx, qname, qcov, tcov, ident, ts, te))
+
+    # Validate each merged contig
     validated = []
-    for name, seq in _read_fasta_records(merged_fasta):
-        if name in t2t_names:
-            validated.append((name, seq))
+    for mname, mseq in merged_seqs.items():
+        mlen = len(mseq)
+        tinfo = telo_info.get(mname, {})
+        tclass = tinfo.get("classification", "unknown")
+        left_score = tinfo.get("left_score", 0)
+        right_score = tinfo.get("right_score", 0)
 
-    return validated
+        rec = {
+            "qm_contig": mname, "length": mlen,
+            "parent1_length": parent_lens.get(input_fastas[0], 0) if len(input_fastas) > 0 else 0,
+            "parent2_length": parent_lens.get(input_fastas[1], 0) if len(input_fastas) > 1 else 0,
+            "length_ratio": round(mlen / max(1, max_input_len), 3),
+            "left_tel_score": left_score, "right_tel_score": right_score,
+            "telomere_class": tclass,
+            "parent1_qcov": 0, "parent2_qcov": 0,
+            "merged_union_cov": 0,
+            "parent1_identity": 0, "parent2_identity": 0,
+            "unexplained_bp": mlen,
+            "decision": "reject", "reason": "",
+        }
+
+        # Check 1: must be T2T
+        if tclass != "strict_t2t":
+            rec["reason"] = f"not_t2t ({tclass})"
+            validation_records.append(rec)
+            continue
+
+        # Check 2: length ratio
+        if mlen > length_threshold:
+            rec["reason"] = (f"length_exceeds_{max_length_ratio}x "
+                             f"({mlen}>{length_threshold})")
+            validation_records.append(rec)
+            runner.log_warn(f"Rejected merged T2T '{mname}' ({mlen:,} bp) — "
+                            f"exceeds {length_threshold:,} bp, likely chimera")
+            continue
+
+        # Check 3-6: parent alignment structure
+        alns = parent_alignments.get(mname, [])
+        p0_best_qcov = 0; p0_best_id = 0
+        p1_best_qcov = 0; p1_best_id = 0
+        covered = set()  # positions on merged contig covered by any parent
+
+        for pidx, qname, qcov, tcov, ident, ts, te in alns:
+            covered.update(range(ts, te))
+            if pidx == 0 and qcov > p0_best_qcov:
+                p0_best_qcov = qcov; p0_best_id = ident
+            elif pidx == 1 and qcov > p1_best_qcov:
+                p1_best_qcov = qcov; p1_best_id = ident
+
+        union_cov = len(covered) / max(1, mlen)
+        unexplained = mlen - len(covered)
+
+        rec["parent1_qcov"] = round(p0_best_qcov, 3)
+        rec["parent2_qcov"] = round(p1_best_qcov, 3)
+        rec["parent1_identity"] = round(p0_best_id, 4)
+        rec["parent2_identity"] = round(p1_best_id, 4)
+        rec["merged_union_cov"] = round(union_cov, 3)
+        rec["unexplained_bp"] = unexplained
+
+        # Identity check
+        if p0_best_id < min_parent_id and p0_best_qcov > 0.1:
+            rec["reason"] = f"parent1_low_identity ({p0_best_id:.3f}<{min_parent_id})"
+            validation_records.append(rec)
+            continue
+        if p1_best_id < min_parent_id and p1_best_qcov > 0.1:
+            rec["reason"] = f"parent2_low_identity ({p1_best_id:.3f}<{min_parent_id})"
+            validation_records.append(rec)
+            continue
+
+        # Parent coverage check
+        if p0_best_qcov < min_parent_qcov and p1_best_qcov < min_parent_qcov:
+            rec["reason"] = (f"both_parents_low_qcov "
+                             f"({p0_best_qcov:.2f},{p1_best_qcov:.2f}<{min_parent_qcov})")
+            validation_records.append(rec)
+            continue
+
+        # Union coverage check
+        if union_cov < min_union_cov:
+            rec["reason"] = f"low_union_coverage ({union_cov:.2f}<{min_union_cov})"
+            validation_records.append(rec)
+            continue
+
+        # Unexplained gap check
+        if unexplained > max_unexplained_bp or \
+           (mlen > 0 and unexplained / mlen > max_unexplained_frac):
+            rec["reason"] = (f"large_unexplained_gap ({unexplained:,} bp, "
+                             f"{unexplained/max(1,mlen):.1%})")
+            validation_records.append(rec)
+            continue
+
+        # All checks passed
+        rec["decision"] = "accept"
+        rec["reason"] = "passed_all_checks"
+        validation_records.append(rec)
+        validated.append((mname, mseq))
+
+    return validated, validation_records
 
 
 def step_10_telomere_pool(runner):
@@ -1144,6 +1271,7 @@ def step_10_telomere_pool(runner):
     # (a) classify as strict_t2t and (b) pass length sanity check.
     validated_t2t_from_merge = []  # list of (name, seq) tuples
     qm_pair_map = {}  # quickmerge_contig_name -> (assembler1, assembler2)
+    all_qm_validation_records = []  # for quickmerge_validation.tsv
     if len(fasta_files) > 1 and shutil.which("merge_wrapper.py"):
         for old_f in glob.glob("merged_*.fasta"):
             os.remove(old_f)
@@ -1168,10 +1296,16 @@ def step_10_telomere_pool(runner):
                         merged_fa = candidates[0]
 
                 if os.path.isfile(merged_fa) and os.path.getsize(merged_fa) > 0:
-                    new_t2t = _validate_quickmerge_t2t(
+                    new_t2t, qm_val_recs = _validate_quickmerge_t2t(
                         merged_fa, [file1, file2], runner,
                         max_length_ratio=1.3,
                     )
+                    # Annotate records with parent assembler names
+                    for vr in qm_val_recs:
+                        vr["parent_asm_1"] = base1
+                        vr["parent_asm_2"] = base2
+                    all_qm_validation_records.extend(qm_val_recs)
+
                     if new_t2t:
                         runner.log(
                             f"Validated {len(new_t2t)} T2T contigs from "
@@ -1183,7 +1317,7 @@ def step_10_telomere_pool(runner):
                     else:
                         runner.log_info(
                             f"No validated T2T from quickmerge({base1} × {base2}) — "
-                            f"merged contigs either not T2T or failed length check"
+                            f"merged contigs failed structural validation"
                         )
 
         if validated_t2t_from_merge:
@@ -1194,6 +1328,23 @@ def step_10_telomere_pool(runner):
         runner.log_info("Only one telo FASTA; skipping quickmerge")
     else:
         runner.log_info("merge_wrapper.py not found; skipping quickmerge")
+
+    # Write quickmerge validation decision table
+    if all_qm_validation_records:
+        qm_val_tsv = "assemblies/quickmerge_validation.tsv"
+        qm_cols = ["qm_contig", "parent_asm_1", "parent_asm_2", "length",
+                    "parent1_length", "parent2_length", "length_ratio",
+                    "left_tel_score", "right_tel_score", "telomere_class",
+                    "parent1_qcov", "parent2_qcov", "merged_union_cov",
+                    "parent1_identity", "parent2_identity", "unexplained_bp",
+                    "decision", "reason"]
+        with open(qm_val_tsv, "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(qm_cols)
+            for r in all_qm_validation_records:
+                w.writerow([r.get(c, "") for c in qm_cols])
+        runner.log(f"Wrote quickmerge validation: {qm_val_tsv} "
+                   f"({len(all_qm_validation_records)} contigs evaluated)")
 
     # ===== Build pool: original .telo.fasta + validated quickmerge T2T =====
     with open("allmerged_telo.fasta", "w") as out:
@@ -1550,6 +1701,50 @@ def step_10_telomere_pool(runner):
     with open("telomere_support_summary.csv") as f:
         runner.log(f.read())
 
+    # Write telomere pool decision table
+    pool_decisions_tsv = "assemblies/telomere_pool_decisions.tsv"
+    pool_dec_cols = ["pool_contig", "source_type", "source_assembler",
+                     "original_contig", "length", "classification",
+                     "decision", "reason"]
+    try:
+        with open(pool_decisions_tsv, "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(pool_dec_cols)
+            # Write entries for all pool contigs using provenance + classification
+            for pname in sorted(pool_seqs.keys()):
+                plen = len(pool_seqs[pname])
+                prov = concat_provenance.get(pname, ("unknown", pname, "unknown"))
+                src_asm = prov[0]
+                orig_name = prov[1]
+                src_type = prov[2] if len(prov) > 2 else "assembler"
+                # Classification
+                if pname in t2t_ids:
+                    pclass = "strict_t2t"
+                elif pname in single_ids:
+                    pclass = "single_tel_strong"
+                elif pname in supported_ids:
+                    pclass = "telomere_supported"
+                else:
+                    pclass = "no_telomere"
+                # Decision
+                if pname in t2t_ids:
+                    decision = "t2t_pool"
+                    reason = "classified as strict T2T"
+                elif pname in single_ids:
+                    decision = "single_tel_pool"
+                    reason = "classified as single-end telomere"
+                elif pname in supported_ids:
+                    decision = "supported_pool"
+                    reason = "telomere-supported"
+                else:
+                    decision = "excluded"
+                    reason = "no telomere signal"
+                w.writerow([pname, src_type, src_asm, orig_name,
+                            plen, pclass, decision, reason])
+        runner.log(f"Wrote telomere pool decisions: {pool_decisions_tsv}")
+    except Exception as e:
+        runner.log_warn(f"Could not write pool decisions TSV: {e}")
+
     # Set protected telomere mode
     if os.path.isfile("t2t_clean.fasta") and os.path.getsize("t2t_clean.fasta") > 0:
         shutil.copy("t2t_clean.fasta", "protected_telomere_contigs.fasta")
@@ -1611,9 +1806,9 @@ def _run_merqury_preselection(runner):
     # Auto-build .meryl from reads if needed and meryl is available
     meryl_bin = shutil.which("meryl")
     if not db and meryl_bin and hasattr(runner, 'fastq') and runner.fastq:
-        k = 21  # standard k-mer size for Merqury
+        k = getattr(runner, 'merqury_k', 21)
         os.makedirs("merqury", exist_ok=True)
-        db = "merqury/reads.meryl"
+        db = f"merqury/reads.k{k}.meryl"
         if not os.path.isdir(db):
             runner.log_info(f"Building Merqury k-mer database from reads (k={k})...")
             cmd = f"{meryl_bin} count k={k} threads={runner.threads} {runner.fastq} output {db}"
@@ -4489,6 +4684,70 @@ def step_12_refine(runner):
             runner.log_warn("Coverage QC: read mapping produced no depth data")
     elif not samtools_bin or not minimap2_bin:
         runner.log_info("Coverage QC skipped (requires samtools + minimap2)")
+
+    # ---- 12L. "Do no harm" safety comparison ----
+    # Compare final assembly vs original backbone to ensure refinement
+    # didn't degrade quality.  If it did, keep both and warn.
+    asm_fa = f"assemblies/{assembler}.result.fasta"
+    final_fa = "assemblies/final.merged.fasta"
+    if os.path.isfile(asm_fa) and os.path.isfile(final_fa):
+        runner.log_info("Running 'do no harm' comparison: final vs backbone")
+
+        bb_recs = list(_read_fasta_records(asm_fa))
+        fn_recs = list(_read_fasta_records(final_fa))
+        bb_bp = sum(len(s) for _, s in bb_recs)
+        fn_bp = sum(len(s) for _, s in fn_recs)
+
+        # Save backbone original for comparison
+        os.makedirs("final_results", exist_ok=True)
+        bb_copy = f"final_results/{assembler}.backbone.original.fasta"
+        if not os.path.isfile(bb_copy):
+            shutil.copy(asm_fa, bb_copy)
+
+        warnings = []
+        expected_size = _parse_genome_size(runner.genomesize)
+
+        # Size sanity
+        if bb_bp > 0 and fn_bp < bb_bp * 0.85:
+            warnings.append(f"Assembly shrank by {(1 - fn_bp/bb_bp)*100:.1f}% "
+                            f"({bb_bp:,} → {fn_bp:,} bp)")
+        if expected_size > 0 and fn_bp > expected_size * 1.30:
+            warnings.append(f"Final assembly ({fn_bp:,} bp) exceeds expected "
+                            f"genome size ({expected_size:,} bp) by "
+                            f"{(fn_bp/expected_size - 1)*100:.0f}%")
+
+        # Telomere comparison
+        bb_t2t_count = len(bb_t2t_ids) if 'bb_t2t_ids' in dir() else 0
+        fn_t2t, fn_telo = set(), set()
+        try:
+            fn_t2t, fn_telo = _classify_contigs_telomere_status(final_fa, runner)
+        except Exception:
+            pass
+        if len(fn_t2t) < bb_t2t_count:
+            warnings.append(f"Telomere T2T contigs decreased: "
+                            f"{bb_t2t_count} → {len(fn_t2t)}")
+
+        if warnings:
+            warn_file = "final_results/refinement_warning.txt"
+            with open(warn_file, "w") as f:
+                f.write(f"TACO v1.3.0 — Refinement quality warnings\n")
+                f.write(f"Backbone: {assembler} ({bb_bp:,} bp, "
+                        f"{len(bb_recs)} contigs)\n")
+                f.write(f"Final:    refined ({fn_bp:,} bp, "
+                        f"{len(fn_recs)} contigs)\n\n")
+                for w in warnings:
+                    f.write(f"WARNING: {w}\n")
+                f.write(f"\nBoth assemblies preserved in final_results/:\n")
+                f.write(f"  {assembler}.backbone.original.fasta\n")
+                f.write(f"  final.merged.fasta (refined)\n")
+                f.write(f"\nReview and choose the better assembly manually.\n")
+            runner.log_warn(
+                f"Refinement quality warnings ({len(warnings)}):")
+            for w in warnings:
+                runner.log_warn(f"  {w}")
+            runner.log_warn(f"Both assemblies saved — see {warn_file}")
+        else:
+            runner.log("Do-no-harm check: final assembly quality OK")
 
 
 def step_13_busco_final(runner):

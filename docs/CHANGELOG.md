@@ -14,9 +14,14 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 
 ### Architecture and platform changes
 
-- **Fixed** hifiasm platform compatibility: HiFi = native, ONT = hifiasm-UL
-  mode (`--ul` flag), CLR = disabled.  Previous versions incorrectly marked
-  hifiasm as compatible with all platforms.
+- **Fixed** hifiasm platform compatibility: HiFi-only as primary input.
+  ONT ultra-long reads can supplement HiFi via `--ul` but require HiFi as
+  primary — not auto-enabled.  CLR disabled.
+- **New** assemblers: LJA (La Jolla Assembler, HiFi-only) and raven (all
+  platforms) added to default comparison.  MBG available as manual install.
+- **New** Step 0 — Input QC: validates FASTQ exists, estimates coverage,
+  warns for low coverage per-platform (HiFi <25×, ONT <40×, CLR <50×),
+  logs compatible assemblers.
 - **New** taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota_odb10,
   `--taxon plant` → embryophyta_odb10, `--taxon vertebrate` → vertebrata_odb10,
   `--taxon insect` → insecta_odb10, `--taxon other` → requires explicit `--busco`.
@@ -30,8 +35,16 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   size_deviation_penalty.  Insect weights added.  Size deviation penalty
   discourages assemblies far from expected genome size.
 - **Improved** replacement safety: candidates must pass sufficient target
-  coverage, query coverage, BUSCO validation (C/D/M), Merqury completeness
-  check, size sanity, and read coverage support before replacing backbone.
+  coverage, query coverage, BUSCO validation (C/D/M), size sanity, and
+  read coverage support before replacing backbone.
+- **New** Step 10 quickmerge structural validation: parent alignment identity,
+  query coverage, union coverage, unexplained gap check.  Decision table
+  written to `quickmerge_validation.tsv` and `telomere_pool_decisions.tsv`.
+- **New** `--merqury-k` flag for configurable Merqury k-mer size (default 21).
+  Auto-build names database `reads.k{K}.meryl`.
+- **New** Step 12L "do no harm" comparison: after refinement, compares final
+  vs backbone for size, telomere count, and genome size deviation.  If quality
+  degraded, saves both assemblies + `refinement_warning.txt`.
 
 ### Key changes
 
