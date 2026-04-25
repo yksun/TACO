@@ -39,7 +39,7 @@ The conda environment provides all external bioinformatics tools. The `pip insta
 
 **Polishing tools (via conda):** NextPolish2, yak, Racon, Medaka
 
-**QV scoring (via conda):** Merqury, Meryl (auto-enabled for all platforms when installed; builds reads.meryl from input reads. QV is most accurate with HiFi; ONT/CLR QV may underestimate but relative ranking and completeness remain useful)
+**QV scoring (via conda):** Merqury, Meryl (auto-enabled for all platforms when installed; builds a reads `.meryl` database from input reads with `--merqury-k auto` by default. QV is most accurate with PacBio HiFi or Illumina; ONT/CLR QV may underestimate true quality, and relative ranking/completeness should be interpreted cautiously)
 
 **Optional manual install:** MBG (Multiplex de Bruijn Graph, HiFi-only). Build from source: `git clone https://github.com/maickrau/MBG && cd MBG && make`. Place the `MBG` binary on PATH.
 
@@ -88,6 +88,12 @@ taco -g 2.5g -t 32 --fastq /path/to/reads.fastq.gz --taxon vertebrate --platform
 # Assembly-only comparison (benchmarking only, no refinement)
 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --assembly-only
 
+# Optional step timing/provenance logs
+taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --benchmark
+
+# Optional publication-grade input checksums with benchmark logs
+TACO_BENCHMARK_SHA256=1 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --benchmark
+
 # Resume from a specific step (e.g., rerun from refinement)
 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal -s 13-15
 ```
@@ -110,7 +116,7 @@ Run `pip install -e .` from the TACO repository directory, or use `./run_taco` i
 TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and run `pip install -e .` again.
 
 **Merqury not working:**
-Merqury is auto-enabled for all platforms when `merqury.sh` and `meryl` are installed. The reads.meryl database is built automatically from input reads. For Nanopore/CLR data, QV values may underestimate true quality (TACO logs a warning), but Merqury completeness and relative ranking across assemblers remain useful. Provide a pre-built database with `--merqury-db path/to/reads.meryl`. Disable with `--no-merqury`.
+Merqury is auto-enabled for all platforms when `merqury.sh` and `meryl` are installed. The reads `.meryl` database is built automatically from input reads. `--merqury-k auto` is the default and uses Merqury `best_k.sh` when available, with a genome-size fallback. For Nanopore/PacBio CLR data, QV values may underestimate true quality (TACO logs a warning), and Merqury completeness/relative ranking should be interpreted cautiously. Provide a pre-built database with `--merqury-db path/to/reads.meryl`. Disable with `--no-merqury`.
 
 **NextPolish2 requires samtools:**
 NextPolish2 v0.2+ needs a sorted BAM file. TACO maps reads with minimap2 and sorts with samtools. Ensure `samtools` is installed in the conda env.

@@ -1939,60 +1939,284 @@ def _run_merqury_preselection(runner):
     If no .meryl database exists but meryl is installed, builds one from
     the input reads automatically.
     """
-    db = runner.merqury_db
-    if not db:
-        for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
-            if os.path.isdir(cand):
-                db = cand
-                break
-
-    # Auto-build .meryl from reads if needed and meryl is available
-    meryl_bin = shutil.which("meryl")
-    if not db and meryl_bin and hasattr(runner, 'fastq') and runner.fastq:
-        k_val = getattr(runner, 'merqury_k', 21)
-        if k_val == "auto":
-            # Use meryl's recommended k based on genome size
-            expected = _parse_genome_size(runner.genomesize)
-            if expected > 0:
-                import math as _math
-                k_val = max(17, min(31, int(_math.log(expected * 3) / _math.log(4))))
-            else:
-                k_val = 21
-            runner.log_info(f"Merqury auto k-mer size: {k_val}")
-        k = int(k_val)
-        os.makedirs("merqury", exist_ok=True)
-        db = f"merqury/reads.k{k}.meryl"
-        if not os.path.isdir(db):
-            runner.log_info(f"Building Merqury k-mer database from reads (k={k})...")
-            cmd = f"{meryl_bin} count k={k} threads={runner.threads} {runner.fastq} output {db}"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            if result.returncode != 0 or not os.path.isdir(db):
-                runner.log_warn(f"meryl count failed: {(result.stderr or '').strip()[:200]}")
-                db = None
-            else:
-                runner.log(f"Built {db}")
-                runner.merqury_db = db
-        else:
-            runner.log(f"Reusing existing {db}")
-            runner.merqury_db = db
-
+    db = _ensure_merqury_db(runner)
     if db and os.path.isdir(db) and shutil.which("merqury.sh"):
         runner.log_info(f"Running Merqury pre-selection using database: {db}")
         runner.log_version("merqury.sh", "merqury.sh")
 
-        assemblers = ["canu", "reference", "flye", "ipa", "nextDenovo",
-                      "peregrine", "hifiasm", "lja", "mbg", "raven"]
-        for asm in assemblers:
+        for asm in ALL_ASSEMBLERS:
             asm_fa = f"assemblies/{asm}.result.fasta"
             if not os.path.isfile(asm_fa) or os.path.getsize(asm_fa) == 0:
                 continue
-            qv_file = os.path.join("merqury", f"{asm}.qv")
-            comp_file = os.path.join("merqury", f"{asm}.completeness.stats")
-            if not os.path.isfile(qv_file) or not os.path.isfile(comp_file):
-                cmd = f"merqury.sh {db} {asm_fa} merqury/{asm}"
-                runner.run_cmd(cmd, desc=f"Merqury on {asm}", check=False)
+            _run_merqury_for_assembly(runner, db, asm_fa, f"merqury/{asm}", asm)
     else:
         runner.log_warn("Merqury requested but merqury.sh or a valid .meryl database was not found; skipping.")
+
+
+def _find_existing_merqury_db(runner):
+    """Return an existing Merqury .meryl database path, if one is available."""
+    db = getattr(runner, 'merqury_db', None)
+    if db:
+        if os.path.isdir(db):
+            return db
+        runner.log_warn(f"Merqury database not found or not a directory: {db}")
+        return None
+
+    candidates = (
+        ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"]
+        + sorted(glob.glob("merqury/reads.k*.meryl"))
+        + sorted(glob.glob("*.meryl"))
+    )
+    for cand in candidates:
+        if os.path.isdir(cand):
+            runner.merqury_db = cand
+            return cand
+    return None
+
+
+def _resolve_merqury_k(runner):
+    """Resolve the Merqury k-mer size from CLI/config defaults."""
+    k_val = getattr(runner, 'merqury_k', "auto")
+    if k_val == "auto":
+        expected = _parse_genome_size(getattr(runner, 'genomesize', None))
+        if expected <= 0:
+            runner.log_warn("Could not parse genome size for Merqury auto k; using k=21")
+            return 21
+
+        best_k = _merqury_best_k_from_tool(expected)
+        if best_k is None:
+            best_k = _merqury_best_k_formula(expected)
+            source = "genome-size formula"
+        else:
+            source = "best_k.sh"
+
+        k_val = _clamp_merqury_k(int(math.ceil(best_k)))
+        runner.log_info(f"Merqury auto k-mer size: {k_val} ({source})")
+        return k_val
+
+    try:
+        k = int(k_val)
+        if k < 6 or k > 64:
+            runner.log_warn(f"Merqury k-mer size '{k}' outside meryl range 6-64; using k=21")
+            return 21
+        return k
+    except (TypeError, ValueError):
+        runner.log_warn(f"Invalid Merqury k-mer size '{k_val}'; using k=21")
+        return 21
+
+
+def _clamp_merqury_k(k):
+    """Keep automatic Merqury k in a practical range for broad eukaryotic use."""
+    return max(17, min(31, k))
+
+
+def _merqury_best_k_formula(genome_size):
+    """Fallback to Merqury's published best-k formula.
+
+    Merqury's best_k.sh uses p=0.001 by default:
+    k = log_4(G * (1 - p) / p)
+    """
+    try:
+        collision_rate = float(os.environ.get("MERQURY_COLLISION_RATE", "0.001"))
+    except ValueError:
+        collision_rate = 0.001
+    if collision_rate <= 0 or collision_rate >= 1:
+        collision_rate = 0.001
+    return math.log(genome_size * ((1.0 - collision_rate) / collision_rate), 4)
+
+
+def _merqury_best_k_candidates():
+    """Return possible locations for Merqury's best_k.sh helper."""
+    candidates = []
+    on_path = shutil.which("best_k.sh")
+    if on_path:
+        candidates.append(on_path)
+
+    merqury_home = os.environ.get("MERQURY")
+    if merqury_home:
+        candidates.append(os.path.join(merqury_home, "best_k.sh"))
+
+    merqury_bin = shutil.which("merqury.sh")
+    if merqury_bin:
+        candidates.append(os.path.join(os.path.dirname(os.path.realpath(merqury_bin)),
+                                       "best_k.sh"))
+
+    seen = set()
+    out = []
+    for cand in candidates:
+        if cand and cand not in seen and os.path.isfile(cand):
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+def _merqury_best_k_from_tool(genome_size):
+    """Ask Merqury best_k.sh for the recommended minimum k, if available."""
+    collision_rate = os.environ.get("MERQURY_COLLISION_RATE", "0.001")
+    for best_k_script in _merqury_best_k_candidates():
+        try:
+            result = subprocess.run(
+                ["bash", best_k_script, str(int(genome_size)), str(collision_rate)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+
+        explicit_k_values = []
+        standalone_values = []
+        hinted_values = []
+        for line in ((result.stdout or "") + "\n" + (result.stderr or "")).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            k_match = re.search(r'(?i)\bk\s*=\s*([0-9]+(?:\.[0-9]+)?)', line)
+            if k_match:
+                explicit_k_values.append(float(k_match.group(1)))
+                continue
+
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', line):
+                standalone_values.append(float(line))
+                continue
+
+            if re.search(r'(?i)(best|k-mer|kmer|k size|k-size)', line):
+                nums = re.findall(r'[0-9]+(?:\.[0-9]+)?', line)
+                if nums:
+                    hinted_values.append(float(nums[-1]))
+
+        if explicit_k_values:
+            return explicit_k_values[-1]
+        if standalone_values:
+            return standalone_values[-1]
+        if hinted_values:
+            return hinted_values[-1]
+    return None
+
+
+def _ensure_merqury_db(runner):
+    """Find or build the read .meryl database used by Merqury."""
+    db = _find_existing_merqury_db(runner)
+    if db:
+        return db
+    if getattr(runner, 'merqury_db', None):
+        return None
+
+    meryl_bin = shutil.which("meryl")
+    fastq = getattr(runner, 'fastq', None)
+    if not meryl_bin or not fastq:
+        return None
+
+    k = _resolve_merqury_k(runner)
+    os.makedirs("merqury", exist_ok=True)
+    db = f"merqury/reads.k{k}.meryl"
+    if os.path.isdir(db):
+        runner.log(f"Reusing existing {db}")
+        runner.merqury_db = db
+        return db
+
+    runner.log_info(f"Building Merqury k-mer database from reads (k={k})...")
+    cmd = [
+        meryl_bin, "count", f"k={k}", f"threads={runner.threads}",
+        "output", db, fastq,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.isdir(db):
+        msg = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+        runner.log_warn(f"meryl count failed: {msg[:400]}")
+        return None
+
+    runner.log(f"Built {db}")
+    runner.merqury_db = db
+    return db
+
+
+def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
+    """Run Merqury unless the expected QV and completeness files already exist."""
+    qv_file = f"{out_prefix}.qv"
+    comp_file = f"{out_prefix}.completeness.stats"
+    qv_ready = os.path.isfile(qv_file) and os.path.getsize(qv_file) > 0
+    comp_ready = os.path.isfile(comp_file) and os.path.getsize(comp_file) > 0
+    if qv_ready and comp_ready:
+        runner.log_info(f"Merqury output exists for {label}; reusing")
+        return
+
+    merqury_bin = shutil.which("merqury.sh")
+    if not merqury_bin:
+        runner.log_warn("merqury.sh not found; skipping Merqury")
+        return
+
+    cmd = [merqury_bin, db, asm_fa, out_prefix]
+    result = runner.run_cmd(cmd, desc=f"Merqury on {label}", check=False)
+    if result.returncode != 0:
+        runner.log_warn(f"Merqury failed for {label} (exit {result.returncode})")
+
+
+def _parse_merqury_number(value):
+    """Parse a numeric Merqury token, tolerating percent signs and NA values."""
+    if value is None:
+        return None
+    cleaned = value.strip().rstrip("%")
+    if cleaned.lower() in ("", "na", "nan"):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _format_merqury_number(value):
+    """Return a stable string representation for Merqury CSV metrics."""
+    if value is None:
+        return ""
+    return f"{value:g}"
+
+
+def _parse_merqury_qv(path):
+    """Parse Merqury .qv files: assembly, asm-only kmers, total kmers, QV, error."""
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) >= 4:
+                value = _parse_merqury_number(parts[3])
+                if value is not None:
+                    return _format_merqury_number(value)
+            m = re.search(r'(?i)\bqv\b[^0-9.+-]*([0-9]+(?:\.[0-9]+)?)', line)
+            if m:
+                return _format_merqury_number(_parse_merqury_number(m.group(1)))
+    return ""
+
+
+def _parse_merqury_completeness(path):
+    """Parse Merqury .completeness.stats files and prefer the 'all' row."""
+    if not os.path.exists(path):
+        return ""
+
+    fallback = None
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) >= 5:
+                value = _parse_merqury_number(parts[4])
+                if value is not None:
+                    if len(parts) > 1 and parts[1].lower() == "all":
+                        return _format_merqury_number(value)
+                    if fallback is None:
+                        fallback = value
+            m = re.search(r'(?i)completeness[^0-9.+-]*([0-9]+(?:\.[0-9]+)?)', line)
+            if m and fallback is None:
+                fallback = _parse_merqury_number(m.group(1))
+
+    return _format_merqury_number(fallback)
 
 
 def _write_merqury_csv():
@@ -2000,21 +2224,9 @@ def _write_merqury_csv():
     assemblers = ALL_ASSEMBLERS
     rows = [["Metric"] + assemblers, ["Merqury QV"], ["Merqury completeness (%)"]]
 
-    def parse_first_float(path):
-        if not os.path.exists(path):
-            return ""
-        txt = open(path, "r", errors="ignore").read()
-        for pat in [r'(?i)qv[^0-9]*([0-9]+(?:\.[0-9]+)?)',
-                    r'(?i)completeness[^0-9]*([0-9]+(?:\.[0-9]+)?)',
-                    r'([0-9]+(?:\.[0-9]+)?)']:
-            m = re.search(pat, txt)
-            if m:
-                return m.group(1)
-        return ""
-
     for asm in assemblers:
-        rows[1].append(parse_first_float(os.path.join("merqury", f"{asm}.qv")))
-        rows[2].append(parse_first_float(os.path.join("merqury", f"{asm}.completeness.stats")))
+        rows[1].append(_parse_merqury_qv(os.path.join("merqury", f"{asm}.qv")))
+        rows[2].append(_parse_merqury_completeness(os.path.join("merqury", f"{asm}.completeness.stats")))
 
     with open("assemblies/assembly.merqury.csv", "w", newline="") as f:
         csv.writer(f).writerows(rows)
@@ -2457,7 +2669,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
     lines = ["##gff-version 3"]
     lines.append(f"# TACO provenance annotation for {os.path.basename(final_fa)}")
     lines.append(f"# Backbone assembler: {backbone_assembler}")
-    lines.append(f"# Generated by TACO v1.3.0")
+    lines.append(f"# Generated by TACO v1.3.1")
     lines.append(f"# Columns: seqid source type start end score strand phase attributes")
     lines.append("#")
 
@@ -3365,7 +3577,7 @@ def _run_polishing(runner, input_fa, output_fa):
 def step_12_refine(runner):
     """Step 13 - backbone-first telomere-aware refinement with BUSCO trial validation.
 
-    v1.3.0 workflow — two-tier confidence model:
+    v1.3.1 workflow — two-tier confidence model:
 
     TIER 1 (immutable): protected strict-T2T contigs from the merged pool.
       These are NEVER replaced or displaced by rescue candidates unless the
@@ -3397,7 +3609,7 @@ def step_12_refine(runner):
       13I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       13J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 13 - Telomere-aware backbone refinement (v1.3.0)")
+    runner.log("Step 13 - Telomere-aware backbone refinement (v1.3.1)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -3407,8 +3619,8 @@ def step_12_refine(runner):
         runner.log_info(f"Merqury enabled (db: {db_src})")
         _run_merqury_preselection(runner)
     else:
-        runner.log_info("Merqury scoring not available (install merqury + provide .meryl db, "
-                        "or use --merqury/--merqury-db to enable)")
+        runner.log_info("Merqury scoring not available (install merqury.sh + meryl, "
+                        "or use --merqury-db to provide a reads .meryl database)")
 
     _write_merqury_csv()
     _build_assembly_info(runner)
@@ -3558,7 +3770,7 @@ def step_12_refine(runner):
                        f"cross-assembly mapping OK)")
 
     # ====================================================================
-    # BACKBONE-FIRST STRATEGY (v1.3.0)
+    # BACKBONE-FIRST STRATEGY (v1.3.1)
     #
     # The backbone assembler was selected for the highest composite quality
     # score (BUSCO S, T2T count, N50, contiguity).  Its contigs carry the
@@ -4935,7 +5147,7 @@ def step_12_refine(runner):
         if warnings:
             warn_file = "final_results/refinement_warning.txt"
             with open(warn_file, "w") as f:
-                f.write(f"TACO v1.3.0 — Refinement quality warnings\n")
+                f.write(f"TACO v1.3.1 — Refinement quality warnings\n")
                 f.write(f"Backbone: {assembler} ({bb_bp:,} bp, "
                         f"{len(bb_recs)} contigs)\n")
                 f.write(f"Final:    refined ({fn_bp:,} bp, "
@@ -5197,47 +5409,21 @@ def _final_quast_qc(runner):
 def _final_comparison_report(runner):
     """Generate final comparison report.
 
-    Runs Merqury on final assembly (if enabled), then combines per-assembler
-    metrics (assembly_info.csv) with final-merged metrics into
+    Ensures final Merqury metrics exist (if enabled), then combines
+    per-assembler metrics (assembly_info.csv) with final-merged metrics into
     final_results/final_result.csv.
     """
     runner.log("Final report - Final assembly comparison")
     os.makedirs("final_results", exist_ok=True)
     os.makedirs("merqury", exist_ok=True)
 
-    # ---- Run Merqury on final assembly ----
-    if runner.merqury_enable:
-        db = runner.merqury_db
-        if not db:
-            for cand in ["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"] + glob.glob("*.meryl"):
-                if os.path.isdir(cand):
-                    db = cand
-                    break
-        if db and os.path.isdir(db) and shutil.which("merqury.sh"):
-            runner.log_info("Running Merqury on final assembly")
-            runner.log_version("merqury.sh", "merqury.sh")
-            cmd = f"merqury.sh {db} assemblies/final.merged.fasta merqury/final"
-            runner.run_cmd(cmd, desc="Merqury on final assembly", check=False)
-        else:
-            runner.log_warn("Merqury requested for final assembly but merqury.sh or .meryl database was not found; skipping.")
-    else:
-        runner.log_info("Merqury disabled for final assembly comparison")
+    # Step 14 normally runs final Merqury.  This call is idempotent so Step 15
+    # also works when run directly or after a partial resume.
+    _final_merqury_qc(runner)
 
     # Write merged Merqury CSV
-    def _parse_first_float(path):
-        if not os.path.exists(path):
-            return ""
-        txt = open(path, "r", errors="ignore").read()
-        for pat in [r'(?i)qv[^0-9]*([0-9]+(?:\.[0-9]+)?)',
-                    r'(?i)completeness[^0-9]*([0-9]+(?:\.[0-9]+)?)',
-                    r'([0-9]+(?:\.[0-9]+)?)']:
-            m = re.search(pat, txt)
-            if m:
-                return m.group(1)
-        return ""
-
-    qv = _parse_first_float("merqury/final.qv")
-    comp = _parse_first_float("merqury/final.completeness.stats")
+    qv = _parse_merqury_qv("merqury/final.qv")
+    comp = _parse_merqury_completeness("merqury/final.completeness.stats")
     with open("assemblies/merged.merqury.csv", "w", newline="") as f:
         csv.writer(f).writerows([
             ["Metric", "merged"],
@@ -5516,13 +5702,7 @@ def _final_merqury_qc(runner):
         runner.log_info("Merqury disabled for final assembly")
         return
 
-    db = runner.merqury_db
-    if not db:
-        for cand in (["reads.meryl", "meryl/reads.meryl", "merqury/reads.meryl"]
-                     + glob.glob("merqury/reads.k*.meryl") + glob.glob("*.meryl")):
-            if os.path.isdir(cand):
-                db = cand
-                break
+    db = _ensure_merqury_db(runner)
     if not db or not os.path.isdir(db) or not shutil.which("merqury.sh"):
         runner.log_warn("Merqury: no .meryl database or merqury.sh not found; "
                         "skipping final Merqury")
@@ -5530,11 +5710,12 @@ def _final_merqury_qc(runner):
 
     final_fa = "assemblies/final.merged.fasta"
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
+        runner.log_warn("Merqury: final assembly FASTA missing; skipping final Merqury")
         return
 
-    runner.log_info("Running Merqury on final assembly")
-    cmd = f"merqury.sh {db} {final_fa} merqury/final"
-    runner.run_cmd(cmd, desc="Merqury on final assembly", check=False)
+    runner.log_version("merqury.sh", "merqury.sh")
+    _run_merqury_for_assembly(runner, db, final_fa, "merqury/final",
+                              "final assembly")
 
 
 def step_14_final_qc(runner):
@@ -5598,7 +5779,7 @@ STEP_FUNCTIONS = {
     12: step_10_telomere_pool,     # Build telomere contig pool after QC comparison
     13: step_12_refine,            # Backbone selection + refinement
     # ---- Final QC + report (Steps 14-15) ----
-    14: step_14_final_qc,          # BUSCO + Telomere + QUAST on final
+    14: step_14_final_qc,          # BUSCO + Telomere + QUAST + Merqury on final
     15: step_15_report_cleanup,    # Final report + cleanup
     # ---- Assembly-only mode (Step 16) ----
     16: step_16_assembly_only_full,  # Assembly-only comparison + cleanup

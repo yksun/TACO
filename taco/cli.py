@@ -15,10 +15,10 @@ STEP_NAMES = {
     8: "MBG assembly",
     9: "Raven assembly",
     10: "Copy and normalize all assemblies",
-    11: "Assembly QC and comparison (BUSCO + telomere + QUAST)",
+    11: "Assembly QC and comparison (BUSCO + telomere + QUAST + Merqury)",
     12: "Build optimized telomere pool",
     13: "Backbone selection and refinement",
-    14: "Final QC (BUSCO + Telomere + QUAST on final)",
+    14: "Final QC (BUSCO + Telomere + QUAST + Merqury on final)",
     15: "Final comparison report and cleanup",
     16: "Assembly-only comparison and cleanup",
 }
@@ -58,7 +58,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.0 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.1 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -78,20 +78,24 @@ def parse_args():
     parser.add_argument('--auto-mode', choices=['smart', 'n50'], default='smart')
     parser.add_argument('--choose', nargs='?', const='__prompt__')
     parser.add_argument('--busco', type=str, help='BUSCO lineage database (e.g., ascomycota_odb10); if not provided, defaults based on --taxon')
-    parser.add_argument('--merqury', action='store_true')
-    parser.add_argument('--merqury-db', type=str)
-    parser.add_argument('--merqury-k', type=str, default="21",
-                        help='K-mer size for Merqury database (default: 21; '
-                             'use "auto" to let meryl choose based on genome size)')
+    parser.add_argument('--merqury', action='store_true',
+                        help='Force-enable Merqury. If no --merqury-db is provided, TACO builds a reads .meryl database when meryl is installed.')
+    parser.add_argument('--merqury-db', type=str,
+                        help='Path to an existing reads .meryl database for Merqury')
+    parser.add_argument('--merqury-k', type=str, default="auto",
+                        help='K-mer size for Merqury database (default: auto; '
+                             'uses Merqury best_k.sh or a genome-size fallback)')
     parser.add_argument('--no-merqury', action='store_true')
     parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
     parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')
     parser.add_argument('--no-coverage-qc', action='store_true', help='Skip final coverage QC')
+    parser.add_argument('--benchmark', action='store_true',
+                        help='Write optional step timing/provenance files to benchmark_logs/')
     parser.add_argument('--allow-t2t-replace', action='store_true',
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.3.0')
+    parser.add_argument('--version', action='version', version='TACO v1.3.1')
     
     args = parser.parse_args()
 

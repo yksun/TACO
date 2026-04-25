@@ -52,7 +52,7 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 - Standardizes assembly outputs for direct cross-assembler comparison
 - Hybrid telomere detection with de novo k-mer discovery, built-in motif families, and per-end composite scoring
 - Three-tier telomere classification: strict T2T, single-end strong, and telomere-supported
-- Benchmarks all assembler outputs AND the final refined assembly with BUSCO, QUAST, telomere metrics, and Merqury QV/completeness (auto-enabled for all platforms when `merqury.sh` + `meryl` installed; builds reads.meryl automatically)
+- Benchmarks all assembler outputs AND the final refined assembly with BUSCO, QUAST, telomere metrics, and Merqury QV/completeness (auto-enabled for all platforms when `merqury.sh` + `meryl` installed; builds a reads `.meryl` database automatically)
 - Taxon-aware scoring: BUSCO S rewarded, BUSCO D penalized, Merqury QV/completeness, telomere metrics, N50, contig count, and genome size deviation — with per-taxon weights for fungal, plant, vertebrate, insect, and other genomes
 - Taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota, `--taxon plant` → embryophyta, etc.
 - Assembly-only mode (`--assembly-only`) for convenient benchmarking without refinement
@@ -60,7 +60,7 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 - Structural quickmerge validation with parent alignment checks
 - Coverage QC: sliding-window read depth analysis with GFF3 output for genome browser visualization
 - Full provenance tracking: GFF3 annotation tracing every contig to its original assembler, with quickmerge region-level mapping
-- Machine-readable benchmark logs, decision tables, and version tracking for reproducible reporting
+- Optional machine-readable benchmark logs with `--benchmark`, plus decision tables and version tracking for reproducible reporting
 
 ## Installation
 
@@ -108,9 +108,11 @@ taco -g 12m -t 16 \
 
 **Merqury QV scoring (enabled by default):**
 
-Merqury is automatically enabled for all platforms when `merqury.sh` and `meryl` are installed. TACO builds a reads.meryl k-mer database from input reads, runs Merqury on every assembler output (Step 11), and on the final refined assembly (Step 14). Merqury QV and completeness are included in backbone scoring and the final comparison table.
+Merqury is automatically enabled for all platforms when `merqury.sh` and `meryl` are installed. TACO builds a reads `.meryl` k-mer database from input reads, runs Merqury on every assembler output (Step 11), and on the final refined assembly (Step 14). Merqury QV and completeness are included in backbone scoring, `assemblies/assembly_info.csv`, and the final all-QC comparison table at `final_results/final_result.csv`.
 
-**Accuracy note:** Merqury QV is most accurate with high-accuracy reads (PacBio HiFi or Illumina). With Nanopore or PacBio CLR reads, QV values may underestimate true assembly quality because read errors inflate k-mer error counts. However, Merqury completeness and relative QV ranking across assemblers remain informative for all platforms. TACO logs a warning when using non-HiFi reads. Disable with `--no-merqury`.
+By default, `--merqury-k auto` chooses an optimized k-mer size from the genome size. TACO uses Merqury's `best_k.sh` helper when it is available, otherwise it uses the same genome-size/collision-rate calculation and clamps automatic values to a practical 17-31 range for broad eukaryotic assemblies. Set `MERQURY_COLLISION_RATE` to tune the default 0.001 collision rate. Override with `--merqury-k 21` or `--merqury-k 31` when you need a fixed database for cross-run comparability.
+
+**Accuracy note:** Merqury QV is most accurate with high-accuracy reads (PacBio HiFi or Illumina). With Nanopore or PacBio CLR reads, QV values may underestimate true assembly quality because read errors inflate k-mer error counts. Merqury completeness and relative QV ranking can still help compare assemblies generated from the same read set, but should be interpreted cautiously. TACO logs a warning when using non-HiFi reads. Disable with `--no-merqury`.
 
 You can also provide a pre-built database:
 
@@ -147,16 +149,22 @@ taco -g 12m -t 16 \
 | `--choose` | Manually choose the backbone assembler |
 | `--assembly-only` | Stop after assembler comparison |
 | `--auto-mode` | Backbone selection mode: `smart` (default) or `n50` |
-| `--merqury` | Force-enable Merqury (auto-detected if `merqury.sh` + `.meryl` db found) |
+| `--merqury` | Force-enable Merqury; if no database is provided, builds one when `meryl` is installed |
 | `--merqury-db` | Enable Merqury with a specific `.meryl` database path |
+| `--merqury-k` | K-mer size for an auto-built Merqury database (default: `auto`; uses Merqury `best_k.sh` when available, otherwise a genome-size/collision-rate fallback) |
 | `--no-merqury` | Disable Merqury even if installed and auto-detected |
+| `--benchmark` | Write optional timing/provenance files to `benchmark_logs/`; disabled by default |
 | `--no-purge-dups` | Skip purge_dups after refinement |
 | `--no-polish` | Skip automatic polishing after refinement |
 | `--allow-t2t-replace` | Allow rescue donors to replace immutable Tier 1 (T2T) contigs. Disabled by default for safety |
 
 ### Assembly-Only Mode
 
-Use `--assembly-only` when the goal is assembler benchmarking and comparison without refinement. TACO runs all assemblers, standardizes outputs, runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes the combined comparison table to `assemblies/assembly_info.csv` and a summary to `final_results/assembly_only_result.csv`.
+Use `--assembly-only` when the goal is assembler benchmarking and comparison without refinement. TACO runs all assemblers, standardizes outputs, runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes the combined comparison table to `assemblies/assembly_info.csv` and a summary to `final_results/assembly_only_result.csv`. Use `--benchmark` separately only when you also want machine-readable step timing and run metadata in `benchmark_logs/`.
+
+### Benchmark Provenance Mode
+
+Use `--benchmark` when a run needs publication-ready provenance. This does not change assembly behavior; it only writes extra audit files in `benchmark_logs/`: exact command line, git commit/dirty state, input file size/mtime, parameters, software versions, per-step timing/status, key output file manifest, and a short methods note. FASTQ/reference SHA-256 checksums are intentionally skipped by default because large read files can be expensive to hash; set `TACO_BENCHMARK_SHA256=1` with `--benchmark` when checksums are required for an archival or paper supplement.
 
 ## Sequencing Platform Support
 
@@ -237,7 +245,7 @@ Steps 0-11, 16: runs all assemblers, normalizes, performs combined assembly QC/c
 
 ## Telomere Detection
 
-TACO v1.3.0 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.1 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -440,9 +448,13 @@ project_directory/
 ├── telomere_pool/                       # Telomere pool intermediates
 ├── quast_results/                       # QUAST output
 ├── logs/                                # Per-step log files
-├── benchmark_logs/                      # Machine-readable benchmark data
+├── benchmark_logs/                      # Optional timing/provenance data, only with --benchmark
 │   ├── run_metadata.tsv
+│   ├── run_manifest.json
+│   ├── software_versions.tsv
 │   ├── step_benchmark.tsv
+│   ├── output_manifest.tsv
+│   ├── methods_note.txt
 │   └── run_summary.txt
 └── version.txt                          # Software versions
 ```
@@ -454,11 +466,11 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.0)
+│   ├── __init__.py         # Package metadata (v1.3.1)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
-│   ├── steps.py            # All 18 step implementations
+│   ├── steps.py            # All 17 public step implementations
 │   ├── utils.py            # Shared utilities and FASTA I/O
 │   ├── telomere_detect.py  # Hybrid telomere detection engine
 │   ├── telomere_pool.py    # Telomere pool classification
@@ -487,7 +499,7 @@ TACO/
 
 **Missing Python modules:** TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and the `taco/` directory is alongside `TACO.sh`.
 
-**Merqury not working:** Merqury is enabled by default when `merqury.sh` + `meryl` are installed. The reads.meryl database is built automatically from input reads. If you have a pre-built database, use `--merqury-db path/to/reads.meryl`. Install with `conda install -c bioconda merqury meryl`. Disable with `--no-merqury`.
+**Merqury not working:** Merqury is enabled by default when `merqury.sh` + `meryl` are installed. The reads `.meryl` database is built automatically from input reads. If you have a pre-built database, use `--merqury-db path/to/reads.meryl`. Install with `conda install -c bioconda merqury meryl`. Nanopore and PacBio CLR runs log a warning because QV from non-high-accuracy reads can be underestimated; completeness and relative assembler ranking are still reported but should be interpreted cautiously. Disable with `--no-merqury`.
 
 ## Citation
 

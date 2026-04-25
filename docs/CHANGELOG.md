@@ -5,6 +5,50 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.1] — 2026-04-25
+
+### Merqury QC flow hardening
+
+- **Fixed** Merqury metric parsing.  TACO now reads QV from the fourth column
+  of `.qv` files and completeness from the fifth column of
+  `.completeness.stats` (preferring the `all` row), avoiding accidental use of
+  k-mer count columns in assembly scoring and comparison tables.
+- **Improved** Merqury database handling.  Step 11 and Step 14 now share one
+  resolver that finds an existing reads `.meryl` database or builds
+  `merqury/reads.k{K}.meryl` from the input FASTQ when `meryl` is installed.
+- **Improved** Merqury k-mer selection.  `--merqury-k` now defaults to `auto`;
+  TACO uses Merqury `best_k.sh` when available and otherwise falls back to the
+  published genome-size/collision-rate formula, clamped to k=17-31 for broad
+  eukaryotic assemblies.  The fallback collision rate is configurable with
+  `MERQURY_COLLISION_RATE` (default 0.001).
+- **Improved** final-QC logic.  Step 14 runs Merqury on the final refined
+  assembly, and Step 15 idempotently reuses or creates those outputs when
+  building `final_results/final_result.csv`, so partial resumes keep the all-QC
+  comparison complete without duplicating successful Merqury runs.
+- **Documented** the non-high-accuracy warning for Nanopore and PacBio CLR
+  reads in the README and installation guide, including cautious
+  interpretation of QV/completeness from non-HiFi reads.
+
+### Benchmark logging
+
+- **Changed** benchmark timing/provenance output to opt-in via `--benchmark`.
+  Normal pipeline runs still write per-step logs, comparison tables, and
+  version metadata, but no longer create or update `benchmark_logs/` unless the
+  benchmark flag is used.
+- **Improved** `step_benchmark.tsv` for single-run interpretation.  The table is
+  reset at run start, records `success`/`failed` status plus numeric
+  `exit_code`, and `run_summary.txt` now reports current-run step counts and
+  total recorded step runtime.
+- **Added** publication-oriented benchmark provenance files:
+  `run_manifest.json`, `software_versions.tsv`, `output_manifest.tsv`, and
+  `methods_note.txt`.  These capture exact command line, code commit/dirty
+  state, parameters, input file metadata, tool versions, key output files, and a
+  short methods note for paper supplements.  Input SHA-256 checksums remain
+  opt-in with `TACO_BENCHMARK_SHA256=1` to avoid unexpectedly hashing very large
+  FASTQ files.
+
+---
+
 ## [1.3.0] — 2026-04-24
 
 ### Overview
@@ -30,7 +74,7 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   - Step 11: **combined** assembler QC/comparison (BUSCO + telomere + QUAST + optional Merqury; were Steps 11, 12, and 14)
   - Step 12: telomere pool (after comparison QC; was Step 13)
   - Step 13: backbone selection + refinement (was Step 15)
-  - Step 14: **combined** final QC (BUSCO + Telomere + QUAST on final; was Step 16)
+  - Step 14: **combined** final QC (BUSCO + Telomere + QUAST + Merqury on final; was Step 16)
   - Step 15: **combined** final report + cleanup (was Step 17)
   - Step 16: assembly-only comparison + cleanup (was Step 18)
 - **Unified** assembler lists: all downstream code (BUSCO CSV, QUAST CSV,
@@ -46,11 +90,12 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   No more fungal-biased default for non-fungal genomes.
 - **New** Merqury auto-enabled for ALL platforms: when `merqury.sh` + `meryl`
   are installed, Merqury is enabled by default for HiFi, ONT, and CLR.  TACO
-  builds a reads.meryl database automatically from input reads, runs Merqury
+  builds a reads `.meryl` database automatically from input reads, runs Merqury
   on every assembler output (Step 11), and on the final refined assembly
   (Step 14).  For non-HiFi platforms, a warning is logged: QV values may
-  underestimate true quality, but Merqury completeness and relative QV ranking
-  across assemblers remain informative.  Disable with `--no-merqury`.
+  underestimate true quality, so Merqury completeness and relative QV ranking
+  across assemblers should be interpreted cautiously.  Disable with
+  `--no-merqury`.
 - **Improved** backbone scoring with taxon-aware weights: BUSCO_S × 1000 -
   BUSCO_D × taxon_penalty + MerquryComp × 200 + MerquryQV × 20 + T2T ×
   taxon_t2t + single × 150 + log10(N50) × taxon_n50 - contigs × taxon_frag -
@@ -62,8 +107,9 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **New** Step 12 quickmerge structural validation: parent alignment identity,
   query coverage, union coverage, unexplained gap check.  Decision table
   written to `quickmerge_validation.tsv` and `telomere_pool_decisions.tsv`.
-- **New** `--merqury-k` flag for configurable Merqury k-mer size (default 21).
-  Auto-build names database `reads.k{K}.meryl`.
+- **New** `--merqury-k` flag for configurable Merqury k-mer size (default
+  `auto`; use a fixed integer such as 21 or 31 for cross-run comparability).
+  Auto-built databases are named `reads.k{K}.meryl`.
 - **New** Step 13L "do no harm" comparison: after refinement, compares final
   vs backbone for size, telomere count, and genome size deviation.  If quality
   degraded, saves both assemblies + `refinement_warning.txt`.
@@ -147,7 +193,6 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 | `SELFDEDUP_ENABLE` | 0 | Set to 1 to re-enable backbone self-dedup |
 | `COV_QC_WINDOW` | 5000 | Sliding window size (bp) for coverage QC |
 | `COV_QC_LOW` | 5 | Reads below this depth counted as low-coverage |
-
 ---
 
 ## [1.2.0] — 2026-04-15
