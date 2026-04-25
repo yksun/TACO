@@ -4818,8 +4818,10 @@ def step_12_refine(runner):
                         for seg in parts[6].split(";"):
                             try:
                                 rng, asm_r, contig_r = seg.split(":", 2)
-                                rs, re = rng.split("-")
-                                regions.append((int(rs), int(re), asm_r, contig_r))
+                                region_start, region_end = rng.split("-")
+                                regions.append((int(region_start),
+                                                int(region_end),
+                                                asm_r, contig_r))
                             except (ValueError, IndexError):
                                 pass
                     pool_provenance_map[parts[0]] = (
@@ -5581,15 +5583,121 @@ def _cleanup_outputs(runner):
     os.makedirs("temp/merge/fasta", exist_ok=True)
     os.makedirs("temp/merge/param", exist_ok=True)
     os.makedirs("temp/busco", exist_ok=True)
+    os.makedirs("temp/telomere", exist_ok=True)
+    os.makedirs("temp/polish", exist_ok=True)
+    os.makedirs("temp/purge_dups", exist_ok=True)
+    os.makedirs("temp/qc", exist_ok=True)
     os.makedirs("temp/log", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
+    os.makedirs("telomere_pool", exist_ok=True)
+    moved_counts = defaultdict(int)
+    copied_counts = defaultdict(int)
 
     def _safe_move(src, dst_dir):
         """Move src into dst_dir, overwriting any existing file of the same name."""
+        if not os.path.exists(src):
+            return False
+        os.makedirs(dst_dir, exist_ok=True)
         dst = os.path.join(dst_dir, os.path.basename(src))
         if os.path.exists(dst):
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            else:
+                os.remove(dst)
+        shutil.move(src, dst)
+        moved_counts[dst_dir.rstrip("/")] += 1
+        return True
+
+    def _safe_copy(src, dst_dir, dst_name=None):
+        """Copy src into dst_dir, overwriting any existing file of the same name."""
+        if not os.path.isfile(src):
+            return False
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, dst_name or os.path.basename(src))
+        if os.path.isfile(dst):
             os.remove(dst)
-        shutil.move(src, dst_dir)
+        shutil.copy2(src, dst)
+        copied_counts[dst_dir.rstrip("/")] += 1
+        return True
+
+    # Copy stable final results first.  Keep originals in assemblies/root so a
+    # user can rerun later steps without rebuilding earlier outputs.
+    final_result_files = [
+        ("assemblies/final.merged.fasta", "final.merged.fasta"),
+        ("assemblies/final.merged.fasta", "final_assembly.fasta"),
+        ("assemblies/final.merged.provenance.gff3", None),
+        ("pool_contig_provenance.tsv", None),
+        ("assemblies/selection_debug.tsv", None),
+        ("assemblies/selection_decision.txt", None),
+        ("assemblies/merged.merqury.csv", None),
+        ("assemblies/merged.busco.csv", None),
+        ("assemblies/merged.quast.csv", None),
+        ("assemblies/merged.telo.csv", None),
+        ("assemblies/coverage_qc/coverage_summary.tsv", None),
+        ("assemblies/coverage_qc/weak_regions.tsv", None),
+        ("assemblies/coverage_qc/weak_regions.gff3", None),
+        ("assemblies/quickmerge_validation.tsv", None),
+        ("assemblies/telomere_pool_decisions.tsv", None),
+        ("assemblies/rescue_trial_summary.tsv", None),
+        ("assemblies/rescue_rejection_summary.txt", None),
+        ("assemblies/single_tel.candidates.tsv", None),
+        ("assemblies/single_tel.replaced.debug.tsv", None),
+        ("assemblies/single_tel.replaced.ids", None),
+        ("assemblies/final.telomere_end_scores.tsv", None),
+        ("assemblies/final.telo_metrics.tsv", None),
+        ("assemblies/final.telo.list", None),
+        ("telomere_cluster_summary.tsv", None),
+        ("t2t_cluster_summary.tsv", None),
+        ("telomere_support_summary.csv", None),
+        ("protected_telomere_mode.txt", None),
+    ]
+    for src, dst_name in final_result_files:
+        try:
+            _safe_copy(src, "final_results", dst_name)
+        except Exception as e:
+            runner.log_warn(f"Could not copy {src} to final_results/: {e}")
+
+    # Keep a structured copy of telomere-pool products for inspection and
+    # manuscript supplements while leaving root copies available for resumes.
+    pool_files = [
+        "allmerged_telo.fasta",
+        "allmerged_telo_sort.fasta",
+        "allmerged.telomere_end_scores.tsv",
+        "allmerged.telo_metrics.tsv",
+        "allmerged.telo.fasta",
+        "allmerged.telo.list",
+        "t2t.list",
+        "single_tel.list",
+        "telomere_supported.list",
+        "t2t.fasta",
+        "t2t_best.fasta",
+        "t2t_clean.fasta",
+        "single_tel.fasta",
+        "single_tel_best.fasta",
+        "single_tel_clean.fasta",
+        "single_tel_best_clean.fasta",
+        "telomere_supported.fasta",
+        "telomere_supported_best.fasta",
+        "telomere_supported_clean.fasta",
+        "telomere_supported_best_clean.fasta",
+        "protected_telomere_contigs.fasta",
+        "protected_telomere_mode.txt",
+        "pool_contig_provenance.tsv",
+        "telomere_support_summary.csv",
+        "t2t_cluster_summary.tsv",
+        "telomere_cluster_summary.tsv",
+    ]
+    for src in pool_files:
+        try:
+            _safe_copy(src, "telomere_pool")
+        except Exception as e:
+            runner.log_warn(f"Could not copy {src} to telomere_pool/: {e}")
+    for src in ["assemblies/quickmerge_validation.tsv",
+                "assemblies/telomere_pool_decisions.tsv"]:
+        try:
+            _safe_copy(src, "telomere_pool")
+        except Exception as e:
+            runner.log_warn(f"Could not copy {src} to telomere_pool/: {e}")
 
     # Move merge intermediates
     for pattern in ["aln_summary_merged*.tsv", "anchor_summary_merged_*.txt"]:
@@ -5634,45 +5742,38 @@ def _cleanup_outputs(runner):
         except Exception:
             pass
 
+    # Move transient telomere/refinement alignment files
+    for f in ["t2t.self.paf", "single_tel.self.paf",
+              "assemblies/single_tel_vs_backbone.paf"]:
+        try:
+            _safe_move(f, "temp/telomere/")
+        except Exception:
+            pass
+
+    # Move large work directories after their summaries have been copied.
+    for src, dst_dir in [("assemblies/polish_work", "temp/polish"),
+                         ("assemblies/purge_dups_work", "temp/purge_dups"),
+                         ("assemblies/coverage_qc", "temp/qc")]:
+        try:
+            _safe_move(src, dst_dir)
+        except Exception as e:
+            runner.log_warn(f"Could not move {src} to {dst_dir}/: {e}")
+
     # Move misc logs
     for f in glob.glob("*.log"):
         if "busco" in f.lower():
             continue
         try:
-            shutil.move(f, "temp/log/")
+            _safe_move(f, "temp/log/")
         except Exception:
             pass
 
-    # Move key results to final_results/
-    # Use shutil.copy + os.remove instead of shutil.move to avoid silent
-    # failures when destination already exists from a previous run.
-    for src in [
-        "assemblies/final.merged.fasta",
-        "assemblies/final.merged.provenance.gff3",
-        "pool_contig_provenance.tsv",
-        "assemblies/selection_debug.tsv",
-        "assemblies/selection_decision.txt",
-        "assemblies/merged.merqury.csv",
-        "assemblies/merged.busco.csv",
-        "assemblies/merged.quast.csv",
-        "assemblies/merged.telo.csv",
-        "assemblies/coverage_qc/coverage_summary.tsv",
-        "assemblies/coverage_qc/weak_regions.tsv",
-        "assemblies/coverage_qc/weak_regions.gff3",
-        "telomere_cluster_summary.tsv",
-        "telomere_support_summary.csv",
-        "protected_telomere_mode.txt",
-    ]:
-        if os.path.isfile(src):
-            dst = os.path.join("final_results", os.path.basename(src))
-            try:
-                if os.path.isfile(dst):
-                    os.remove(dst)
-                shutil.copy2(src, dst)
-                os.remove(src)
-            except Exception as e:
-                runner.log_warn(f"Could not move {src} to final_results/: {e}")
-
+    if copied_counts:
+        runner.log("Cleanup copied stable outputs: " +
+                   ", ".join(f"{k}={v}" for k, v in sorted(copied_counts.items())))
+    if moved_counts:
+        runner.log("Cleanup moved temporary outputs: " +
+                   ", ".join(f"{k}={v}" for k, v in sorted(moved_counts.items())))
     runner.log("Cleanup complete.")
 
 

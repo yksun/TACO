@@ -164,7 +164,9 @@ Use `--assembly-only` when the goal is assembler benchmarking and comparison wit
 
 ### Benchmark Provenance Mode
 
-Use `--benchmark` when a run needs publication-ready provenance. This does not change assembly behavior; it only writes extra audit files in `benchmark_logs/`: exact command line, git commit/dirty state, input file size/mtime, parameters, software versions, per-step timing/status, key output file manifest, and a short methods note. FASTQ/reference SHA-256 checksums are intentionally skipped by default because large read files can be expensive to hash; set `TACO_BENCHMARK_SHA256=1` with `--benchmark` when checksums are required for an archival or paper supplement.
+`--benchmark` is for reproducibility and methods reporting, not for changing how assemblies are built. The biological benchmark is still the QC comparison itself: BUSCO, QUAST, telomere metrics, Merqury, and the final decision tables. When `--benchmark` is enabled, TACO adds a publication audit layer around that run so a future reader can reconstruct what was executed.
+
+Use `--benchmark` when a run needs publication-ready provenance. It writes extra files in `benchmark_logs/`: exact command line, git commit/dirty state, input file size/mtime, parameters, software versions, per-step timing/status, key output file manifest, and a short methods note. FASTQ/reference SHA-256 checksums are intentionally skipped by default because large read files can be expensive to hash; set `TACO_BENCHMARK_SHA256=1` with `--benchmark` when checksums are required for an archival or paper supplement.
 
 ## Sequencing Platform Support
 
@@ -436,18 +438,39 @@ project_directory/
 │   └── *.busco/                         # BUSCO results per assembly
 ├── final_results/
 │   ├── final_result.csv                 # Final comparison report
+│   ├── final.merged.fasta               # Refined assembly with internal TACO name
 │   ├── final_assembly.fasta             # Refined assembly (full mode)
 │   ├── final.merged.provenance.gff3     # GFF3 provenance: full assembler tracing per contig
 │   ├── pool_contig_provenance.tsv       # Pool contig → assembler + original name mapping
+│   ├── quickmerge_validation.tsv        # Quickmerge structural validation decisions
+│   ├── telomere_pool_decisions.tsv      # Per-contig pool classification decisions
+│   ├── rescue_trial_summary.tsv         # BUSCO rescue trial results
+│   ├── rescue_rejection_summary.txt     # Rescue rejection summary
+│   ├── single_tel.candidates.tsv        # Candidate single-telomere rescue contigs
+│   ├── selection_decision.txt           # Backbone-selection formula and selected assembler
 │   ├── coverage_summary.tsv             # Per-contig coverage stats (median, mean, zero/low bp)
 │   ├── weak_regions.tsv                 # Flagged weak windows with coords, source assembler, flag
 │   ├── weak_regions.gff3                # GFF3 coverage warnings: load in IGV to see weak spots
 │   ├── {backbone}.backbone.original.fasta  # Original backbone (for do-no-harm comparison)
 │   ├── refinement_warning.txt           # Quality warnings if refinement degraded backbone
 │   └── assembly_only_result.csv         # Comparison summary (assembly-only)
-├── telomere_pool/                       # Telomere pool intermediates
+├── telomere_pool/                       # Structured copy of telomere-pool intermediates
+│   ├── protected_telomere_contigs.fasta
+│   ├── t2t_clean.fasta
+│   ├── single_tel_best_clean.fasta
+│   ├── telomere_supported_best_clean.fasta
+│   ├── pool_contig_provenance.tsv
+│   └── telomere_pool_decisions.tsv
 ├── quast_results/                       # QUAST output
 ├── logs/                                # Per-step log files
+├── temp/                                # Organized temporary alignment/work files after cleanup
+│   ├── merge/
+│   ├── telomere/
+│   ├── polish/
+│   ├── purge_dups/
+│   ├── qc/
+│   ├── busco/
+│   └── log/
 ├── benchmark_logs/                      # Optional timing/provenance data, only with --benchmark
 │   ├── run_metadata.tsv
 │   ├── run_manifest.json

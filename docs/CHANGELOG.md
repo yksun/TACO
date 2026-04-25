@@ -46,6 +46,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   short methods note for paper supplements.  Input SHA-256 checksums remain
   opt-in with `TACO_BENCHMARK_SHA256=1` to avoid unexpectedly hashing very large
   FASTQ files.
+- **Fixed** `version.txt` handling for tools without clean version commands.
+  LJA command-line parse errors are no longer recorded as versions, and
+  `merge_wrapper.py` falls back to the active conda/mamba `quickmerge` package
+  version when the wrapper does not expose a version flag.
+- **Improved** cleanup organization.  Final report cleanup now copies stable
+  results into `final_results/` while leaving source files in place for easier
+  reruns/resumes, writes both `final.merged.fasta` and `final_assembly.fasta`,
+  copies telomere-pool products into `telomere_pool/`, and moves large
+  transient work directories into structured `temp/` subfolders.
 
 ---
 

@@ -6,6 +6,7 @@ import shutil
 import gzip
 import socket
 import csv
+import glob
 import hashlib
 import json
 import shlex
@@ -281,21 +282,115 @@ class PipelineRunner:
         ("python",         "python3",          ["--version"]),
     ]
 
-    def log_version(self, label, cmd):
+    CONDA_PACKAGE_ALIASES = {
+        "merge_wrapper": ["quickmerge"],
+        "merqury": ["merqury"],
+        "nextPolish2": ["nextpolish2"],
+        "python": ["python"],
+    }
+
+    @staticmethod
+    def _version_output_is_error(text):
+        """Return True for command output that is clearly not a version."""
+        bad_phrases = (
+            "failed to parse command line parameters",
+            "unrecognized option",
+            "unrecognized arguments",
+            "invalid option",
+            "unknown command",
+            "no such option",
+            "missing argument",
+            "required argument",
+            "traceback",
+        )
+        lowered = text.lower()
+        if any(p in lowered for p in bad_phrases):
+            return True
+
+        first = text.splitlines()[0].strip().lower() if text.splitlines() else ""
+        return first.startswith(("usage:", "error:", "exception:"))
+
+    @staticmethod
+    def _version_flags(flags_to_try):
+        """Combine preferred tool flags with conservative generic fallbacks."""
+        generic = ["--version", "-V", "-v", "version", ""]
+        preferred = list(flags_to_try or [])
+        out = []
+        for flag in preferred + generic:
+            if flag not in out:
+                out.append(flag)
+        return out
+
+    def _conda_package_version(self, label, package_names=None):
+        """Return package version from the active conda/mamba environment."""
+        names = package_names or self.CONDA_PACKAGE_ALIASES.get(label, [label])
+        names = {n.lower().replace("_", "-") for n in names}
+
+        prefixes = []
+        for prefix in [os.environ.get("CONDA_PREFIX"), sys.prefix]:
+            if prefix and prefix not in prefixes:
+                prefixes.append(prefix)
+
+        for prefix in prefixes:
+            meta_dir = os.path.join(prefix, "conda-meta")
+            if not os.path.isdir(meta_dir):
+                continue
+            for meta_json in glob.glob(os.path.join(meta_dir, "*.json")):
+                try:
+                    with open(meta_json) as f:
+                        meta = json.load(f)
+                except Exception:
+                    continue
+                pkg_name = (meta.get("name") or "").lower().replace("_", "-")
+                if pkg_name in names:
+                    version = meta.get("version") or "unknown"
+                    return f"{version} (conda package: {meta.get('name')})"
+
+        for manager in ["conda", "mamba", "micromamba"]:
+            exe = shutil.which(manager)
+            if not exe:
+                continue
+            try:
+                result = subprocess.run(
+                    [exe, "list", "--json"],
+                    capture_output=True, text=True, timeout=20,
+                )
+            except Exception:
+                continue
+            if result.returncode != 0 or not result.stdout:
+                continue
+            try:
+                packages = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                continue
+            for pkg in packages:
+                pkg_name = (pkg.get("name") or "").lower().replace("_", "-")
+                if pkg_name in names:
+                    return f"{pkg.get('version', 'unknown')} (conda package: {pkg.get('name')})"
+
+        return None
+
+    def log_version(self, label, cmd, flags_to_try=None):
         """Extract version string from a tool, handling various output formats."""
         import re as _re
 
-        # Try each flag; also try bare command (some tools print version on stderr
-        # when invoked without arguments)
-        flags_to_try = ["--version", "-V", "-v", "version", ""]
-        for flag in flags_to_try:
+        # Try preferred flags first; also try bare command for tools that print
+        # version/help on stderr when invoked without arguments.
+        for flag in self._version_flags(flags_to_try):
             try:
+                if isinstance(cmd, str) and any(c.isspace() for c in cmd):
+                    base_cmd = shlex.split(cmd)
+                else:
+                    base_cmd = [cmd]
+                run_args = base_cmd + ([flag] if flag else [])
                 r = subprocess.run(
-                    f"{cmd} {flag}".strip(),
-                    shell=True, capture_output=True, text=True, timeout=10,
+                    run_args,
+                    capture_output=True, text=True, timeout=10,
                 )
                 text = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
                 if not text:
+                    continue
+                if self._version_output_is_error(text):
                     continue
 
                 # Search for version-like patterns in output
@@ -320,11 +415,16 @@ class PipelineRunner:
                 if first and "unrecognized" not in first.lower() \
                    and "invalid option" not in first.lower() \
                    and "unknown command" not in first.lower() \
+                   and "failed to parse" not in first.lower() \
                    and not first.lower().startswith("usage:"):
                     return first
 
             except Exception:
                 pass
+
+        conda_version = self._conda_package_version(label)
+        if conda_version:
+            return conda_version
         return "unknown"
 
     def _tool_version_records(self):
@@ -336,7 +436,7 @@ class PipelineRunner:
                 # Try lowercase variant
                 bin_path = shutil.which(binary.lower())
             if bin_path:
-                ver = self.log_version(label, bin_path)
+                ver = self.log_version(label, bin_path, flags)
                 records.append({
                     "tool": label,
                     "binary": binary,
@@ -345,12 +445,13 @@ class PipelineRunner:
                     "status": "installed",
                 })
             else:
+                ver = self._conda_package_version(label)
                 records.append({
                     "tool": label,
                     "binary": binary,
                     "path": "",
-                    "version": "",
-                    "status": "not_installed",
+                    "version": ver or "",
+                    "status": "conda_package_only" if ver else "not_installed",
                 })
         return records
 
@@ -367,7 +468,7 @@ class PipelineRunner:
         ]
         self.version_records = self._tool_version_records()
         for rec in self.version_records:
-            if rec["status"] == "installed":
+            if rec["status"] == "installed" or rec["version"]:
                 lines.append(f"  {rec['tool']}: {rec['version']}")
             else:
                 lines.append(f"  {rec['tool']}: not installed")
@@ -832,13 +933,26 @@ nextgraph_options = -a 1
             "final_results/final_result.csv",
             "final_results/assembly_info.csv",
             "final_results/assembly_only_result.csv",
+            "final_results/final.merged.fasta",
             "final_results/final_assembly.fasta",
             "final_results/final.merged.provenance.gff3",
             "final_results/pool_contig_provenance.tsv",
+            "final_results/quickmerge_validation.tsv",
+            "final_results/telomere_pool_decisions.tsv",
+            "final_results/rescue_trial_summary.tsv",
+            "final_results/rescue_rejection_summary.txt",
+            "final_results/single_tel.candidates.tsv",
+            "final_results/single_tel.replaced.debug.tsv",
+            "final_results/selection_decision.txt",
+            "final_results/selection_debug.tsv",
             "final_results/coverage_summary.tsv",
             "final_results/weak_regions.tsv",
             "final_results/weak_regions.gff3",
             "final_results/refinement_warning.txt",
+            "telomere_pool/pool_contig_provenance.tsv",
+            "telomere_pool/telomere_pool_decisions.tsv",
+            "telomere_pool/quickmerge_validation.tsv",
+            "telomere_pool/protected_telomere_contigs.fasta",
             os.path.relpath(self.bench_run_tsv, self.working_dir),
             os.path.relpath(self.bench_manifest_json, self.working_dir),
             os.path.relpath(self.bench_tools_tsv, self.working_dir),
