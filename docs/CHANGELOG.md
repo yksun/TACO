@@ -55,6 +55,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   reruns/resumes, writes both `final.merged.fasta` and `final_assembly.fasta`,
   copies telomere-pool products into `telomere_pool/`, and moves large
   transient work directories into structured `temp/` subfolders.
+- **Improved** resume and selected-step warnings.  Tool preflight checks are now
+  based on the requested steps rather than every platform-compatible assembler,
+  so resume runs such as `-s 13-15` no longer warn about missing Step 1-9
+  assembler binaries.  Before each resumed step, TACO warns about missing
+  upstream files and can restore common inputs from `final_results/` or
+  `telomere_pool/`.
+- **Fixed** `purge_dups` version parsing.  Error output such as
+  `[E::hit_read] can not open PAF file version` is rejected as non-version
+  text, and TACO falls back to the active conda package version when available.
 
 ---
 

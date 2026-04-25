@@ -286,6 +286,7 @@ class PipelineRunner:
         "merge_wrapper": ["quickmerge"],
         "merqury": ["merqury"],
         "nextPolish2": ["nextpolish2"],
+        "purge_dups": ["purge_dups", "purge-dups"],
         "python": ["python"],
     }
 
@@ -294,6 +295,11 @@ class PipelineRunner:
         """Return True for command output that is clearly not a version."""
         bad_phrases = (
             "failed to parse command line parameters",
+            "[e::",
+            "can not open",
+            "cannot open",
+            "failed to open",
+            "no such file",
             "unrecognized option",
             "unrecognized arguments",
             "invalid option",
@@ -478,49 +484,256 @@ class PipelineRunner:
     # ------------------------------------------------------------------ #
     # Requirement checking
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _tool_available(tool_spec):
+        """Return True if a tool or one of several alternative binaries exists."""
+        if isinstance(tool_spec, (tuple, list)):
+            return any(shutil.which(t) for t in tool_spec)
+        return shutil.which(tool_spec) is not None
+
     def check_requirements(self):
-        """Check that all required tools are available."""
+        """Check tools needed by the requested steps only."""
         from taco.utils import is_assembler_compatible
 
-        core_required = ["python3", "minimap2", "samtools"]
-        if self.run_busco:
-            core_required.append("busco")
-        if not shutil.which("quast.py") and not shutil.which("quast"):
-            core_required.append("quast.py/quast")
+        step_set = set(self.steps)
+        required = {}
+        optional = {}
 
-        assembler_bins = {
-            "canu": "canu",
-            "nextDenovo": "nextDenovo",
-            "peregrine": "pg_asm",
-            "ipa": "ipa",
-            "flye": "flye",
-            "hifiasm": "hifiasm",
-            "lja": "lja",
-            "mbg": "MBG",
-            "raven": "raven",
+        def add_required(tool_spec, reason):
+            required.setdefault(tuple(tool_spec) if isinstance(tool_spec, list) else tool_spec, set()).add(reason)
+
+        def add_optional(tool_spec, reason):
+            optional.setdefault(tuple(tool_spec) if isinstance(tool_spec, list) else tool_spec, set()).add(reason)
+
+        assembler_steps = {
+            1: ("canu", "canu"),
+            2: ("nextDenovo", "nextDenovo"),
+            3: ("peregrine", "pg_asm"),
+            4: ("ipa", "ipa"),
+            5: ("flye", "flye"),
+            6: ("hifiasm", "hifiasm"),
+            7: ("lja", "lja"),
+            8: ("mbg", ["MBG", "mbg"]),
+            9: ("raven", "raven"),
         }
-        platform_bins = []
-        for asm, binary in assembler_bins.items():
-            if is_assembler_compatible(asm, self.platform):
-                if asm == "mbg":
-                    if not shutil.which("MBG") and not shutil.which("mbg"):
-                        platform_bins.append("MBG/mbg")
-                else:
-                    platform_bins.append(binary)
 
-        missing = [c for c in core_required if "/" in c or not shutil.which(c)]
-        missing.extend(c for c in platform_bins if "/" in c or not shutil.which(c))
-        # quast can be quast.py or quast
-        missing = sorted(set(missing))
-        if missing:
+        for step, (asm, binary) in assembler_steps.items():
+            if step not in step_set:
+                continue
+            if not is_assembler_compatible(asm, self.platform):
+                self.log_info(
+                    f"Step {step} ({asm}) is incompatible with platform "
+                    f"{self.platform}; it will be skipped.")
+                continue
+            add_required(binary, f"Step {step} {asm} assembly")
+
+        if 11 in step_set:
+            if self.run_busco:
+                add_required("busco", "Step 11 BUSCO comparison")
+            add_required(["quast.py", "quast"], "Step 11 QUAST comparison")
+            if self.merqury_enable:
+                add_optional("merqury.sh", "Step 11 Merqury comparison")
+                if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
+                    add_optional("meryl", "Step 11 Merqury read database build")
+
+        if 12 in step_set:
+            add_optional("minimap2", "Step 12 telomere-pool clustering/quickmerge validation")
+            add_optional("merge_wrapper.py", "Step 12 optional quickmerge T2T recovery")
+
+        if 13 in step_set:
+            add_optional("minimap2", "Step 13 rescue alignment, polishing, coverage QC, purge_dups")
+            if not getattr(self, 'no_coverage_qc', False):
+                add_optional("samtools", "Step 13 final assembly coverage QC")
+            if not getattr(self, 'no_purge_dups', False):
+                for tool in ["purge_dups", "pbcstat", "calcuts", "split_fa", "get_seqs"]:
+                    add_optional(tool, "Step 13 purge_dups cleanup")
+            if not getattr(self, 'no_polish', False):
+                if self.platform == "pacbio-hifi":
+                    add_optional("nextPolish2", "Step 13 HiFi polishing")
+                    add_optional("yak", "Step 13 HiFi polishing")
+                    add_optional("samtools", "Step 13 HiFi polishing read alignment")
+                elif self.platform == "nanopore":
+                    add_optional("medaka_consensus", "Step 13 Nanopore polishing")
+                    add_optional("racon", "Step 13 Nanopore polishing fallback")
+                else:
+                    add_optional("racon", "Step 13 PacBio CLR polishing")
+
+        if 14 in step_set:
+            if self.run_busco:
+                add_required("busco", "Step 14 final BUSCO QC")
+            add_required(["quast.py", "quast"], "Step 14 final QUAST QC")
+            if self.merqury_enable:
+                add_optional("merqury.sh", "Step 14 final Merqury QC")
+                if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
+                    add_optional("meryl", "Step 14 Merqury read database build")
+
+        if 15 in step_set and self.merqury_enable:
+            add_optional("merqury.sh", "Step 15 final report Merqury completion")
+            if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
+                add_optional("meryl", "Step 15 Merqury read database build")
+
+        missing_required = {
+            self._format_tool_spec(tool): sorted(reasons)
+            for tool, reasons in required.items()
+            if not self._tool_available(tool)
+        }
+        missing_optional = {
+            self._format_tool_spec(tool): sorted(reasons)
+            for tool, reasons in optional.items()
+            if not self._tool_available(tool)
+        }
+
+        if missing_required:
             self.log_warn(
-                f"Missing tools for selected platform ({self.platform}): "
-                f"{', '.join(missing)}"
+                "Missing required tools for requested steps: " +
+                "; ".join(
+                    f"{tool} ({', '.join(reasons)})"
+                    for tool, reasons in sorted(missing_required.items())
+                )
             )
             self.log_warn(
-                "Some steps may fail. Create and activate the TACO conda "
-                "environment first, or install tools manually."
+                "Only requested steps were checked. Install these tools or "
+                "remove the affected steps; resume runs do not require "
+                "assembler binaries unless their assembly steps are selected."
             )
+
+        if missing_optional:
+            self.log_warn(
+                "Optional tools unavailable for requested steps: " +
+                "; ".join(
+                    f"{tool} ({', '.join(reasons)})"
+                    for tool, reasons in sorted(missing_optional.items())
+                )
+            )
+            self.log_warn(
+                "TACO will skip or fall back for optional analyses where "
+                "possible; install these tools for the most complete QC."
+            )
+
+    @staticmethod
+    def _format_tool_spec(tool_spec):
+        if isinstance(tool_spec, tuple):
+            return "/".join(tool_spec)
+        return str(tool_spec)
+
+    @staticmethod
+    def _any_path_exists(patterns):
+        for pattern in patterns:
+            if glob.glob(pattern):
+                return True
+        return False
+
+    def _copy_resume_input(self, dst, candidates):
+        """Restore an active working file from cleanup output if needed."""
+        if os.path.exists(dst):
+            return False
+        for src in candidates:
+            if os.path.isfile(src):
+                dst_dir = os.path.dirname(dst)
+                if dst_dir:
+                    os.makedirs(dst_dir, exist_ok=True)
+                shutil.copy2(src, dst)
+                self.log_warn(
+                    f"Resume input restored: copied {src} -> {dst}")
+                return True
+        return False
+
+    def restore_resume_inputs_for_step(self, step):
+        """Restore inputs moved by older cleanup runs before a resumed step."""
+        if step in (13, 14, 15, 16):
+            self._copy_resume_input(
+                "assemblies/assembly_info.csv",
+                ["final_results/assembly_info.csv",
+                 "final_results/assembly_only_result.csv"],
+            )
+        if step in (13, 15):
+            self._copy_resume_input(
+                "pool_contig_provenance.tsv",
+                ["telomere_pool/pool_contig_provenance.tsv",
+                 "final_results/pool_contig_provenance.tsv"],
+            )
+            self._copy_resume_input(
+                "protected_telomere_contigs.fasta",
+                ["telomere_pool/protected_telomere_contigs.fasta"],
+            )
+            self._copy_resume_input(
+                "protected_telomere_mode.txt",
+                ["telomere_pool/protected_telomere_mode.txt",
+                 "final_results/protected_telomere_mode.txt"],
+            )
+        if step in (14, 15):
+            self._copy_resume_input(
+                "assemblies/final.merged.fasta",
+                ["final_results/final.merged.fasta",
+                 "final_results/final_assembly.fasta"],
+            )
+
+    def warn_missing_step_inputs(self, step):
+        """Warn clearly when a selected/resumed step lacks upstream files."""
+        checks = {
+            11: [
+                ("normalized assembler FASTA files",
+                 ["assemblies/*.result.fasta"],
+                 "Step 10"),
+            ],
+            12: [
+                ("telomere FASTAs or normalized assembler FASTAs",
+                 ["assemblies/*.telo.fasta", "assemblies/*.result.fasta"],
+                 "Steps 10-11"),
+            ],
+            13: [
+                ("assembly comparison table",
+                 ["assemblies/assembly_info.csv"],
+                 "Step 11"),
+                ("protected telomere contigs",
+                 ["protected_telomere_contigs.fasta",
+                  "telomere_pool/protected_telomere_contigs.fasta"],
+                 "Step 12"),
+                ("normalized assembler FASTA files",
+                 ["assemblies/*.result.fasta"],
+                 "Step 10"),
+            ],
+            14: [
+                ("final merged assembly",
+                 ["assemblies/final.merged.fasta",
+                  "final_results/final.merged.fasta",
+                  "final_results/final_assembly.fasta"],
+                 "Step 13"),
+            ],
+            15: [
+                ("final merged assembly",
+                 ["assemblies/final.merged.fasta",
+                  "final_results/final.merged.fasta",
+                  "final_results/final_assembly.fasta"],
+                 "Step 13"),
+                ("assembly comparison table",
+                 ["assemblies/assembly_info.csv",
+                  "final_results/assembly_info.csv"],
+                 "Step 11"),
+            ],
+            16: [
+                ("assembly comparison table or component metric CSVs",
+                 ["assemblies/assembly_info.csv",
+                  "final_results/assembly_info.csv",
+                  "assemblies/assembly.busco.csv"],
+                 "Step 11"),
+            ],
+        }
+        missing = []
+        for desc, patterns, producer in checks.get(step, []):
+            if not self._any_path_exists(patterns):
+                missing.append((desc, patterns, producer))
+        if not missing:
+            return
+
+        self.log_warn(
+            f"Step {step} is being run without some expected upstream files. "
+            "This is common after selecting individual steps or resuming in a "
+            "fresh directory, but the step may fail if it cannot rebuild them.")
+        for desc, patterns, producer in missing:
+            self.log_warn(
+                f"  Missing {desc} from {producer}; expected one of: "
+                f"{', '.join(patterns)}")
 
     # ------------------------------------------------------------------ #
     # Reference FASTA resolution
@@ -1071,6 +1284,10 @@ nextgraph_options = -a 1
             self.log_info("No user motif supplied; using auto-discovery + built-in families")
         if self.assembly_only:
             self.log_info("Assembly-only mode enabled")
+        elif self.steps != list(range(0, 16)):
+            self.log_info(
+                "Selected-step/resume mode enabled: " +
+                ",".join(str(s) for s in self.steps))
         if self.benchmark:
             self.log_info("Benchmark logging enabled: benchmark_logs/")
 
@@ -1093,6 +1310,9 @@ nextgraph_options = -a 1
 
             sname = STEP_NAMES.get(step_num, f"Step {step_num}")
             log_file = os.path.join(self.logs_dir, f"step_{step_num}.log")
+
+            self.restore_resume_inputs_for_step(step_num)
+            self.warn_missing_step_inputs(step_num)
 
             self.log(f"===== STEP {step_num} START: {sname} =====")
             start = datetime.now()

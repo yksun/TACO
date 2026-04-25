@@ -168,6 +168,12 @@ Use `--assembly-only` when the goal is assembler benchmarking and comparison wit
 
 Use `--benchmark` when a run needs publication-ready provenance. It writes extra files in `benchmark_logs/`: exact command line, git commit/dirty state, input file size/mtime, parameters, software versions, per-step timing/status, key output file manifest, and a short methods note. FASTQ/reference SHA-256 checksums are intentionally skipped by default because large read files can be expensive to hash; set `TACO_BENCHMARK_SHA256=1` with `--benchmark` when checksums are required for an archival or paper supplement.
 
+### Resuming And File Organization
+
+When running selected steps with `-s`/`--steps`, TACO checks only the tools needed by those requested steps. For example, `-s 13-15` will not warn about missing assembler binaries from Steps 1-9. Before each resumed step, TACO checks for expected upstream files and prints a specific warning naming the missing file type and the earlier step that should have produced it. For common cleanup outputs, TACO can also restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step.
+
+Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 11-15`) or place the expected file back at the path shown in the warning.
+
 ## Sequencing Platform Support
 
 TACO supports three sequencing platforms. Each assembler receives platform-appropriate flags automatically. The platform also determines the default polishing strategy: HiFi assemblies are polished with NextPolish2 by default (k-mer-based, safe for high-accuracy reads; requires `yak` for k-mer database construction), Nanopore assemblies use Medaka (neural-network polisher; falls back to Racon), and CLR assemblies use Racon.
