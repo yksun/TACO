@@ -14,8 +14,8 @@ STEP_NAMES = {
     7: "LJA assembly",
     8: "MBG assembly",
     9: "Raven assembly",
-    10: "Copy and normalize all assemblies",
-    11: "Assembly QC and comparison (BUSCO + telomere + QUAST + Merqury)",
+    10: "Normalize assemblies (legacy standalone step)",
+    11: "Normalize assemblies + QC comparison (BUSCO + telomere + QUAST + Merqury)",
     12: "Build optimized telomere pool",
     13: "Backbone selection and refinement",
     14: "Final QC (BUSCO + Telomere + QUAST + Merqury on final)",
@@ -114,15 +114,19 @@ def parse_args():
         args.merqury = True
     
     if args.assembly_only:
-        # Steps 0-11, 16 (assemblers + normalize + combined QC + assembly-only report)
-        args.steps = list(range(0, 12)) + [16]
+        # Steps 0-9, 11, 16 (assemblers + normalize/QC + assembly-only report).
+        # Step 10 remains available as a standalone legacy normalization step;
+        # Step 11 runs normalization automatically.
+        args.steps = list(range(0, 10)) + [11, 16]
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
         except ValueError as e:
             parser.error(str(e))
     else:
-        args.steps = list(range(0, 16))  # Steps 0-15 for full mode
+        # Full mode skips the legacy standalone Step 10 because Step 11 now
+        # normalizes assemblies before running QC/comparison.
+        args.steps = list(range(0, 10)) + list(range(11, 16))
     
     for s in args.steps:
         if s < 0 or s > 16:

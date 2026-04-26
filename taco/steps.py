@@ -9,6 +9,7 @@ import sys
 import glob
 import csv
 import re
+import shlex
 import shutil
 import subprocess
 import json
@@ -918,8 +919,9 @@ def step_08_mbg(runner):
     mbg_bin = shutil.which("MBG") or shutil.which("mbg")
     if not mbg_bin:
         _assembler_skip(runner, 8, "mbg",
-                        "binary not found. Build from source: "
-                        "git clone https://github.com/maickrau/MBG && cd MBG && make")
+                        "optional HiFi assembler binary not found. Install MBG "
+                        "or build from source if you want it included in the "
+                        "comparison; TACO will continue with other assemblers")
         return
 
     os.makedirs("mbg_out", exist_ok=True)
@@ -950,55 +952,132 @@ def step_09_raven(runner):
     """Step 9 - Assembly using Raven (non-fatal; all platforms)."""
     runner.log("Step 9 - Assembly of the genome using Raven")
 
-    if not shutil.which("raven"):
+    raven_bin = shutil.which("raven")
+    if not raven_bin:
         _assembler_skip(runner, 9, "raven",
                         "binary not found. Install via: conda install -c bioconda raven-assembler")
         return
 
     os.makedirs("raven_out", exist_ok=True)
-    runner.log_version("raven", "raven")
-
-    cmd = (f"raven -t {runner.threads} {runner.fastq} "
-           f"> raven_out/raven.fasta 2> raven_out/raven.log")
-    result = runner.run_cmd(cmd, desc="Running Raven", check=False)
-    if result.returncode != 0:
-        runner.log_warn("Step 9: Raven failed. Skipping.")
-        return
+    runner.log_version("raven", raven_bin)
 
     raven_fa = "raven_out/raven.fasta"
+    raven_log = "raven_out/raven.log"
+    fastq_arg = shlex.quote(str(runner.fastq))
+    raven_arg = shlex.quote(str(raven_bin))
+    threads = max(1, int(getattr(runner, "threads", 1) or 1))
+    flag_override = os.environ.get("TACO_RAVEN_THREADS_FLAG", "").strip()
+
+    attempts = []
+    if flag_override.lower() in {"0", "false", "none", "off", "no"}:
+        attempts.append((f"{raven_arg} {fastq_arg}", "Raven without thread flag"))
+    elif flag_override:
+        attempts.append((f"{raven_arg} {flag_override} {threads} {fastq_arg}",
+                         f"Raven with {flag_override}"))
+        attempts.append((f"{raven_arg} {fastq_arg}", "Raven without thread flag"))
+    else:
+        attempts.append((f"{raven_arg} --threads {threads} {fastq_arg}",
+                         "Raven with --threads"))
+        attempts.append((f"{raven_arg} {fastq_arg}", "Raven without thread flag"))
+
+    unsupported_thread_flag = (
+        "no such option",
+        "unrecognized option",
+        "unknown option",
+        "invalid option",
+    )
+
+    for i, (base_cmd, label) in enumerate(attempts):
+        if os.path.exists(raven_fa):
+            os.remove(raven_fa)
+        cmd = f"{base_cmd} > {raven_fa} 2> {raven_log}"
+        result = runner.run_cmd(cmd, desc=f"Running {label}", check=False)
+        if result.returncode == 0 and os.path.isfile(raven_fa) and os.path.getsize(raven_fa) > 0:
+            runner.log(f"Raven assembly: {raven_fa}")
+            return
+
+        stderr_text = ""
+        if os.path.isfile(raven_log):
+            try:
+                with open(raven_log, "r", errors="ignore") as fh:
+                    stderr_text = fh.read().lower()
+            except Exception:
+                stderr_text = ""
+        can_retry_without_flag = (
+            i + 1 < len(attempts)
+            and any(token in stderr_text for token in unsupported_thread_flag)
+        )
+        if can_retry_without_flag:
+            runner.log_info(
+                "Raven rejected the thread option; retrying without a thread "
+                "flag for compatibility with older raven builds.")
+            continue
+
+        if result.returncode != 0:
+            runner.log_warn(f"Step 9: Raven failed during {label}. Skipping.")
+            return
+        break
+
     if os.path.isfile(raven_fa) and os.path.getsize(raven_fa) > 0:
         runner.log(f"Raven assembly: {raven_fa}")
     else:
         runner.log_warn("Step 9: Raven produced no output.")
 
 
-def step_10_normalize(runner):
-    """Step 10 - Copy and normalize all assemblies."""
-    runner.log("Step 10 - Copy and normalize all assemblies")
+def step_10_normalize(runner, embedded=False):
+    """Step 10 - Copy and normalize all assemblies.
+
+    This remains available as a standalone legacy step, but Step 11 runs it
+    automatically before QC/comparison.
+    """
+    if embedded:
+        runner.log("Assembly normalization - Copy and normalize all assemblies")
+    else:
+        runner.log("Step 10 - Copy and normalize all assemblies")
     os.makedirs("assemblies", exist_ok=True)
 
     assembler_paths = [
-        ("canu", "./hicanu/canu.contigs.fasta"),
-        ("nextDenovo", "./NextDenovo/03.ctg_graph/nd.asm.fasta"),
-        ("peregrine", "./peregrine-2021/asm_ctgs_m_p.fa"),
-        ("ipa", "./ipa/assembly-results/final.p_ctg.fasta"),
-        ("flye", "./flye/assembly.fasta"),
-        ("hifiasm", "./hifiasm/hifiasm.fasta"),
-        ("lja", "./lja_out/assembly.fasta"),
-        ("mbg", "./mbg_out/mbg.fasta"),
-        ("raven", "./raven_out/raven.fasta"),
+        ("canu", ["./hicanu/canu.contigs.fasta",
+                  "./temp/assemblers/hicanu/canu.contigs.fasta"]),
+        ("nextDenovo", ["./NextDenovo/03.ctg_graph/nd.asm.fasta",
+                        "./temp/assemblers/NextDenovo/03.ctg_graph/nd.asm.fasta"]),
+        ("peregrine", ["./peregrine-2021/asm_ctgs_m_p.fa",
+                       "./temp/assemblers/peregrine-2021/asm_ctgs_m_p.fa"]),
+        ("ipa", ["./ipa/assembly-results/final.p_ctg.fasta",
+                 "./temp/assemblers/ipa/assembly-results/final.p_ctg.fasta"]),
+        ("flye", ["./flye/assembly.fasta",
+                  "./temp/assemblers/flye/assembly.fasta"]),
+        ("hifiasm", ["./hifiasm/hifiasm.fasta",
+                     "./temp/assemblers/hifiasm/hifiasm.fasta"]),
+        ("lja", ["./lja_out/assembly.fasta",
+                 "./temp/assemblers/lja_out/assembly.fasta"]),
+        ("mbg", ["./mbg_out/mbg.fasta",
+                 "./temp/assemblers/mbg_out/mbg.fasta"]),
+        ("raven", ["./raven_out/raven.fasta",
+                   "./temp/assemblers/raven_out/raven.fasta"]),
     ]
 
-    for prefix, src_path in assembler_paths:
+    normalized = 0
+    for prefix, path_options in assembler_paths:
+        src_path = next(
+            (p for p in path_options if os.path.isfile(p) and os.path.getsize(p) > 0),
+            None,
+        )
+        if not src_path:
+            continue
         if os.path.isfile(src_path) and os.path.getsize(src_path) > 0:
             dest = f"./assemblies/{prefix}.result.fasta"
             shutil.copy(src_path, dest)
             tmp_renamed = f"assemblies/.{prefix}.renamed.tmp.fasta"
             rename_and_sort_fasta(runner, dest, tmp_renamed, prefix)
             shutil.move(tmp_renamed, dest)
+            normalized += 1
 
     if runner.reference_fasta and os.path.isfile(runner.reference_fasta) and os.path.getsize(runner.reference_fasta) > 0:
         shutil.copy(runner.reference_fasta, "./assemblies/reference.result.fasta")
+        normalized += 1
+
+    runner.log(f"Normalized {normalized} assembly FASTA file(s) into assemblies/")
 
 
 def step_08_busco(runner):
@@ -2235,11 +2314,12 @@ def _write_merqury_csv():
 def step_11_assembly_qc_comparison(runner):
     """Step 11 - Combined assembly QC and cross-assembler comparison.
 
-    Runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes
-    the unified assembly_info.csv used by assembly-only mode and backbone
-    selection.
+    Normalizes assembler outputs, runs BUSCO, telomere detection, QUAST, and
+    optional Merqury, then writes the unified assembly_info.csv used by
+    assembly-only mode and backbone selection.
     """
-    runner.log("Step 11 - Assembly QC and comparison")
+    runner.log("Step 11 - Normalize assemblies, QC, and comparison")
+    step_10_normalize(runner, embedded=True)
     step_08_busco(runner)
     step_09_telomere(runner)
     step_11_quast(runner)
@@ -5588,6 +5668,7 @@ def _cleanup_outputs(runner):
     os.makedirs("temp/purge_dups", exist_ok=True)
     os.makedirs("temp/qc", exist_ok=True)
     os.makedirs("temp/log", exist_ok=True)
+    os.makedirs("temp/assemblers", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
     os.makedirs("telomere_pool", exist_ok=True)
     moved_counts = defaultdict(int)
@@ -5759,6 +5840,15 @@ def _cleanup_outputs(runner):
         except Exception as e:
             runner.log_warn(f"Could not move {src} to {dst_dir}/: {e}")
 
+    # Move bulky assembler work directories only after normalized FASTAs have
+    # been copied into assemblies/ and stable reports have been written.
+    for src in ["hicanu", "NextDenovo", "peregrine-2021", "ipa", "flye",
+                "hifiasm", "lja_out", "mbg_out", "raven_out"]:
+        try:
+            _safe_move(src, "temp/assemblers")
+        except Exception as e:
+            runner.log_warn(f"Could not move {src} to temp/assemblers/: {e}")
+
     # Move misc logs
     for f in glob.glob("*.log"):
         if "busco" in f.lower():
@@ -5845,6 +5935,7 @@ def step_16_assembly_only_full(runner):
     _assembly_only_summary(runner)
     # Cleanup for assembly-only mode
     os.makedirs("final_results", exist_ok=True)
+    os.makedirs("temp/assemblers", exist_ok=True)
     for src in ["assemblies/assembly_info.csv",
                 "assemblies/assembly.busco.csv",
                 "assemblies/assembly.quast.csv",
@@ -5858,6 +5949,21 @@ def step_16_assembly_only_full(runner):
                 shutil.copy2(src, dst)
             except Exception:
                 pass
+
+    for src in ["hicanu", "NextDenovo", "peregrine-2021", "ipa", "flye",
+                "hifiasm", "lja_out", "mbg_out", "raven_out"]:
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join("temp/assemblers", os.path.basename(src))
+        try:
+            if os.path.exists(dst):
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                else:
+                    os.remove(dst)
+            shutil.move(src, dst)
+        except Exception as e:
+            runner.log_warn(f"Could not move {src} to temp/assemblers/: {e}")
     runner.log("Assembly-only results in final_results/")
 
 
@@ -5874,8 +5980,8 @@ STEP_FUNCTIONS = {
     8: step_08_mbg,                # MBG assembly
     9: step_09_raven,              # Raven assembly
     # ---- Normalize + pre-refinement QC/comparison (Steps 10-11) ----
-    10: step_10_normalize,         # Copy, normalize, FASTA rename
-    11: step_11_assembly_qc_comparison,  # BUSCO + telomere + QUAST + Merqury
+    10: step_10_normalize,         # Legacy standalone normalize step
+    11: step_11_assembly_qc_comparison,  # Normalize + BUSCO + telomere + QUAST + Merqury
     # ---- Telomere pool + refinement (Steps 12-13) ----
     12: step_10_telomere_pool,     # Build telomere contig pool after QC comparison
     13: step_12_refine,            # Backbone selection + refinement

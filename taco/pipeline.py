@@ -506,18 +506,18 @@ class PipelineRunner:
             optional.setdefault(tuple(tool_spec) if isinstance(tool_spec, list) else tool_spec, set()).add(reason)
 
         assembler_steps = {
-            1: ("canu", "canu"),
-            2: ("nextDenovo", "nextDenovo"),
-            3: ("peregrine", "pg_asm"),
-            4: ("ipa", "ipa"),
-            5: ("flye", "flye"),
-            6: ("hifiasm", "hifiasm"),
-            7: ("lja", "lja"),
-            8: ("mbg", ["MBG", "mbg"]),
-            9: ("raven", "raven"),
+            1: ("canu", "canu", True),
+            2: ("nextDenovo", "nextDenovo", True),
+            3: ("peregrine", "pg_asm", True),
+            4: ("ipa", "ipa", True),
+            5: ("flye", "flye", True),
+            6: ("hifiasm", "hifiasm", True),
+            7: ("lja", "lja", True),
+            8: ("mbg", ["MBG", "mbg"], False),
+            9: ("raven", "raven", True),
         }
 
-        for step, (asm, binary) in assembler_steps.items():
+        for step, (asm, binary, required_tool) in assembler_steps.items():
             if step not in step_set:
                 continue
             if not is_assembler_compatible(asm, self.platform):
@@ -525,7 +525,10 @@ class PipelineRunner:
                     f"Step {step} ({asm}) is incompatible with platform "
                     f"{self.platform}; it will be skipped.")
                 continue
-            add_required(binary, f"Step {step} {asm} assembly")
+            if required_tool:
+                add_required(binary, f"Step {step} {asm} assembly")
+            else:
+                add_optional(binary, f"Step {step} {asm} assembly")
 
         if 11 in step_set:
             if self.run_busco:
@@ -672,14 +675,32 @@ class PipelineRunner:
         """Warn clearly when a selected/resumed step lacks upstream files."""
         checks = {
             11: [
-                ("normalized assembler FASTA files",
-                 ["assemblies/*.result.fasta"],
-                 "Step 10"),
+                ("assembler FASTA files to normalize or compare",
+                 ["assemblies/*.result.fasta",
+                  "hicanu/canu.contigs.fasta",
+                  "NextDenovo/03.ctg_graph/nd.asm.fasta",
+                  "peregrine-2021/asm_ctgs_m_p.fa",
+                  "ipa/assembly-results/final.p_ctg.fasta",
+                  "flye/assembly.fasta",
+                  "hifiasm/hifiasm.fasta",
+                  "lja_out/assembly.fasta",
+                  "mbg_out/mbg.fasta",
+                  "raven_out/raven.fasta",
+                  "temp/assemblers/hicanu/canu.contigs.fasta",
+                  "temp/assemblers/NextDenovo/03.ctg_graph/nd.asm.fasta",
+                  "temp/assemblers/peregrine-2021/asm_ctgs_m_p.fa",
+                  "temp/assemblers/ipa/assembly-results/final.p_ctg.fasta",
+                  "temp/assemblers/flye/assembly.fasta",
+                  "temp/assemblers/hifiasm/hifiasm.fasta",
+                  "temp/assemblers/lja_out/assembly.fasta",
+                  "temp/assemblers/mbg_out/mbg.fasta",
+                  "temp/assemblers/raven_out/raven.fasta"],
+                 "Steps 1-9 or an existing assemblies/ directory"),
             ],
             12: [
                 ("telomere FASTAs or normalized assembler FASTAs",
                  ["assemblies/*.telo.fasta", "assemblies/*.result.fasta"],
-                 "Steps 10-11"),
+                 "Step 11"),
             ],
             13: [
                 ("assembly comparison table",
@@ -691,7 +712,7 @@ class PipelineRunner:
                  "Step 12"),
                 ("normalized assembler FASTA files",
                  ["assemblies/*.result.fasta"],
-                 "Step 10"),
+                 "Step 11"),
             ],
             14: [
                 ("final merged assembly",

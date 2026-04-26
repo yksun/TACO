@@ -160,7 +160,7 @@ taco -g 12m -t 16 \
 
 ### Assembly-Only Mode
 
-Use `--assembly-only` when the goal is assembler benchmarking and comparison without refinement. TACO runs all assemblers, standardizes outputs, runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes the combined comparison table to `assemblies/assembly_info.csv` and a summary to `final_results/assembly_only_result.csv`. Use `--benchmark` separately only when you also want machine-readable step timing and run metadata in `benchmark_logs/`.
+Use `--assembly-only` when the goal is assembler benchmarking and comparison without refinement. TACO runs all assemblers, standardizes outputs inside Step 11, runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes the combined comparison table to `assemblies/assembly_info.csv` and a summary to `final_results/assembly_only_result.csv`. Use `--benchmark` separately only when you also want machine-readable step timing and run metadata in `benchmark_logs/`.
 
 ### Benchmark Provenance Mode
 
@@ -172,7 +172,7 @@ Use `--benchmark` when a run needs publication-ready provenance. It writes extra
 
 When running selected steps with `-s`/`--steps`, TACO checks only the tools needed by those requested steps. For example, `-s 13-15` will not warn about missing assembler binaries from Steps 1-9. Before each resumed step, TACO checks for expected upstream files and prints a specific warning naming the missing file type and the earlier step that should have produced it. For common cleanup outputs, TACO can also restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step.
 
-Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 11-15`) or place the expected file back at the path shown in the warning.
+Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 11 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 11-15`) or place the expected file back at the path shown in the warning.
 
 ## Sequencing Platform Support
 
@@ -231,8 +231,8 @@ Incompatible assemblers are automatically skipped with a warning.
 |---|---|---|
 | 0 | Input QC and validation | Setup |
 | 1-9 | Run assemblers: Canu, NextDenovo, Peregrine, IPA, Flye, Hifiasm, LJA, MBG, Raven | Assembly |
-| 10 | Copy and normalize all assembler outputs | Normalization |
-| 11 | Assembly QC and comparison: BUSCO + telomere + QUAST + optional Merqury | Comparison |
+| 10 | Normalize all assembler outputs (legacy standalone step; Step 11 runs this automatically) | Normalization |
+| 11 | Normalize assemblies + QC comparison: BUSCO + telomere + QUAST + optional Merqury | Comparison |
 | 12 | Build optimized telomere contig pool (pairwise quickmerge + validation) | Telomere pool |
 | 13 | Backbone selection and telomere-aware refinement | Refinement |
 | 14 | Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
@@ -245,11 +245,11 @@ Step 0 runs automatically before assembly. It validates that the FASTQ file exis
 
 ### Full Refinement Mode (default)
 
-Steps 0-15: runs all assemblers, normalizes, performs combined assembly QC/comparison, builds the telomere pool, selects and refines the backbone, runs final QC, and produces the comparison report.
+Steps 0-9 and 11-15: runs all assemblers, normalizes inside Step 11, performs combined assembly QC/comparison, builds the telomere pool, selects and refines the backbone, runs final QC, and produces the comparison report. Step 10 remains available for manual legacy normalization but is no longer part of the default full run.
 
 ### Assembly-Only Mode (`--assembly-only`)
 
-Steps 0-11, 16: runs all assemblers, normalizes, performs combined assembly QC/comparison, then produces the assembly-only comparison table at `final_results/assembly_only_result.csv`. Skips the telomere pool (Step 12), refinement (Step 13), and final QC/report steps (Steps 14-15). This mode is designed for benchmarking and decision-making without modifying any assembly.
+Steps 0-9, 11, and 16: runs all assemblers, normalizes inside Step 11, performs combined assembly QC/comparison, then produces the assembly-only comparison table at `final_results/assembly_only_result.csv`. Skips the standalone legacy normalization step (Step 10), telomere pool (Step 12), refinement (Step 13), and final QC/report steps (Steps 14-15). This mode is designed for benchmarking and decision-making without modifying any assembly.
 
 ## Telomere Detection
 
@@ -431,8 +431,8 @@ Example workflow for inspecting weak spots:
 project_directory/
 ├── assemblies/
 │   ├── assembly_info.csv                # Unified comparison table
-│   ├── canu.fasta                       # Normalized assembly outputs
-│   ├── nextdenovo.fasta
+│   ├── canu.result.fasta                # Normalized assembly outputs
+│   ├── nextDenovo.result.fasta
 │   ├── ...
 │   ├── single_tel.replaced.debug.tsv    # All rescue alignment hits
 │   ├── single_tel.candidates.tsv        # Plausible rescue candidates
@@ -467,10 +467,12 @@ project_directory/
 │   ├── telomere_supported_best_clean.fasta
 │   ├── pool_contig_provenance.tsv
 │   └── telomere_pool_decisions.tsv
-├── quast_results/                       # QUAST output
+├── quast_out/                           # Pre-refinement QUAST output
+├── quast_final/                         # Final-assembly QUAST output
 ├── logs/                                # Per-step log files
 ├── temp/                                # Organized temporary alignment/work files after cleanup
 │   ├── merge/
+│   ├── assemblers/                      # Raw assembler work directories after cleanup
 │   ├── telomere/
 │   ├── polish/
 │   ├── purge_dups/
