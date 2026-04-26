@@ -2027,7 +2027,8 @@ def _run_merqury_preselection(runner):
             asm_fa = f"assemblies/{asm}.result.fasta"
             if not os.path.isfile(asm_fa) or os.path.getsize(asm_fa) == 0:
                 continue
-            _run_merqury_for_assembly(runner, db, asm_fa, f"merqury/{asm}", asm)
+            _run_merqury_for_assembly(runner, db, asm_fa,
+                                      _merqury_output_prefix(asm), asm)
     else:
         runner.log_warn("Merqury requested but merqury.sh or a valid .meryl database was not found; skipping.")
 
@@ -2213,12 +2214,15 @@ def _ensure_merqury_db(runner):
 
 def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
     """Run Merqury unless the expected QV and completeness files already exist."""
-    qv_file = f"{out_prefix}.qv"
-    comp_file = f"{out_prefix}.completeness.stats"
-    qv_ready = os.path.isfile(qv_file) and os.path.getsize(qv_file) > 0
-    comp_ready = os.path.isfile(comp_file) and os.path.getsize(comp_file) > 0
+    prefixes = _merqury_prefixes_for_label(label, preferred=out_prefix)
+    qv_ready, qv_ready_path = _find_merqury_metric_for_prefixes(
+        prefixes, ".qv", _parse_merqury_qv)
+    comp_ready, comp_ready_path = _find_merqury_metric_for_prefixes(
+        prefixes, ".completeness.stats", _parse_merqury_completeness)
     if qv_ready and comp_ready:
-        runner.log_info(f"Merqury output exists for {label}; reusing")
+        runner.log_info(
+            f"Merqury output exists for {label}; reusing "
+            f"{qv_ready_path} and {comp_ready_path}")
         return
 
     merqury_bin = shutil.which("merqury.sh")
@@ -2226,17 +2230,136 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
         runner.log_warn("merqury.sh not found; skipping Merqury")
         return
 
+    out_dir = os.path.dirname(out_prefix)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    runner.log_info(f"Merqury output for {label}: prefix {out_prefix}")
     cmd = [merqury_bin, db, asm_fa, out_prefix]
     result = runner.run_cmd(cmd, desc=f"Merqury on {label}", check=False)
     if result.returncode != 0:
         runner.log_warn(f"Merqury failed for {label} (exit {result.returncode})")
+        return
+
+    qv, qv_path = _find_merqury_metric_for_prefixes(
+        prefixes, ".qv", _parse_merqury_qv)
+    comp, comp_path = _find_merqury_metric_for_prefixes(
+        prefixes, ".completeness.stats", _parse_merqury_completeness)
+    if qv or comp:
+        runner.log_info(
+            f"Merqury metrics for {label}: QV={qv or 'NA'} "
+            f"({qv_path or 'not found'}), completeness={comp or 'NA'} "
+            f"({comp_path or 'not found'})")
+    else:
+        found = _merqury_metric_candidates_for_prefixes(prefixes, ".qv")
+        found += _merqury_metric_candidates_for_prefixes(
+            prefixes, ".completeness.stats")
+        found_msg = ", ".join(found[:6]) if found else "none"
+        runner.log_warn(
+            f"Merqury finished for {label}, but no parseable QV/completeness "
+            f"files were found near prefix '{out_prefix}'. Found: {found_msg}")
+
+
+def _merqury_safe_label(label):
+    """Make a filesystem-safe Merqury label."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label or "assembly")).strip("_")
+    return safe or "assembly"
+
+
+def _merqury_output_prefix(label):
+    """Return the organized Merqury output prefix for a label."""
+    safe = _merqury_safe_label(label)
+    return os.path.join("merqury", safe, safe)
+
+
+def _merqury_prefixes_for_label(label, preferred=None):
+    """Return current and legacy Merqury output prefixes for a label."""
+    safe = _merqury_safe_label(label)
+    prefixes = []
+    if preferred:
+        prefixes.append(preferred)
+    prefixes.extend([
+        os.path.join("merqury", safe, safe),  # current organized prefix
+        os.path.join("merqury", safe),        # legacy flat prefix
+    ])
+
+    out = []
+    seen = set()
+    for prefix in prefixes:
+        if prefix and prefix not in seen:
+            seen.add(prefix)
+            out.append(prefix)
+    return out
+
+
+def _merqury_metric_candidates(out_prefix, suffix):
+    """Return possible Merqury metric files for an output prefix and suffix."""
+    out_dir = os.path.dirname(out_prefix) or "."
+    base = os.path.basename(out_prefix)
+    patterns = [
+        f"{out_prefix}{suffix}",
+        f"{out_prefix}*{suffix}",
+        os.path.join(out_prefix, f"*{suffix}"),
+        os.path.join(out_prefix, f"{base}*{suffix}"),
+        os.path.join(out_dir, f"{base}*{suffix}"),
+    ]
+
+    seen = set()
+    exact = f"{out_prefix}{suffix}"
+    candidates = []
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            if path in seen or not os.path.isfile(path) or os.path.getsize(path) == 0:
+                continue
+            seen.add(path)
+            candidates.append(path)
+
+    if exact in candidates:
+        candidates.remove(exact)
+        return [exact] + sorted(
+            candidates, key=lambda p: os.path.getmtime(p), reverse=True)
+    return sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
+def _merqury_metric_candidates_for_prefixes(prefixes, suffix):
+    """Return possible Merqury metric files for several output prefixes."""
+    out = []
+    seen = set()
+    for prefix in prefixes:
+        for path in _merqury_metric_candidates(prefix, suffix):
+            if path in seen:
+                continue
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _find_merqury_metric_for_prefixes(prefixes, suffix, parser):
+    """Return (value, path) for the first usable metric found."""
+    for path in _merqury_metric_candidates_for_prefixes(prefixes, suffix):
+        value = parser(path)
+        if value != "":
+            return value, path
+    return "", ""
+
+
+def _parse_merqury_metric_for_prefix(out_prefix, suffix, parser):
+    """Parse the first usable Merqury metric file found for out_prefix."""
+    value, _ = _find_merqury_metric_for_prefixes([out_prefix], suffix, parser)
+    return value
+
+
+def _parse_merqury_metric_for_label(label, suffix, parser):
+    """Parse the first usable Merqury metric file for a named assembly label."""
+    value, _ = _find_merqury_metric_for_prefixes(
+        _merqury_prefixes_for_label(label), suffix, parser)
+    return value
 
 
 def _parse_merqury_number(value):
     """Parse a numeric Merqury token, tolerating percent signs and NA values."""
     if value is None:
         return None
-    cleaned = value.strip().rstrip("%")
+    cleaned = value.strip().rstrip("%").replace(",", "")
     if cleaned.lower() in ("", "na", "nan"):
         return None
     try:
@@ -2264,7 +2387,14 @@ def _parse_merqury_qv(path):
             parts = re.split(r"\s+", line)
             if len(parts) >= 4:
                 value = _parse_merqury_number(parts[3])
-                if value is not None:
+                if value is not None and 1 <= value <= 1000:
+                    return _format_merqury_number(value)
+            numeric_values = [
+                _parse_merqury_number(part)
+                for part in parts
+            ]
+            for value in reversed(numeric_values):
+                if value is not None and 1 <= value <= 1000:
                     return _format_merqury_number(value)
             m = re.search(r'(?i)\bqv\b[^0-9.+-]*([0-9]+(?:\.[0-9]+)?)', line)
             if m:
@@ -2284,13 +2414,32 @@ def _parse_merqury_completeness(path):
             if not line or line.startswith("#"):
                 continue
             parts = re.split(r"\s+", line)
+            is_all_row = any(part.lower() == "all" for part in parts[:2])
             if len(parts) >= 5:
                 value = _parse_merqury_number(parts[4])
-                if value is not None:
-                    if len(parts) > 1 and parts[1].lower() == "all":
+                if value is not None and 0 <= value <= 100:
+                    if is_all_row:
                         return _format_merqury_number(value)
                     if fallback is None:
                         fallback = value
+            if len(parts) >= 4:
+                value = _parse_merqury_number(parts[3])
+                if value is not None and 0 <= value <= 100:
+                    if is_all_row:
+                        return _format_merqury_number(value)
+                    if fallback is None:
+                        fallback = value
+            numeric_values = [
+                _parse_merqury_number(part)
+                for part in parts
+            ]
+            for value in reversed(numeric_values):
+                if value is not None and 0 <= value <= 100:
+                    if is_all_row:
+                        return _format_merqury_number(value)
+                    if fallback is None:
+                        fallback = value
+                    break
             m = re.search(r'(?i)completeness[^0-9.+-]*([0-9]+(?:\.[0-9]+)?)', line)
             if m and fallback is None:
                 fallback = _parse_merqury_number(m.group(1))
@@ -2304,8 +2453,11 @@ def _write_merqury_csv():
     rows = [["Metric"] + assemblers, ["Merqury QV"], ["Merqury completeness (%)"]]
 
     for asm in assemblers:
-        rows[1].append(_parse_merqury_qv(os.path.join("merqury", f"{asm}.qv")))
-        rows[2].append(_parse_merqury_completeness(os.path.join("merqury", f"{asm}.completeness.stats")))
+        rows[1].append(
+            _parse_merqury_metric_for_label(asm, ".qv", _parse_merqury_qv))
+        rows[2].append(
+            _parse_merqury_metric_for_label(
+                asm, ".completeness.stats", _parse_merqury_completeness))
 
     with open("assemblies/assembly.merqury.csv", "w", newline="") as f:
         csv.writer(f).writerows(rows)
@@ -5504,8 +5656,9 @@ def _final_comparison_report(runner):
     _final_merqury_qc(runner)
 
     # Write merged Merqury CSV
-    qv = _parse_merqury_qv("merqury/final.qv")
-    comp = _parse_merqury_completeness("merqury/final.completeness.stats")
+    qv = _parse_merqury_metric_for_label("final", ".qv", _parse_merqury_qv)
+    comp = _parse_merqury_metric_for_label(
+        "final", ".completeness.stats", _parse_merqury_completeness)
     with open("assemblies/merged.merqury.csv", "w", newline="") as f:
         csv.writer(f).writerows([
             ["Metric", "merged"],
@@ -5932,7 +6085,8 @@ def _final_merqury_qc(runner):
         return
 
     runner.log_version("merqury.sh", "merqury.sh")
-    _run_merqury_for_assembly(runner, db, final_fa, "merqury/final",
+    _run_merqury_for_assembly(runner, db, final_fa,
+                              _merqury_output_prefix("final"),
                               "final assembly")
 
 

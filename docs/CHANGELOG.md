@@ -87,6 +87,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   Step 16 preserves restored `assembly_info.csv` when component metric CSVs are
   unavailable.  Deprecated step 17 requests now produce guidance for the
   current 0-16 step layout.
+- **Fixed** Merqury result discovery.  TACO now searches exact, prefix-based,
+  and nested Merqury output paths for `.qv` and `.completeness.stats` files
+  before writing `assembly.merqury.csv` or final Merqury metrics, and logs a
+  warning when `merqury.sh` exits successfully but no parseable metrics are
+  found.
+- **Improved** Merqury output organization.  New Merqury runs now use a real
+  per-assembly directory and prefix such as `merqury/canu/canu.qv` and
+  `merqury/canu/canu.completeness.stats`, while still reading legacy flat
+  outputs such as `merqury/canu.qv` from older runs.
 
 ---
 

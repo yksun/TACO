@@ -108,7 +108,7 @@ taco -g 12m -t 16 \
 
 **Merqury QV scoring (enabled by default):**
 
-Merqury is automatically enabled for all platforms when `merqury.sh` and `meryl` are installed. TACO builds a reads `.meryl` k-mer database from input reads, runs Merqury on every assembler output (Step 11), and on the final refined assembly (Step 14). Merqury QV and completeness are included in backbone scoring, `assemblies/assembly_info.csv`, and the final all-QC comparison table at `final_results/final_result.csv`.
+Merqury is automatically enabled for all platforms when `merqury.sh` and `meryl` are installed. TACO builds a reads `.meryl` k-mer database from input reads, runs Merqury on every assembler output (Step 11), and on the final refined assembly (Step 14). Per-assembly Merqury files are written under `merqury/{assembler}/` with prefixes such as `merqury/canu/canu.qv` and `merqury/canu/canu.completeness.stats`. Merqury QV and completeness are included in backbone scoring, `assemblies/assembly_info.csv`, and the final all-QC comparison table at `final_results/final_result.csv`.
 
 By default, `--merqury-k auto` chooses an optimized k-mer size from the genome size. TACO uses Merqury's `best_k.sh` helper when it is available, otherwise it uses the same genome-size/collision-rate calculation and clamps automatic values to a practical 17-31 range for broad eukaryotic assemblies. Set `MERQURY_COLLISION_RATE` to tune the default 0.001 collision rate. Override with `--merqury-k 21` or `--merqury-k 31` when you need a fixed database for cross-run comparability.
 
@@ -530,7 +530,7 @@ TACO/
 
 **Missing Python modules:** TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and the `taco/` directory is alongside `TACO.sh`.
 
-**Merqury not working:** Merqury is enabled by default when `merqury.sh` + `meryl` are installed. The reads `.meryl` database is built automatically from input reads. If you have a pre-built database, use `--merqury-db path/to/reads.meryl`. Install with `conda install -c bioconda merqury meryl`. Nanopore and PacBio CLR runs log a warning because QV from non-high-accuracy reads can be underestimated; completeness and relative assembler ranking are still reported but should be interpreted cautiously. Disable with `--no-merqury`.
+**Merqury not working:** Merqury is enabled by default when `merqury.sh` + `meryl` are installed. The reads `.meryl` database is built automatically from input reads. If you have a pre-built database, use `--merqury-db path/to/reads.meryl`. Install with `conda install -c bioconda merqury meryl`. TACO writes organized outputs such as `merqury/canu/canu.qv` and also searches legacy flat prefixes such as `merqury/canu.qv`; if `assembly.merqury.csv` is empty, check the step log for the warning that lists which Merqury files were found. Nanopore and PacBio CLR runs log a warning because QV from non-high-accuracy reads can be underestimated; completeness and relative assembler ranking are still reported but should be interpreted cautiously. Disable with `--no-merqury`.
 
 ## Citation
 
