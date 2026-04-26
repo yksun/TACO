@@ -21,9 +21,8 @@ dependencies:
   - snakemake>=7,<8  # IPA requires Snakemake 7; v8 removed --reason flag
   # Additional assemblers for broader comparison
   - lja               # La Jolla Assembler (HiFi-only, very contiguous)
+  - mbg               # Multiplex de Bruijn Graph assembler (HiFi-only)
   - raven>=1.8        # Fast OLC assembler (all long-read platforms)
-  # MBG (Multiplex de Bruijn Graph, HiFi-only) — install manually if needed:
-  #   git clone https://github.com/maickrau/MBG && cd MBG && make
   # Analysis tools
   - busco>=5.4
   - quast>=5.2

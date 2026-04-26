@@ -41,7 +41,7 @@ The conda environment provides all external bioinformatics tools. The `pip insta
 
 **QV scoring (via conda):** Merqury, Meryl (auto-enabled for all platforms when installed; builds a reads `.meryl` database from input reads with `--merqury-k auto` by default. QV is most accurate with PacBio HiFi or Illumina; ONT/CLR QV may underestimate true quality, and relative ranking/completeness should be interpreted cautiously)
 
-**Optional manual install:** MBG (Multiplex de Bruijn Graph, HiFi-only). Build from source: `git clone https://github.com/maickrau/MBG && cd MBG && make`. Place the `MBG` binary on PATH.
+**Additional HiFi assembler:** MBG (Multiplex de Bruijn Graph, HiFi-only) is included in `taco-env.yml` via Bioconda. For an existing environment, install with `mamba install -c conda-forge -c bioconda mbg`. If the package is unavailable on your platform, build from source: `git clone https://github.com/maickrau/MBG && cd MBG && make`, then place the `MBG` binary on PATH.
 
 ## Sequencing Platform Support
 

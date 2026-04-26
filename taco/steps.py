@@ -919,9 +919,10 @@ def step_08_mbg(runner):
     mbg_bin = shutil.which("MBG") or shutil.which("mbg")
     if not mbg_bin:
         _assembler_skip(runner, 8, "mbg",
-                        "optional HiFi assembler binary not found. Install MBG "
-                        "or build from source if you want it included in the "
-                        "comparison; TACO will continue with other assemblers")
+                        "optional HiFi assembler binary not found. Install "
+                        "with `mamba install -c conda-forge -c bioconda mbg` "
+                        "or build MBG from source if you want it included in "
+                        "the comparison; TACO will continue with other assemblers")
         return
 
     os.makedirs("mbg_out", exist_ok=True)
@@ -963,22 +964,31 @@ def step_09_raven(runner):
 
     raven_fa = "raven_out/raven.fasta"
     raven_log = "raven_out/raven.log"
-    fastq_arg = shlex.quote(str(runner.fastq))
-    raven_arg = shlex.quote(str(raven_bin))
     threads = max(1, int(getattr(runner, "threads", 1) or 1))
     flag_override = os.environ.get("TACO_RAVEN_THREADS_FLAG", "").strip()
 
     attempts = []
     if flag_override.lower() in {"0", "false", "none", "off", "no"}:
-        attempts.append((f"{raven_arg} {fastq_arg}", "Raven without thread flag"))
+        attempts.append(([raven_bin, runner.fastq], "Raven without thread flag", "no_threads"))
     elif flag_override:
-        attempts.append((f"{raven_arg} {flag_override} {threads} {fastq_arg}",
-                         f"Raven with {flag_override}"))
-        attempts.append((f"{raven_arg} {fastq_arg}", "Raven without thread flag"))
+        attempts.append((
+            [raven_bin, flag_override, str(threads), runner.fastq],
+            f"Raven with {flag_override}",
+            "override_threads",
+        ))
+        attempts.append(([raven_bin, runner.fastq], "Raven without thread flag", "no_threads"))
     else:
-        attempts.append((f"{raven_arg} --threads {threads} {fastq_arg}",
-                         "Raven with --threads"))
-        attempts.append((f"{raven_arg} {fastq_arg}", "Raven without thread flag"))
+        attempts.append((
+            [raven_bin, "--threads", str(threads), runner.fastq],
+            "Raven with --threads",
+            "long_threads",
+        ))
+        attempts.append((
+            [raven_bin, "-t", str(threads), runner.fastq],
+            "Raven with -t",
+            "short_threads",
+        ))
+        attempts.append(([raven_bin, runner.fastq], "Raven without thread flag", "no_threads"))
 
     unsupported_thread_flag = (
         "no such option",
@@ -987,19 +997,32 @@ def step_09_raven(runner):
         "invalid option",
     )
 
-    for i, (base_cmd, label) in enumerate(attempts):
+    for i, (cmd_args, label, attempt_name) in enumerate(attempts):
         if os.path.exists(raven_fa):
             os.remove(raven_fa)
-        cmd = f"{base_cmd} > {raven_fa} 2> {raven_log}"
-        result = runner.run_cmd(cmd, desc=f"Running {label}", check=False)
+        attempt_log = f"raven_out/raven.{attempt_name}.log"
+        display = " ".join(shlex.quote(str(c)) for c in cmd_args)
+        runner.log(f"Running {label}")
+        runner.log(f"$ {display} > {raven_fa} 2> {attempt_log}")
+        with open(raven_fa, "w") as out_fh, open(attempt_log, "w") as err_fh:
+            result = subprocess.run(
+                cmd_args,
+                stdout=out_fh,
+                stderr=err_fh,
+                text=True,
+            )
+        try:
+            shutil.copyfile(attempt_log, raven_log)
+        except OSError:
+            pass
         if result.returncode == 0 and os.path.isfile(raven_fa) and os.path.getsize(raven_fa) > 0:
             runner.log(f"Raven assembly: {raven_fa}")
             return
 
         stderr_text = ""
-        if os.path.isfile(raven_log):
+        if os.path.isfile(attempt_log):
             try:
-                with open(raven_log, "r", errors="ignore") as fh:
+                with open(attempt_log, "r", errors="ignore") as fh:
                     stderr_text = fh.read().lower()
             except Exception:
                 stderr_text = ""
@@ -1009,19 +1032,23 @@ def step_09_raven(runner):
         )
         if can_retry_without_flag:
             runner.log_info(
-                "Raven rejected the thread option; retrying without a thread "
-                "flag for compatibility with older raven builds.")
+                "Raven rejected the thread option; retrying with the next "
+                "compatible Raven command form.")
             continue
 
         if result.returncode != 0:
-            runner.log_warn(f"Step 9: Raven failed during {label}. Skipping.")
+            runner.log_warn(
+                f"Step 9: Raven failed during {label}. Skipping. "
+                f"See {attempt_log}")
+            _log_file_tail(runner, attempt_log, f"Raven log tail for {label}")
             return
         break
 
     if os.path.isfile(raven_fa) and os.path.getsize(raven_fa) > 0:
         runner.log(f"Raven assembly: {raven_fa}")
     else:
-        runner.log_warn("Step 9: Raven produced no output.")
+        runner.log_warn(f"Step 9: Raven produced no output. See {raven_log}")
+        _log_file_tail(runner, raven_log, "Raven log tail")
 
 
 def step_10_normalize(runner, embedded=False):
@@ -2230,14 +2257,46 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
         runner.log_warn("merqury.sh not found; skipping Merqury")
         return
 
-    out_dir = os.path.dirname(out_prefix)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.dirname(out_prefix) or "."
+    out_base = (
+        os.path.basename(out_prefix.rstrip(os.sep))
+        or _merqury_safe_label(label)
+    )
+    os.makedirs(out_dir, exist_ok=True)
     runner.log_info(f"Merqury output for {label}: prefix {out_prefix}")
-    cmd = [merqury_bin, db, asm_fa, out_prefix]
-    result = runner.run_cmd(cmd, desc=f"Merqury on {label}", check=False)
+    # merqury.sh creates internal logs under logs/$out.*.log, so an output
+    # prefix containing slashes can make its own log redirection fail while the
+    # top-level script still exits 0. Run inside the target directory and pass a
+    # basename prefix to keep Merqury's internal paths flat.
+    cmd = [
+        merqury_bin,
+        os.path.abspath(db),
+        os.path.abspath(asm_fa),
+        out_base,
+    ]
+    command_log = os.path.join(out_dir, f"{out_base}.taco-merqury.log")
+    display = " ".join(shlex.quote(str(c)) for c in cmd)
+    runner.log(f"Merqury on {label}")
+    runner.log(f"$ cd {shlex.quote(out_dir)} && {display}")
+    try:
+        with open(command_log, "w") as log_fh:
+            log_fh.write(f"$ {display}\n")
+            log_fh.flush()
+            result = subprocess.run(
+                cmd,
+                cwd=out_dir,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+    except OSError as exc:
+        runner.log_warn(f"Merqury failed for {label}: {exc}")
+        return
     if result.returncode != 0:
-        runner.log_warn(f"Merqury failed for {label} (exit {result.returncode})")
+        runner.log_warn(
+            f"Merqury failed for {label} (exit {result.returncode}); "
+            f"see {command_log}")
+        _log_file_tail(runner, command_log, f"Merqury log tail for {label}")
         return
 
     qv, qv_path = _find_merqury_metric_for_prefixes(
@@ -2256,7 +2315,20 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
         found_msg = ", ".join(found[:6]) if found else "none"
         runner.log_warn(
             f"Merqury finished for {label}, but no parseable QV/completeness "
-            f"files were found near prefix '{out_prefix}'. Found: {found_msg}")
+            f"files were found near prefix '{out_prefix}'. Found: {found_msg}. "
+            f"Command log: {command_log}")
+        _log_file_tail(runner, command_log, f"Merqury log tail for {label}")
+
+
+def _log_file_tail(runner, path, label, limit=8):
+    """Log a short tail from a diagnostic file, if available."""
+    try:
+        with open(path, "r", errors="ignore") as fh:
+            lines = [line.rstrip() for line in fh if line.strip()]
+    except OSError:
+        return
+    for line in lines[-limit:]:
+        runner.log_warn(f"{label}: {line[:300]}")
 
 
 def _merqury_safe_label(label):

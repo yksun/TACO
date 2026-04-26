@@ -64,13 +64,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - **Fixed** `purge_dups` version parsing.  Error output such as
   `[E::hit_read] can not open PAF file version` is rejected as non-version
   text, and TACO falls back to the active conda package version when available.
-- **Fixed** Raven command compatibility.  Step 9 now tries Raven's long thread
-  option and automatically retries without a thread flag when the installed
-  Raven build rejects thread options such as `-t`/`--threads`, avoiding false
-  assembler failures from older command-line interfaces.
+- **Fixed** Raven command compatibility.  Step 9 now tries Raven's long and
+  short thread options, then automatically retries without a thread flag when
+  the installed Raven build rejects thread options.  Each attempt keeps its own
+  stderr log and failed attempts print a short diagnostic tail.
 - **Improved** MBG handling.  MBG remains included in the assembler comparison
-  when installed, but missing MBG is treated as an optional HiFi assembler
-  skip with a clearer warning instead of a broad environment warning.
+  when installed, is now included in `taco-env.yml` via Bioconda, and missing
+  MBG is treated as an optional HiFi assembler skip with a clearer warning
+  instead of a broad environment warning.
 - **Changed** default step flow.  Step 11 now runs assembly normalization before
   BUSCO, telomere, QUAST, and Merqury comparison.  Step 10 is retained as a
   legacy standalone normalization step, but default full mode runs Steps 0-9
@@ -112,7 +113,8 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   ONT ultra-long reads can supplement HiFi via `--ul` but require HiFi as
   primary — not auto-enabled.  CLR disabled.
 - **New** assemblers: LJA (La Jolla Assembler, HiFi-only) and raven (all
-  platforms) added to default comparison.  MBG available as manual install.
+  platforms) added to default comparison.  MBG available via Bioconda or
+  source builds.
 - **New** Step 0 — Input QC: validates FASTQ exists, estimates coverage,
   warns for low coverage per-platform (HiFi <25×, ONT <40×, CLR <50×),
   logs compatible assemblers.  Runs in both full and assembly-only modes.
