@@ -5875,10 +5875,37 @@ def _assembly_only_summary(runner):
     os.makedirs("final_results", exist_ok=True)
 
     # Step 11 already runs BUSCO, telomere, QUAST, and optional Merqury.
-    # Rebuild the summary from existing metric CSVs so assembly-only mode is
-    # a report/cleanup step rather than another expensive QC pass.
-    _write_merqury_csv()
-    _build_assembly_info(runner)
+    # Rebuild only when component metric CSVs are present.  If Step 16 is run
+    # alone after cleanup, preserve a restored assembly_info.csv instead of
+    # replacing it with a mostly empty table.
+    component_csvs = [
+        "assemblies/assembly.busco.csv",
+        "assemblies/assembly.quast.csv",
+        "assemblies/assembly.telo.csv",
+        "assemblies/assembly.merqury.csv",
+    ]
+    has_component_metrics = any(
+        os.path.isfile(p) and os.path.getsize(p) > 0
+        for p in component_csvs
+    )
+    has_existing_info = (
+        os.path.isfile("assemblies/assembly_info.csv")
+        and os.path.getsize("assemblies/assembly_info.csv") > 0
+    )
+
+    if has_component_metrics:
+        _write_merqury_csv()
+        _build_assembly_info(runner)
+    elif has_existing_info:
+        runner.log_info(
+            "Using existing assemblies/assembly_info.csv for assembly-only "
+            "summary; component metric CSVs were not present for rebuild.")
+    else:
+        runner.log_warn(
+            "No Step 11 assembly_info.csv or component metric CSVs found; "
+            "writing an empty assembly-only comparison skeleton.")
+        _write_merqury_csv()
+        _build_assembly_info(runner)
 
     if os.path.isfile("assemblies/assembly_info.csv"):
         shutil.copy("assemblies/assembly_info.csv", "final_results/assembly_only_result.csv")

@@ -129,6 +129,12 @@ def parse_args():
         args.steps = list(range(0, 10)) + list(range(11, 16))
     
     for s in args.steps:
+        if s == 17:
+            parser.error(
+                "Invalid step: 17. TACO v1.3.1 uses public steps 0-16. "
+                "Use -s 12-15 to resume the full refinement/report path, "
+                "or -s 11,16 for assembly-only summary/cleanup.")
         if s < 0 or s > 16:
-            parser.error(f"Invalid step: {s}")
+            parser.error(
+                f"Invalid step: {s}. TACO v1.3.1 uses public steps 0-16.")
     return args

@@ -643,12 +643,23 @@ class PipelineRunner:
 
     def restore_resume_inputs_for_step(self, step):
         """Restore inputs moved by older cleanup runs before a resumed step."""
-        if step in (13, 14, 15, 16):
+        if step in (12, 13, 14, 15, 16):
             self._copy_resume_input(
                 "assemblies/assembly_info.csv",
                 ["final_results/assembly_info.csv",
                  "final_results/assembly_only_result.csv"],
             )
+        if step in (16,):
+            for metric_csv in [
+                "assembly.busco.csv",
+                "assembly.quast.csv",
+                "assembly.telo.csv",
+                "assembly.merqury.csv",
+            ]:
+                self._copy_resume_input(
+                    os.path.join("assemblies", metric_csv),
+                    [os.path.join("final_results", metric_csv)],
+                )
         if step in (13, 15):
             self._copy_resume_input(
                 "pool_contig_provenance.tsv",
@@ -673,31 +684,103 @@ class PipelineRunner:
 
     def warn_missing_step_inputs(self, step):
         """Warn clearly when a selected/resumed step lacks upstream files."""
+        fastq_patterns = [self.fastq] if self.fastq else []
+        raw_assembler_patterns = [
+            "hicanu/canu.contigs.fasta",
+            "NextDenovo/03.ctg_graph/nd.asm.fasta",
+            "peregrine-2021/asm_ctgs_m_p.fa",
+            "ipa/assembly-results/final.p_ctg.fasta",
+            "flye/assembly.fasta",
+            "hifiasm/hifiasm.fasta",
+            "lja_out/assembly.fasta",
+            "mbg_out/mbg.fasta",
+            "raven_out/raven.fasta",
+            "temp/assemblers/hicanu/canu.contigs.fasta",
+            "temp/assemblers/NextDenovo/03.ctg_graph/nd.asm.fasta",
+            "temp/assemblers/peregrine-2021/asm_ctgs_m_p.fa",
+            "temp/assemblers/ipa/assembly-results/final.p_ctg.fasta",
+            "temp/assemblers/flye/assembly.fasta",
+            "temp/assemblers/hifiasm/hifiasm.fasta",
+            "temp/assemblers/lja_out/assembly.fasta",
+            "temp/assemblers/mbg_out/mbg.fasta",
+            "temp/assemblers/raven_out/raven.fasta",
+        ]
+        assembler_or_normalized_patterns = (
+            ["assemblies/*.result.fasta"] + raw_assembler_patterns
+        )
+        component_metric_patterns = [
+            "assemblies/assembly.busco.csv",
+            "assemblies/assembly.quast.csv",
+            "assemblies/assembly.telo.csv",
+            "assemblies/assembly.merqury.csv",
+            "final_results/assembly.busco.csv",
+            "final_results/assembly.quast.csv",
+            "final_results/assembly.telo.csv",
+            "final_results/assembly.merqury.csv",
+        ]
+
         checks = {
+            1: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            2: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            3: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            4: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            5: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            6: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            7: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            8: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            9: [
+                ("input FASTQ",
+                 fastq_patterns,
+                 "the --fastq input / Step 0"),
+            ],
+            10: [
+                ("assembler FASTA files to normalize, or existing normalized assemblies",
+                 assembler_or_normalized_patterns,
+                 "Steps 1-9 or previous Step 10/11 output"),
+            ],
             11: [
                 ("assembler FASTA files to normalize or compare",
-                 ["assemblies/*.result.fasta",
-                  "hicanu/canu.contigs.fasta",
-                  "NextDenovo/03.ctg_graph/nd.asm.fasta",
-                  "peregrine-2021/asm_ctgs_m_p.fa",
-                  "ipa/assembly-results/final.p_ctg.fasta",
-                  "flye/assembly.fasta",
-                  "hifiasm/hifiasm.fasta",
-                  "lja_out/assembly.fasta",
-                  "mbg_out/mbg.fasta",
-                  "raven_out/raven.fasta",
-                  "temp/assemblers/hicanu/canu.contigs.fasta",
-                  "temp/assemblers/NextDenovo/03.ctg_graph/nd.asm.fasta",
-                  "temp/assemblers/peregrine-2021/asm_ctgs_m_p.fa",
-                  "temp/assemblers/ipa/assembly-results/final.p_ctg.fasta",
-                  "temp/assemblers/flye/assembly.fasta",
-                  "temp/assemblers/hifiasm/hifiasm.fasta",
-                  "temp/assemblers/lja_out/assembly.fasta",
-                  "temp/assemblers/mbg_out/mbg.fasta",
-                  "temp/assemblers/raven_out/raven.fasta"],
+                 assembler_or_normalized_patterns,
                  "Steps 1-9 or an existing assemblies/ directory"),
             ],
             12: [
+                ("assembly comparison table",
+                 ["assemblies/assembly_info.csv",
+                  "final_results/assembly_info.csv",
+                  "final_results/assembly_only_result.csv"],
+                 "Step 11"),
                 ("telomere FASTAs or normalized assembler FASTAs",
                  ["assemblies/*.telo.fasta", "assemblies/*.result.fasta"],
                  "Step 11"),
@@ -731,15 +814,32 @@ class PipelineRunner:
                  ["assemblies/assembly_info.csv",
                   "final_results/assembly_info.csv"],
                  "Step 11"),
+                ("final telomere QC table",
+                 ["assemblies/merged.telo.csv"],
+                 "Step 14"),
+                ("final QUAST QC table",
+                 ["assemblies/merged.quast.csv"],
+                 "Step 14"),
+                ("final BUSCO QC table",
+                 ["assemblies/merged.busco.csv"],
+                 "Step 14"),
             ],
             16: [
                 ("assembly comparison table or component metric CSVs",
                  ["assemblies/assembly_info.csv",
                   "final_results/assembly_info.csv",
-                  "assemblies/assembly.busco.csv"],
+                  "final_results/assembly_only_result.csv"] + component_metric_patterns,
                  "Step 11"),
             ],
         }
+        if step == 15 and self.merqury_enable:
+            checks[15].append(
+                ("final Merqury QC files",
+                 ["merqury/final.qv",
+                  "merqury/final.completeness.stats",
+                  "assemblies/merged.merqury.csv"],
+                 "Step 14 or Step 15 Merqury auto-retry")
+            )
         missing = []
         for desc, patterns, producer in checks.get(step, []):
             if not self._any_path_exists(patterns):
@@ -755,6 +855,9 @@ class PipelineRunner:
             self.log_warn(
                 f"  Missing {desc} from {producer}; expected one of: "
                 f"{', '.join(patterns)}")
+            self.log_warn(
+                f"  Finish {producer} first, or provide one of the expected "
+                "files before running this step alone.")
 
     # ------------------------------------------------------------------ #
     # Reference FASTA resolution
@@ -1303,9 +1406,10 @@ nextgraph_options = -a 1
             self.log_info(f"User telomere motif: {self.motif}")
         else:
             self.log_info("No user motif supplied; using auto-discovery + built-in families")
+        default_full_steps = list(range(0, 10)) + list(range(11, 16))
         if self.assembly_only:
             self.log_info("Assembly-only mode enabled")
-        elif self.steps != list(range(0, 16)):
+        elif self.steps != default_full_steps:
             self.log_info(
                 "Selected-step/resume mode enabled: " +
                 ",".join(str(s) for s in self.steps))

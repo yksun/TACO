@@ -80,6 +80,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   and peers) into `temp/assemblers/` after normalized FASTAs and comparison
   tables have been written; Step 11 can normalize from those organized
   directories during resumed runs.
+- **Improved** selected-step preflight.  Standalone runs now warn about the
+  specific upstream files they need: Step 10 checks for assembler outputs from
+  Steps 1-9 or existing normalized FASTAs, Step 12+ checks for Step 11
+  comparison outputs before telomere-pool/refinement/final reporting, and
+  Step 16 preserves restored `assembly_info.csv` when component metric CSVs are
+  unavailable.  Deprecated step 17 requests now produce guidance for the
+  current 0-16 step layout.
 
 ---
 
