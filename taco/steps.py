@@ -15,6 +15,7 @@ import subprocess
 import json
 import math
 import tempfile
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -562,6 +563,78 @@ def _assembler_skip(runner, step_num, name, reason):
     runner.log_warn(f"Step {step_num}: {name} skipped — {reason}")
 
 
+def _log_file_tail(runner, path, label, limit=12, missing_ok=True):
+    """Log a short tail from a diagnostic file."""
+    if not os.path.exists(path):
+        if not missing_ok:
+            runner.log_warn(f"{label}: log file not found: {path}")
+        return
+    try:
+        with open(path, "r", errors="ignore") as fh:
+            lines = [line.rstrip() for line in fh if line.strip()]
+    except OSError as exc:
+        runner.log_warn(f"{label}: could not read {path}: {exc}")
+        return
+    if not lines:
+        runner.log_warn(f"{label}: {path} is empty")
+        return
+    for line in lines[-limit:]:
+        runner.log_warn(f"{label}: {line[:300]}")
+
+
+def _log_file_status(runner, path, label):
+    """Log whether an expected output/log path exists and how large it is."""
+    if os.path.isfile(path):
+        runner.log_info(f"{label}: {path} ({os.path.getsize(path):,} bytes)")
+    elif os.path.isdir(path):
+        try:
+            entries = sum(1 for _ in os.scandir(path))
+        except OSError:
+            entries = 0
+        runner.log_info(f"{label}: {path}/ ({entries:,} entries)")
+    else:
+        runner.log_warn(f"{label}: missing {path}")
+
+
+def _write_text_log(path, text):
+    """Write captured text to a log file when text is non-empty."""
+    if not text:
+        return False
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    return True
+
+
+def _run_shell_capture(runner, cmd, label, stdout_log=None, stderr_log=None, cwd=None):
+    """Run a shell command, capture streams to optional logs, and log status."""
+    runner.log(label)
+    cwd_msg = f" (cwd={cwd})" if cwd else ""
+    runner.log(f"$ {cmd}{cwd_msg}")
+    start = time.time()
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
+    if stdout_log and _write_text_log(stdout_log, result.stdout):
+        _log_file_status(runner, stdout_log, f"{label} stdout log")
+    if stderr_log and _write_text_log(stderr_log, result.stderr):
+        _log_file_status(runner, stderr_log, f"{label} stderr log")
+    if result.returncode != 0:
+        if stderr_log and os.path.isfile(stderr_log):
+            _log_file_tail(runner, stderr_log, f"{label} stderr tail")
+        elif result.stderr:
+            for line in result.stderr.strip().splitlines()[-8:]:
+                runner.log_warn(f"{label} stderr: {line[:300]}")
+    return result
+
+
 def step_00_input_qc(runner):
     """Step 0 - Input validation and QC.
 
@@ -696,9 +769,22 @@ def step_01_canu(runner):
 
     # Run canu with stderr/stdout captured so we can report the actual error.
     # Canu dev builds from bioconda frequently fail with broken Java (JLI_StringDup).
+    os.makedirs("hicanu", exist_ok=True)
     runner.log(f"Running canu")
     runner.log(f"$ {cmd}")
+    start = time.time()
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
+    stdout_log = "hicanu/canu.taco.stdout.log"
+    stderr_log = "hicanu/canu.taco.stderr.log"
+    if result.stdout:
+        with open(stdout_log, "w") as f:
+            f.write(result.stdout)
+        _log_file_status(runner, stdout_log, "Canu stdout log")
+    if result.stderr:
+        with open(stderr_log, "w") as f:
+            f.write(result.stderr)
+        _log_file_status(runner, stderr_log, "Canu stderr log")
     if result.returncode != 0:
         # Log captured stderr/stdout for diagnosis
         err_snippet = (result.stderr or "").strip()
@@ -729,6 +815,10 @@ def step_01_canu(runner):
                             f"Check that {runner.fastq} exists and is readable.")
 
         runner.log_warn("Step 1: canu failed. Skipping. Other assemblers will continue.")
+        _log_file_tail(runner, stderr_log, "Canu stderr tail")
+        return
+
+    _log_file_status(runner, "hicanu/canu.contigs.fasta", "Canu assembly output")
 
 
 def step_02_nextdenovo(runner):
@@ -744,6 +834,9 @@ def step_02_nextdenovo(runner):
     result = runner.run_cmd(cmd, desc="Running nextDenovo", check=False)
     if result.returncode != 0:
         runner.log_warn("Step 2: nextDenovo failed. Skipping. Check logs/step_2.log for details.")
+        return
+    _log_file_status(runner, "NextDenovo/03.ctg_graph/nd.asm.fasta",
+                     "NextDenovo assembly output")
 
 
 def step_03_peregrine(runner):
@@ -765,6 +858,9 @@ def step_03_peregrine(runner):
     result = runner.run_cmd(cmd, desc="Running peregrine", check=False)
     if result.returncode != 0:
         runner.log_warn("Step 3: peregrine failed. Skipping. Check logs/step_3.log for details.")
+        return
+    _log_file_status(runner, "peregrine-2021/asm_ctgs_m_p.fa",
+                     "Peregrine assembly output")
 
 
 def step_04_ipa(runner):
@@ -803,6 +899,9 @@ def step_04_ipa(runner):
     result = runner.run_cmd(cmd, desc="Running ipa", check=False)
     if result.returncode != 0:
         runner.log_warn("Step 4: IPA failed. Skipping. Check logs/step_4.log for details.")
+        return
+    _log_file_status(runner, "ipa/assembly-results/final.p_ctg.fasta",
+                     "IPA assembly output")
 
 
 def step_05_flye(runner):
@@ -827,7 +926,11 @@ def step_05_flye(runner):
     cmd = f"flye {flye_flag} {runner.fastq} --out-dir flye --threads {runner.threads}"
     result = runner.run_cmd(cmd, desc="Running flye", check=False)
     if result.returncode != 0:
-        runner.log_warn("Step 5: flye failed. Skipping. Check logs/step_5.log for details.")
+        runner.log_warn("Step 5: flye failed. Skipping. Check logs/step_5.log and flye/flye.log for details.")
+        _log_file_tail(runner, "flye/flye.log", "Flye log tail")
+        return
+    _log_file_status(runner, "flye/assembly.fasta", "Flye assembly output")
+    _log_file_status(runner, "flye/flye.log", "Flye tool log")
 
 
 def step_06_hifiasm(runner):
@@ -862,17 +965,25 @@ def step_06_hifiasm(runner):
     cmd = f"cd hifiasm && hifiasm -o hifiasm.asm -t {runner.threads} {hifiasm_flags} {runner.fastq} 2> hifiasm.log"
     result = runner.run_cmd(cmd, desc="Running hifiasm", check=False)
     if result.returncode != 0:
-        runner.log_warn("Step 6: hifiasm failed. Skipping. Check logs/step_6.log for details.")
+        runner.log_warn("Step 6: hifiasm failed. Skipping. Check logs/step_6.log and hifiasm/hifiasm.log for details.")
+        _log_file_tail(runner, "hifiasm/hifiasm.log", "Hifiasm log tail")
         return
+    _log_file_status(runner, "hifiasm/hifiasm.log", "Hifiasm tool log")
 
     if os.path.isfile("hifiasm/hifiasm.asm.bp.p_ctg.gfa"):
+        _log_file_status(runner, "hifiasm/hifiasm.asm.bp.p_ctg.gfa",
+                         "Hifiasm primary contig GFA")
         cmd = "cd hifiasm && awk '/^S/{print \">\"$2; print $3}' hifiasm.asm.bp.p_ctg.gfa > hifiasm.fasta"
         result = runner.run_cmd(cmd, desc="Converting GFA to FASTA", check=False)
         if result.returncode != 0:
             runner.log_warn("Step 6: GFA-to-FASTA conversion failed. Check logs/step_6.log.")
+        else:
+            _log_file_status(runner, "hifiasm/hifiasm.fasta",
+                             "Hifiasm assembly output")
     else:
         runner.log_warn("Step 6: hifiasm primary contig GFA not found (hifiasm.asm.bp.p_ctg.gfa). "
                         "Assembly may have failed or produced no output.")
+        _log_file_tail(runner, "hifiasm/hifiasm.log", "Hifiasm log tail")
 
 
 def step_07_lja(runner):
@@ -896,15 +1007,19 @@ def step_07_lja(runner):
            f"-t {runner.threads} 2> lja_out/lja.log")
     result = runner.run_cmd(cmd, desc="Running LJA", check=False)
     if result.returncode != 0:
-        runner.log_warn("Step 7: LJA failed. Skipping.")
+        runner.log_warn("Step 7: LJA failed. Skipping. See lja_out/lja.log")
+        _log_file_tail(runner, "lja_out/lja.log", "LJA log tail")
         return
+    _log_file_status(runner, "lja_out/lja.log", "LJA tool log")
 
     # LJA output: lja_out/assembly.fasta
     lja_fa = "lja_out/assembly.fasta"
     if os.path.isfile(lja_fa) and os.path.getsize(lja_fa) > 0:
         runner.log(f"LJA assembly: {lja_fa}")
+        _log_file_status(runner, lja_fa, "LJA assembly output")
     else:
         runner.log_warn("Step 7: LJA produced no output.")
+        _log_file_tail(runner, "lja_out/lja.log", "LJA log tail")
 
 
 def step_08_mbg(runner):
@@ -932,21 +1047,27 @@ def step_08_mbg(runner):
            f"-t {runner.threads} 2> mbg_out/mbg.log")
     result = runner.run_cmd(cmd, desc="Running MBG", check=False)
     if result.returncode != 0:
-        runner.log_warn("Step 8: MBG failed. Skipping.")
+        runner.log_warn("Step 8: MBG failed. Skipping. See mbg_out/mbg.log")
+        _log_file_tail(runner, "mbg_out/mbg.log", "MBG log tail")
         return
+    _log_file_status(runner, "mbg_out/mbg.log", "MBG tool log")
 
     # Convert GFA to FASTA
     gfa_file = "mbg_out/mbg.gfa"
     mbg_fa = "mbg_out/mbg.fasta"
     if os.path.isfile(gfa_file) and os.path.getsize(gfa_file) > 0:
+        _log_file_status(runner, gfa_file, "MBG GFA output")
         cmd = f"awk '/^S/{{print \">\"$2; print $3}}' {gfa_file} > {mbg_fa}"
         runner.run_cmd(cmd, desc="Converting MBG GFA to FASTA", check=False)
         if os.path.isfile(mbg_fa) and os.path.getsize(mbg_fa) > 0:
             runner.log(f"MBG assembly: {mbg_fa}")
+            _log_file_status(runner, mbg_fa, "MBG assembly output")
         else:
             runner.log_warn("Step 8: MBG GFA-to-FASTA conversion produced no output.")
+            _log_file_tail(runner, "mbg_out/mbg.log", "MBG log tail")
     else:
         runner.log_warn("Step 8: MBG produced no GFA output.")
+        _log_file_tail(runner, "mbg_out/mbg.log", "MBG log tail")
 
 
 def step_09_raven(runner):
@@ -995,6 +1116,7 @@ def step_09_raven(runner):
         "unrecognized option",
         "unknown option",
         "invalid option",
+        "failed to parse command line parameters",
     )
 
     for i, (cmd_args, label, attempt_name) in enumerate(attempts):
@@ -1004,6 +1126,7 @@ def step_09_raven(runner):
         display = " ".join(shlex.quote(str(c)) for c in cmd_args)
         runner.log(f"Running {label}")
         runner.log(f"$ {display} > {raven_fa} 2> {attempt_log}")
+        start = time.time()
         with open(raven_fa, "w") as out_fh, open(attempt_log, "w") as err_fh:
             result = subprocess.run(
                 cmd_args,
@@ -1011,12 +1134,15 @@ def step_09_raven(runner):
                 stderr=err_fh,
                 text=True,
             )
+        runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
         try:
             shutil.copyfile(attempt_log, raven_log)
         except OSError:
             pass
         if result.returncode == 0 and os.path.isfile(raven_fa) and os.path.getsize(raven_fa) > 0:
             runner.log(f"Raven assembly: {raven_fa}")
+            _log_file_status(runner, raven_fa, "Raven assembly output")
+            _log_file_status(runner, attempt_log, f"{label} stderr log")
             return
 
         stderr_text = ""
@@ -1159,7 +1285,17 @@ def step_08_busco(runner):
         os.chdir("busco")
         cmd = f"busco -i ../{fasta_path} -l {lineage} -m genome -c {runner.threads} -o {base} {force_flag}"
         try:
-            runner.run_cmd(cmd, desc=f"Running BUSCO on {base}", check=False)
+            result = runner.run_cmd(cmd, desc=f"Running BUSCO on {base}", check=False)
+            if result.returncode != 0:
+                runner.log_warn(f"BUSCO failed for {base}; checking BUSCO logs")
+                busco_logs = (
+                    glob.glob(f"{base}/logs/*.log")
+                    + glob.glob(f"run_{base}/logs/*.log")
+                )
+                for log_path in sorted(busco_logs)[-3:]:
+                    _log_file_tail(runner, log_path, f"BUSCO log tail for {base}")
+            else:
+                runner.log_info(f"BUSCO output directory for {base}: busco/{base}")
         finally:
             os.chdir(cwd)
 
@@ -2033,7 +2169,12 @@ def step_11_quast(runner):
     if quast_bin:
         asm_str = " ".join(assemblies)
         cmd = f"{quast_bin} {asm_str} --threads {runner.threads} -o quast_out"
-        runner.run_cmd(cmd, desc="Running QUAST", check=False)
+        result = runner.run_cmd(cmd, desc="Running QUAST", check=False)
+        if result.returncode != 0:
+            runner.log_warn("QUAST failed for assembly comparison; checking quast_out/quast.log")
+            _log_file_tail(runner, "quast_out/quast.log", "QUAST log tail")
+        else:
+            _log_file_status(runner, "quast_out/report.tsv", "QUAST report")
 
     _build_quast_csv(runner)
     runner.log("Wrote assemblies/assembly.quast.csv")
@@ -2228,13 +2369,25 @@ def _ensure_merqury_db(runner):
         meryl_bin, "count", f"k={k}", f"threads={runner.threads}",
         "output", db, fastq,
     ]
+    display = " ".join(shlex.quote(str(c)) for c in cmd)
+    runner.log(f"$ {display}")
+    start = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
+    runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
+    stdout_log = f"merqury/meryl_count.k{k}.stdout.log"
+    stderr_log = f"merqury/meryl_count.k{k}.stderr.log"
+    if _write_text_log(stdout_log, result.stdout):
+        _log_file_status(runner, stdout_log, "meryl count stdout log")
+    if _write_text_log(stderr_log, result.stderr):
+        _log_file_status(runner, stderr_log, "meryl count stderr log")
     if result.returncode != 0 or not os.path.isdir(db):
         msg = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
         runner.log_warn(f"meryl count failed: {msg[:400]}")
+        _log_file_tail(runner, stderr_log, "meryl count stderr tail")
         return None
 
     runner.log(f"Built {db}")
+    _log_file_status(runner, db, "Merqury meryl database")
     runner.merqury_db = db
     return db
 
@@ -2282,6 +2435,7 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
         with open(command_log, "w") as log_fh:
             log_fh.write(f"$ {display}\n")
             log_fh.flush()
+            start = time.time()
             result = subprocess.run(
                 cmd,
                 cwd=out_dir,
@@ -2289,9 +2443,12 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+            elapsed = time.time() - start
+            log_fh.write(f"\nCommand exit={result.returncode} elapsed={elapsed:.1f}s\n")
     except OSError as exc:
         runner.log_warn(f"Merqury failed for {label}: {exc}")
         return
+    runner.log(f"Command exit={result.returncode} elapsed={elapsed:.1f}s")
     if result.returncode != 0:
         runner.log_warn(
             f"Merqury failed for {label} (exit {result.returncode}); "
@@ -2318,18 +2475,6 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
             f"files were found near prefix '{out_prefix}'. Found: {found_msg}. "
             f"Command log: {command_log}")
         _log_file_tail(runner, command_log, f"Merqury log tail for {label}")
-
-
-def _log_file_tail(runner, path, label, limit=8):
-    """Log a short tail from a diagnostic file, if available."""
-    try:
-        with open(path, "r", errors="ignore") as fh:
-            lines = [line.rstrip() for line in fh if line.strip()]
-    except OSError:
-        return
-    for line in lines[-limit:]:
-        runner.log_warn(f"{label}: {line[:300]}")
-
 
 def _merqury_safe_label(label):
     """Make a filesystem-safe Merqury label."""
@@ -3558,45 +3703,69 @@ def _run_purge_dups(runner, input_fa, output_fa):
     paf = os.path.join(pd_dir, "reads_vs_asm.paf.gz")
     cmd = (f"minimap2 -x {mm2_preset} -t {runner.threads} {input_fa} {runner.fastq} "
            f"| gzip -c > {paf}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    result = _run_shell_capture(
+        runner, cmd, "purge_dups: align reads to assembly",
+        stderr_log=os.path.join(pd_dir, "01.read_alignment.stderr.log"))
     if not os.path.isfile(paf) or os.path.getsize(paf) == 0:
         runner.log_warn("purge_dups: read alignment produced no output; skipping")
+        _log_file_tail(runner, os.path.join(pd_dir, "01.read_alignment.stderr.log"),
+                       "purge_dups read alignment stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
+    _log_file_status(runner, paf, "purge_dups read alignment PAF")
 
     # Step 2: Calculate coverage stats
     stat_file = os.path.join(pd_dir, "PB.stat")
     cutoff_file = os.path.join(pd_dir, "cutoffs")
     cmd = f"pbcstat {paf} -O {pd_dir}"
-    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _run_shell_capture(
+        runner, cmd, "purge_dups: calculate coverage stats",
+        stdout_log=os.path.join(pd_dir, "02.pbcstat.stdout.log"),
+        stderr_log=os.path.join(pd_dir, "02.pbcstat.stderr.log"))
 
     if not os.path.isfile(stat_file) or os.path.getsize(stat_file) == 0:
         runner.log_warn("purge_dups pbcstat failed; skipping")
+        _log_file_tail(runner, os.path.join(pd_dir, "02.pbcstat.stderr.log"),
+                       "purge_dups pbcstat stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
+    _log_file_status(runner, stat_file, "purge_dups PB.stat")
 
     cmd = f"calcuts {stat_file} > {cutoff_file}"
-    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _run_shell_capture(
+        runner, cmd, "purge_dups: calculate cutoffs",
+        stderr_log=os.path.join(pd_dir, "03.calcuts.stderr.log"))
 
     if not os.path.isfile(cutoff_file) or os.path.getsize(cutoff_file) == 0:
         runner.log_warn("purge_dups calcuts failed; skipping")
+        _log_file_tail(runner, os.path.join(pd_dir, "03.calcuts.stderr.log"),
+                       "purge_dups calcuts stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
+    _log_file_status(runner, cutoff_file, "purge_dups cutoffs")
 
     # Step 3: Self-alignment for duplicate detection
     split_fa = os.path.join(pd_dir, "asm.split.fa")
     cmd = f"split_fa {input_fa} > {split_fa}"
-    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _run_shell_capture(
+        runner, cmd, "purge_dups: split assembly FASTA",
+        stderr_log=os.path.join(pd_dir, "04.split_fa.stderr.log"))
 
     if not os.path.isfile(split_fa) or os.path.getsize(split_fa) == 0:
         runner.log_warn("purge_dups split_fa failed; skipping")
+        _log_file_tail(runner, os.path.join(pd_dir, "04.split_fa.stderr.log"),
+                       "purge_dups split_fa stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
+    _log_file_status(runner, split_fa, "purge_dups split FASTA")
 
     self_paf = os.path.join(pd_dir, "self_aln.paf.gz")
     cmd = (f"minimap2 -x asm5 -t {runner.threads} -DP {split_fa} {split_fa} "
            f"| gzip -c > {self_paf}")
-    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _run_shell_capture(
+        runner, cmd, "purge_dups: self-align split assembly",
+        stderr_log=os.path.join(pd_dir, "05.self_alignment.stderr.log"))
+    _log_file_status(runner, self_paf, "purge_dups self-alignment PAF")
 
     # Step 4: Purge duplicates
     # Taxon-aware purge_dups strategy:
@@ -3643,20 +3812,29 @@ def _run_purge_dups(runner, input_fa, output_fa):
         runner.log_info(f"Using custom calcuts override: {custom_calcuts}")
 
     cmd = f"purge_dups {purge_flag} -c {base_cov} -T {cutoff_file} {self_paf} > {dups_bed}"
-    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _run_shell_capture(
+        runner, cmd, "purge_dups: call duplicate regions",
+        stderr_log=os.path.join(pd_dir, "06.purge_dups.stderr.log"))
 
     if not os.path.isfile(dups_bed) or os.path.getsize(dups_bed) == 0:
         runner.log_warn("purge_dups produced no dups.bed; skipping")
+        _log_file_tail(runner, os.path.join(pd_dir, "06.purge_dups.stderr.log"),
+                       "purge_dups duplicate caller stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
+    _log_file_status(runner, dups_bed, "purge_dups duplicate BED")
 
     # Step 5: Get purged sequences
     # get_seqs writes purged.fa and hap.fa in its working directory.
     # Use absolute path for input FASTA since we set cwd=pd_dir.
     abs_input = os.path.abspath(input_fa)
-    cmd = f"get_seqs -e {dups_bed} {abs_input}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                            cwd=pd_dir)
+    abs_dups_bed = os.path.abspath(dups_bed)
+    cmd = f"get_seqs -e {abs_dups_bed} {abs_input}"
+    result = _run_shell_capture(
+        runner, cmd, "purge_dups: extract purged sequences",
+        stdout_log=os.path.join(pd_dir, "07.get_seqs.stdout.log"),
+        stderr_log=os.path.join(pd_dir, "07.get_seqs.stderr.log"),
+        cwd=pd_dir)
 
     purged_fa = os.path.join(pd_dir, "purged.fa")
     hap_fa = os.path.join(pd_dir, "hap.fa")
@@ -3670,10 +3848,17 @@ def _run_purge_dups(runner, input_fa, output_fa):
         runner.log(f"purge_dups: {len(before_recs)} → {len(after_recs)} contigs "
                    f"({hap_n} haplotigs removed), "
                    f"{before_bp:,} → {after_bp:,} bp")
+        _log_file_status(runner, purged_fa, "purge_dups purged FASTA")
+        if os.path.isfile(hap_fa):
+            _log_file_status(runner, hap_fa, "purge_dups haplotig FASTA")
+        else:
+            runner.log_info("purge_dups haplotig FASTA: none produced")
         shutil.copy(purged_fa, output_fa)
         return True
     else:
         runner.log_warn("purge_dups produced no purged.fa; keeping original assembly")
+        _log_file_tail(runner, os.path.join(pd_dir, "07.get_seqs.stderr.log"),
+                       "purge_dups get_seqs stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
 
@@ -3723,8 +3908,9 @@ def _run_polishing(runner, input_fa, output_fa):
                 cmd = (f"{yak_bin} count -k {ksize} -b 37 "
                        f"-t {runner.threads} -o {yak_out} "
                        f"{runner.fastq} {runner.fastq}")
-                result = subprocess.run(cmd, shell=True, capture_output=True,
-                                        text=True)
+                result = _run_shell_capture(
+                    runner, cmd, f"yak count k={ksize}",
+                    stderr_log=os.path.join(polish_dir, f"yak_k{ksize}.stderr.log"))
                 if result.returncode != 0:
                     runner.log_warn(f"yak count k={ksize} failed: "
                                     f"{(result.stderr or '').strip()[:200]}")
@@ -3764,29 +3950,38 @@ def _run_polishing(runner, input_fa, output_fa):
                    f"{abs_input} {runner.fastq} "
                    f"| {samtools_bin} sort -@ {runner.threads} "
                    f"-o {bam_sorted}")
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = _run_shell_capture(
+                runner, cmd, "NextPolish2: map and sort HiFi reads",
+                stderr_log=os.path.join(polish_dir, "nextpolish2_mapping.stderr.log"))
             if not os.path.isfile(bam_sorted) or os.path.getsize(bam_sorted) == 0:
                 runner.log_warn("HiFi read mapping failed; skipping NextPolish2")
+                _log_file_tail(
+                    runner, os.path.join(polish_dir, "nextpolish2_mapping.stderr.log"),
+                    "NextPolish2 mapping stderr tail")
                 shutil.copy(input_fa, output_fa)
                 return False
+            _log_file_status(runner, bam_sorted, "NextPolish2 sorted BAM")
 
             # Index the sorted BAM
             cmd = f"{samtools_bin} index {bam_sorted}"
-            subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            _run_shell_capture(
+                runner, cmd, "NextPolish2: index sorted BAM",
+                stderr_log=os.path.join(polish_dir, "nextpolish2_bam_index.stderr.log"))
             runner.log("  Mapped and sorted HiFi reads")
 
             # Run NextPolish2: nextPolish2 -t N reads.bam genome.fa k21.yak k31.yak
             cmd = (f"{np2_bin} -t {runner.threads} "
                    f"{abs_bam} {abs_input} {abs_k21} {abs_k31}")
-            runner.log_info(f"Running: {cmd}")
-            result = subprocess.run(cmd, shell=True, capture_output=True,
-                                    text=True)
+            result = _run_shell_capture(
+                runner, cmd, "Run NextPolish2",
+                stderr_log=os.path.join(polish_dir, "nextpolish2.stderr.log"))
 
             if result.returncode == 0 and result.stdout.strip():
                 with open(output_fa, "w") as f:
                     f.write(result.stdout)
                 if os.path.getsize(output_fa) > 0:
                     runner.log("NextPolish2 polishing complete")
+                    _log_file_status(runner, output_fa, "NextPolish2 polished FASTA")
                     return True
 
             # If NextPolish2 failed, check if yak databases are stale/corrupt
@@ -3806,6 +4001,9 @@ def _run_polishing(runner, input_fa, output_fa):
             else:
                 runner.log_warn(f"NextPolish2 failed or produced no output"
                                 f"{': ' + err_msg if err_msg else ''}")
+                _log_file_tail(
+                    runner, os.path.join(polish_dir, "nextpolish2.stderr.log"),
+                    "NextPolish2 stderr tail")
 
             shutil.copy(input_fa, output_fa)
             return False
@@ -3836,15 +4034,21 @@ def _run_polishing(runner, input_fa, output_fa):
             medaka_model = os.environ.get("MEDAKA_MODEL", "r1041_e82_400bps_sup_v4.3.0")
             cmd = (f"medaka_consensus -i {runner.fastq} -d {input_fa} "
                    f"-o {medaka_out} -t {runner.threads} -m {medaka_model}")
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = _run_shell_capture(
+                runner, cmd, "Run Medaka",
+                stdout_log=os.path.join(polish_dir, "medaka.stdout.log"),
+                stderr_log=os.path.join(polish_dir, "medaka.stderr.log"))
 
             medaka_fa = os.path.join(medaka_out, "consensus.fasta")
             if os.path.isfile(medaka_fa) and os.path.getsize(medaka_fa) > 0:
                 shutil.copy(medaka_fa, output_fa)
                 runner.log("Medaka polishing complete")
+                _log_file_status(runner, medaka_fa, "Medaka consensus FASTA")
                 return True
             else:
                 runner.log_warn("Medaka produced no output; falling back to Racon")
+                _log_file_tail(runner, os.path.join(polish_dir, "medaka.stderr.log"),
+                               "Medaka stderr tail")
 
     # Racon path: default for CLR, fallback for ONT
     racon_bin = shutil.which("racon")
@@ -3861,19 +4065,27 @@ def _run_polishing(runner, input_fa, output_fa):
     overlap_paf = os.path.join(polish_dir, "reads_vs_asm.paf")
     cmd = (f"minimap2 -x {mm2_preset} -t {runner.threads} {input_fa} {runner.fastq} "
            f"> {overlap_paf}")
-    subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _run_shell_capture(
+        runner, cmd, "Racon: map reads to assembly",
+        stderr_log=os.path.join(polish_dir, "racon_mapping.stderr.log"))
+    _log_file_status(runner, overlap_paf, "Racon overlap PAF")
 
     # Racon outputs polished FASTA to stdout
     cmd = f"racon -t {runner.threads} {runner.fastq} {overlap_paf} {input_fa}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    result = _run_shell_capture(
+        runner, cmd, "Run Racon",
+        stderr_log=os.path.join(polish_dir, "racon.stderr.log"))
     if result.stdout.strip():
         with open(output_fa, "w") as f:
             f.write(result.stdout)
         if os.path.getsize(output_fa) > 0:
             runner.log("Racon polishing complete")
+            _log_file_status(runner, output_fa, "Racon polished FASTA")
             return True
 
     runner.log_warn("Racon produced no output; keeping unpolished assembly")
+    _log_file_tail(runner, os.path.join(polish_dir, "racon.stderr.log"),
+                   "Racon stderr tail")
     shutil.copy(input_fa, output_fa)
     return False
 
@@ -5183,9 +5395,12 @@ def step_12_refine(runner):
                f"{abs_fa} {runner.fastq} "
                f"| {samtools_bin} sort -@ {runner.threads} "
                f"| {samtools_bin} depth -a -J - > {depth_file}")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        result = _run_shell_capture(
+            runner, cmd, "Coverage QC: map reads and compute depth",
+            stderr_log=os.path.join(cov_dir, "coverage_depth.stderr.log"))
 
         if os.path.isfile(depth_file) and os.path.getsize(depth_file) > 0:
+            _log_file_status(runner, depth_file, "Coverage QC depth table")
             # Build source assembler lookup for each final contig
             # name_map, pool_provenance_map, pool_asm_map are in scope from GFF section
             contig_source = {}  # final_contig_name -> (source_assembler, source_type)
@@ -5405,6 +5620,8 @@ def step_12_refine(runner):
             runner.log(f"Coverage QC reports: {summary_tsv}, {weak_tsv}, {weak_gff}")
         else:
             runner.log_warn("Coverage QC: read mapping produced no depth data")
+            _log_file_tail(runner, os.path.join(cov_dir, "coverage_depth.stderr.log"),
+                           "Coverage QC mapping stderr tail")
     elif not samtools_bin or not minimap2_bin:
         runner.log_info("Coverage QC skipped (requires samtools + minimap2)")
 
@@ -5521,7 +5738,14 @@ def _final_busco_qc(runner):
         os.chdir("busco")
         cmd = f"busco -o final -i ../{final_fa} -l {lineage} -m genome -c {runner.threads}"
         try:
-            runner.run_cmd(cmd, desc="Running BUSCO on final", check=False)
+            result = runner.run_cmd(cmd, desc="Running BUSCO on final", check=False)
+            if result.returncode != 0:
+                runner.log_warn("BUSCO failed for final assembly; checking BUSCO logs")
+                busco_logs = glob.glob("final/logs/*.log") + glob.glob("run_final/logs/*.log")
+                for log_path in sorted(busco_logs)[-3:]:
+                    _log_file_tail(runner, log_path, "Final BUSCO log tail")
+            else:
+                runner.log_info("BUSCO output directory for final: busco/final")
         finally:
             os.chdir(cwd)
 
@@ -5684,7 +5908,12 @@ def _final_quast_qc(runner):
     quast_bin = shutil.which("quast.py") or shutil.which("quast")
     if quast_bin:
         cmd = f"{quast_bin} {final_fa} --labels final --threads {runner.threads} -o quast_final"
-        runner.run_cmd(cmd, desc="Running QUAST on final assembly", check=False)
+        result = runner.run_cmd(cmd, desc="Running QUAST on final assembly", check=False)
+        if result.returncode != 0:
+            runner.log_warn("QUAST failed for final assembly; checking quast_final/quast.log")
+            _log_file_tail(runner, "quast_final/quast.log", "Final QUAST log tail")
+        else:
+            _log_file_status(runner, "quast_final/report.tsv", "Final QUAST report")
 
     # Parse QUAST output into merged.quast.csv
     quast_report = os.path.join("quast_final", "report.tsv")

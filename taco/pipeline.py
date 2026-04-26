@@ -218,15 +218,18 @@ class PipelineRunner:
         if desc:
             self.log(desc)
         if isinstance(cmd, list):
-            display = " ".join(str(c) for c in cmd)
+            display = " ".join(shlex.quote(str(c)) for c in cmd)
         else:
             display = cmd
         self.log(f"$ {display}")
+        start = time.time()
         result = subprocess.run(
             cmd,
             shell=isinstance(cmd, str),
             capture_output=False,
         )
+        elapsed = time.time() - start
+        self.log(f"Command exit={result.returncode} elapsed={elapsed:.1f}s")
         if check and result.returncode != 0:
             self.log_error(f"Command failed (exit {result.returncode}): {display}")
             sys.exit(result.returncode)
@@ -1436,19 +1439,17 @@ nextgraph_options = -a 1
             sname = STEP_NAMES.get(step_num, f"Step {step_num}")
             log_file = os.path.join(self.logs_dir, f"step_{step_num}.log")
 
-            self.restore_resume_inputs_for_step(step_num)
-            self.warn_missing_step_inputs(step_num)
-
-            self.log(f"===== STEP {step_num} START: {sname} =====")
-            start = datetime.now()
-
             # Tee stdout/stderr into the per-step log file
             log_fh = open(log_file, "w")
             old_stdout, old_stderr = sys.stdout, sys.stderr
             sys.stdout = TeeWriter(log_fh, old_stdout)
             sys.stderr = TeeWriter(log_fh, old_stderr)
+            start = datetime.now()
 
             try:
+                self.log(f"===== STEP {step_num} START: {sname} =====")
+                self.restore_resume_inputs_for_step(step_num)
+                self.warn_missing_step_inputs(step_num)
                 func(self)
                 status = "success"
                 exit_code = 0
@@ -1457,6 +1458,10 @@ nextgraph_options = -a 1
                 status = "success" if exit_code == 0 else "failed"
                 end = datetime.now()
                 self.run_end_ts = end
+                self.log(
+                    f"===== STEP {step_num} END: {sname} "
+                    f"({(end - start).total_seconds():.0f}s, "
+                    f"status={status}, exit={exit_code}) =====")
                 sys.stdout, sys.stderr = old_stdout, old_stderr
                 log_fh.close()
                 self.append_step_benchmark(step_num, start, end, status, log_file, exit_code)
@@ -1471,24 +1476,34 @@ nextgraph_options = -a 1
                 exit_code = 1
                 end = datetime.now()
                 self.run_end_ts = end
+                self.log_error(f"Step {step_num} exception: {e}")
+                self.log(
+                    f"===== STEP {step_num} END: {sname} "
+                    f"({(end - start).total_seconds():.0f}s, "
+                    f"status={status}, exit={exit_code}) =====")
                 sys.stdout, sys.stderr = old_stdout, old_stderr
                 log_fh.close()
                 self.append_step_benchmark(step_num, start, end, status, log_file, exit_code)
                 self.log_error(f"Step {step_num} failed with exception: {e}")
                 self.write_benchmark_summary()
                 raise
+            else:
+                end = datetime.now()
+                self.log(
+                    f"===== STEP {step_num} END: {sname} "
+                    f"({(end - start).total_seconds():.0f}s, "
+                    f"status={status}, exit={exit_code}) =====")
+                sys.stdout, sys.stderr = old_stdout, old_stderr
+                log_fh.close()
+                self.append_step_benchmark(step_num, start, end, status, log_file, exit_code)
             finally:
-                # Restore streams in the normal (non-exception) path too
+                # Restore streams if an exception path left them active.
                 if sys.stdout is not old_stdout:
                     sys.stdout = old_stdout
                 if sys.stderr is not old_stderr:
                     sys.stderr = old_stderr
                 if not log_fh.closed:
                     log_fh.close()
-
-            end = datetime.now()
-            self.append_step_benchmark(step_num, start, end, status, log_file, exit_code)
-            self.log(f"===== STEP {step_num} END: {sname} ({(end - start).total_seconds():.0f}s) =====")
 
         self.run_end_ts = datetime.now()
         self.write_benchmark_summary()

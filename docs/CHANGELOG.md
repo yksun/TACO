@@ -68,6 +68,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   short thread options, then automatically retries without a thread flag when
   the installed Raven build rejects thread options.  Each attempt keeps its own
   stderr log and failed attempts print a short diagnostic tail.
+- **Improved** step diagnostics.  Per-step logs now include START/END markers,
+  preflight restore/missing-input messages, command exit codes, elapsed command
+  times, expected assembler output paths, and short tails from tool-specific
+  logs when assembler, BUSCO, QUAST, purge_dups, polishing, or Merqury commands
+  fail or produce empty output.
 - **Improved** MBG handling.  MBG remains included in the assembler comparison
   when installed, is now included in `taco-env.yml` via Bioconda, and missing
   MBG is treated as an optional HiFi assembler skip with a clearer warning
