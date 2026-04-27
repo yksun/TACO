@@ -770,33 +770,24 @@ class PipelineRunner:
                  "the --fastq input / Step 0"),
             ],
             10: [
-                ("assembler FASTA files to normalize, or existing normalized assemblies",
+                ("assembler FASTA files to normalize",
                  assembler_or_normalized_patterns,
-                 "Steps 1-9 or previous Step 10/11 output"),
+                 "Steps 1-9 assembler outputs"),
             ],
             11: [
-                ("assembler FASTA files to normalize or compare",
-                 assembler_or_normalized_patterns,
-                 "Steps 1-9 or an existing assemblies/ directory"),
+                ("assembly comparison table and telomere FASTAs",
+                 ["assemblies/assembly_info.csv",
+                  "assemblies/*.telo.fasta", "assemblies/*.result.fasta"],
+                 "Step 10 (normalize + QC)"),
             ],
             12: [
                 ("assembly comparison table",
-                 ["assemblies/assembly_info.csv",
-                  "final_results/assembly_info.csv",
-                  "final_results/assembly_only_result.csv"],
-                 "Step 11"),
-                ("telomere FASTAs or normalized assembler FASTAs",
-                 ["assemblies/*.telo.fasta", "assemblies/*.result.fasta"],
-                 "Step 11"),
-            ],
-            13: [
-                ("assembly comparison table",
                  ["assemblies/assembly_info.csv"],
-                 "Step 11"),
+                 "Step 10"),
                 ("protected telomere contigs",
                  ["protected_telomere_contigs.fasta",
                   "telomere_pool/protected_telomere_contigs.fasta"],
-                 "Step 12"),
+                 "Step 11 (telomere pool)"),
                 ("normalized assembler FASTA files",
                  ["assemblies/*.result.fasta"],
                  "Step 11"),
@@ -806,43 +797,39 @@ class PipelineRunner:
                  ["assemblies/final.merged.fasta",
                   "final_results/final.merged.fasta",
                   "final_results/final_assembly.fasta"],
-                 "Step 13"),
+                 "Step 12 (refinement)"),
             ],
-            15: [
+            14: [
                 ("final merged assembly",
                  ["assemblies/final.merged.fasta",
                   "final_results/final.merged.fasta",
                   "final_results/final_assembly.fasta"],
-                 "Step 13"),
+                 "Step 12 (refinement)"),
                 ("assembly comparison table",
                  ["assemblies/assembly_info.csv",
                   "final_results/assembly_info.csv"],
-                 "Step 11"),
-                ("final telomere QC table",
-                 ["assemblies/merged.telo.csv"],
-                 "Step 14"),
-                ("final QUAST QC table",
-                 ["assemblies/merged.quast.csv"],
-                 "Step 14"),
-                ("final BUSCO QC table",
-                 ["assemblies/merged.busco.csv"],
-                 "Step 14"),
+                 "Step 10"),
+                ("final QC tables",
+                 ["assemblies/merged.telo.csv",
+                  "assemblies/merged.quast.csv",
+                  "assemblies/merged.busco.csv"],
+                 "Step 13 (final QC)"),
             ],
-            16: [
+            15: [
                 ("assembly comparison table or component metric CSVs",
                  ["assemblies/assembly_info.csv",
                   "final_results/assembly_info.csv",
                   "final_results/assembly_only_result.csv"] + component_metric_patterns,
-                 "Step 11"),
+                 "Step 10 (normalize + QC)"),
             ],
         }
-        if step == 15 and self.merqury_enable:
-            checks[15].append(
+        if step == 14 and self.merqury_enable:
+            checks[14].append(
                 ("final Merqury QC files",
                  ["merqury/final.qv",
                   "merqury/final.completeness.stats",
                   "assemblies/merged.merqury.csv"],
-                 "Step 14 or Step 15 Merqury auto-retry")
+                 "Step 13 (final QC) Merqury run")
             )
         missing = []
         for desc, patterns, producer in checks.get(step, []):

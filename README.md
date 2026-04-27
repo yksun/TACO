@@ -231,12 +231,12 @@ Incompatible assemblers are automatically skipped with a warning.
 |---|---|---|
 | 0 | Input QC and validation | Setup |
 | 1-9 | Run assemblers: Canu, NextDenovo, Peregrine, IPA, Flye, Hifiasm, LJA, MBG, Raven | Assembly |
-| 10 | Normalize all assembler outputs (legacy standalone step; Step 11 runs this automatically) | Normalization |
-| 11 | Normalize assemblies + QC comparison: BUSCO + telomere + QUAST + optional Merqury | Comparison |
-| 12 | Build optimized telomere contig pool (pairwise quickmerge + validation) | Telomere pool |
-| 13 | Backbone selection and telomere-aware refinement | Refinement |
-| 14 | Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
-| 15 | Final comparison report + cleanup into `final_results/` | Report + Cleanup |
+| 10 | Normalize + QC comparison: BUSCO + Telomere + QUAST + Merqury on all assemblies | QC |
+| 11 | Build telomere pool (pairwise quickmerge + structural validation) | Telomere pool |
+| 12 | Backbone selection and telomere-aware refinement | Refinement |
+| 13 | Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
+| 14 | Final comparison report + cleanup into `final_results/` | Report + Cleanup |
+| 15 | Assembly-only comparison + cleanup (for `--assembly-only`) | Assembly-only |
 | 16 | Assembly-only comparison summary + cleanup (used by `--assembly-only`) | Assembly-only |
 
 ### Step 0 — Input QC
@@ -245,11 +245,11 @@ Step 0 runs automatically before assembly. It validates that the FASTQ file exis
 
 ### Full Refinement Mode (default)
 
-Steps 0-9 and 11-15: runs all assemblers, normalizes inside Step 11, performs combined assembly QC/comparison, builds the telomere pool, selects and refines the backbone, runs final QC, and produces the comparison report. Step 10 remains available for manual legacy normalization but is no longer part of the default full run.
+Steps 0-14: runs all assemblers (1-9), normalizes and runs QC comparison including BUSCO, telomere detection, QUAST, and Merqury (10), builds the telomere pool via pairwise quickmerge (11), selects and refines the backbone (12), runs final QC on the refined assembly (13), and produces the comparison report with cleanup (14).
 
 ### Assembly-Only Mode (`--assembly-only`)
 
-Steps 0-9, 11, and 16: runs all assemblers, normalizes inside Step 11, performs combined assembly QC/comparison, then produces the assembly-only comparison table at `final_results/assembly_only_result.csv`. Skips the standalone legacy normalization step (Step 10), telomere pool (Step 12), refinement (Step 13), and final QC/report steps (Steps 14-15). This mode is designed for benchmarking and decision-making without modifying any assembly.
+Steps 0-10 and 15: runs all assemblers (1-9), normalizes and runs QC comparison (10), then produces the assembly-only comparison table at `final_results/assembly_only_result.csv` (15). Skips telomere pool (11), refinement (12), final QC (13), and full report (14). This mode is designed for benchmarking and decision-making without modifying any assembly.
 
 ## Telomere Detection
 

@@ -14,13 +14,12 @@ STEP_NAMES = {
     7: "LJA assembly",
     8: "MBG assembly",
     9: "Raven assembly",
-    10: "Normalize assemblies (legacy standalone step)",
-    11: "Normalize assemblies + QC comparison (BUSCO + telomere + QUAST + Merqury)",
-    12: "Build optimized telomere pool",
-    13: "Backbone selection and refinement",
-    14: "Final QC (BUSCO + Telomere + QUAST + Merqury on final)",
-    15: "Final comparison report and cleanup",
-    16: "Assembly-only comparison and cleanup",
+    10: "Normalize + QC comparison (BUSCO + Telomere + QUAST + Merqury)",
+    11: "Build telomere pool (quickmerge + validation)",
+    12: "Backbone selection and refinement",
+    13: "Final QC (BUSCO + Telomere + QUAST + Merqury on final)",
+    14: "Final comparison report and cleanup",
+    15: "Assembly-only comparison and cleanup",
 }
 
 
@@ -114,27 +113,21 @@ def parse_args():
         args.merqury = True
     
     if args.assembly_only:
-        # Steps 0-9, 11, 16 (assemblers + normalize/QC + assembly-only report).
-        # Step 10 remains available as a standalone legacy normalization step;
-        # Step 11 runs normalization automatically.
-        args.steps = list(range(0, 10)) + [11, 16]
+        # Steps 0-10, 15: assemblers + normalize/QC + assembly-only report
+        args.steps = list(range(0, 11)) + [15]
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
         except ValueError as e:
             parser.error(str(e))
     else:
-        # Full mode skips the legacy standalone Step 10 because Step 11 now
-        # normalizes assemblies before running QC/comparison.
-        args.steps = list(range(0, 10)) + list(range(11, 16))
+        # Full mode: Steps 0-14
+        args.steps = list(range(0, 15))
     
     for s in args.steps:
-        if s == 17:
+        if s < 0 or s > 15:
             parser.error(
-                "Invalid step: 17. TACO v1.3.1 uses public steps 0-16. "
-                "Use -s 12-15 to resume the full refinement/report path, "
-                "or -s 11,16 for assembly-only summary/cleanup.")
-        if s < 0 or s > 16:
-            parser.error(
-                f"Invalid step: {s}. TACO v1.3.1 uses public steps 0-16.")
+                f"Invalid step: {s}. TACO v1.3.0 uses steps 0-15. "
+                f"Full mode: 0-14. Assembly-only: 0-10, 15. "
+                f"Resume refinement: -s 12-14.")
     return args

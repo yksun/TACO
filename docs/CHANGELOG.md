@@ -125,24 +125,23 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **New** Step 0 — Input QC: validates FASTQ exists, estimates coverage,
   warns for low coverage per-platform (HiFi <25×, ONT <40×, CLR <50×),
   logs compatible assemblers.  Runs in both full and assembly-only modes.
-- **Renumbered** public pipeline steps to 17 steps (0-16) and moved the
-  telomere pool after the full assembler QC/comparison pass:
+- **Renumbered** pipeline to 16 public steps (0-15):
   - Steps 1-6: original assemblers (Canu, NextDenovo, Peregrine, IPA, Flye, Hifiasm)
   - Steps 7-9: **new** assemblers (LJA, MBG, Raven)
-  - Step 10: normalize (was Step 7)
-  - Step 11: **combined** assembler QC/comparison (BUSCO + telomere + QUAST + optional Merqury; were Steps 11, 12, and 14)
-  - Step 12: telomere pool (after comparison QC; was Step 13)
-  - Step 13: backbone selection + refinement (was Step 15)
-  - Step 14: **combined** final QC (BUSCO + Telomere + QUAST + Merqury on final; was Step 16)
-  - Step 15: **combined** final report + cleanup (was Step 17)
-  - Step 16: assembly-only comparison + cleanup (was Step 18)
+  - Step 10: normalize + QC comparison (BUSCO + Telomere + QUAST + Merqury → assembly_info.csv)
+  - Step 11: build telomere pool (pairwise quickmerge + structural validation)
+  - Step 12: backbone selection + telomere-aware refinement
+  - Step 13: final QC (BUSCO + Telomere + QUAST + Merqury on refined assembly)
+  - Step 14: final comparison report + cleanup
+  - Step 15: assembly-only comparison + cleanup (for `--assembly-only`)
 - **Unified** assembler lists: all downstream code (BUSCO CSV, QUAST CSV,
   Merqury CSV, assembly_info, backbone selection, chimera check) now imports
   `ALL_ASSEMBLERS` from `utils.py` instead of hardcoding names.  Adding a
   new assembler requires only one change in `utils.py`.
-- **Assembly-only mode** (`--assembly-only`) now runs Steps 0-11 and 16
-  (all assemblers + normalize + combined QC/comparison + assembly-only report).
-  Full mode runs Steps 0-15.
+- **Assembly-only mode** (`--assembly-only`) runs Steps 0-10, 15
+  (assemblers + normalize/QC + assembly-only report).
+  Full mode runs Steps 0-14 (adds telomere pool, refinement, final QC,
+  report+cleanup).
 - **New** taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota_odb10,
   `--taxon plant` → embryophyta_odb10, `--taxon vertebrate` → vertebrata_odb10,
   `--taxon insect` → insecta_odb10, `--taxon other` → requires explicit `--busco`.

@@ -1305,13 +1305,14 @@ def _raven_thread_flag(help_text):
 
 
 def step_10_normalize(runner, embedded=False):
-    """Step 10 - Copy and normalize all assemblies.
+    """Copy and normalize all assembler outputs.
 
-    This remains available as a standalone legacy step, but Step 11 runs it
-    automatically before QC/comparison.
+    Called internally by step_10_normalize_and_qc (the public Step 10).
+    Copies each assembler's output FASTA into assemblies/, renames contigs,
+    and sorts by length.
     """
     if embedded:
-        runner.log("Assembly normalization - Copy and normalize all assemblies")
+        runner.log("Normalizing all assembler outputs")
     else:
         runner.log("Step 10 - Copy and normalize all assemblies")
     os.makedirs("assemblies", exist_ok=True)
@@ -1736,7 +1737,7 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
 
 
 def step_10_telomere_pool(runner):
-    """Step 12 - Build optimized telomere contig pool.
+    """Step 11 - Build optimized telomere contig pool.
 
     TELOMERE-AWARE VALIDATED MERGE STRATEGY:
 
@@ -1758,7 +1759,7 @@ def step_10_telomere_pool(runner):
     clustering then deduplicates, preferring the best representative per
     chromosome group.
     """
-    runner.log("Step 12 - Build optimized telomere contig pool")
+    runner.log("Step 11 - Build optimized telomere contig pool")
     os.makedirs("assemblies", exist_ok=True)
 
     fasta_files = glob.glob("assemblies/*.telo.fasta")
@@ -2807,14 +2808,15 @@ def _write_merqury_csv():
         csv.writer(f).writerows(rows)
 
 
-def step_11_assembly_qc_comparison(runner):
-    """Step 11 - Combined assembly QC and cross-assembler comparison.
+def step_10_normalize_and_qc(runner):
+    """Step 10 - Normalize all assemblies + QC comparison.
 
-    Normalizes assembler outputs, runs BUSCO, telomere detection, QUAST, and
-    optional Merqury, then writes the unified assembly_info.csv used by
-    assembly-only mode and backbone selection.
+    Copies and normalizes all assembler outputs, then runs BUSCO, telomere
+    detection, QUAST, and Merqury on all assemblies.  Writes the unified
+    assembly_info.csv used by assembly-only mode and backbone selection.
     """
-    runner.log("Step 11 - Normalize assemblies, QC, and comparison")
+    runner.log("Step 10 - Normalize assemblies + QC comparison "
+               "(BUSCO + Telomere + QUAST + Merqury)")
     step_10_normalize(runner, embedded=True)
     step_08_busco(runner)
     step_09_telomere(runner)
@@ -4218,7 +4220,7 @@ def _run_polishing(runner, input_fa, output_fa):
 
 
 def step_12_refine(runner):
-    """Step 13 - backbone-first telomere-aware refinement with BUSCO trial validation.
+    """Step 12 - Backbone-first telomere-aware refinement with BUSCO trial validation.
 
     v1.3.1 workflow — two-tier confidence model:
 
@@ -4252,7 +4254,7 @@ def step_12_refine(runner):
       13I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       13J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 13 - Telomere-aware backbone refinement (v1.3.1)")
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.0)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -6519,8 +6521,8 @@ def _final_merqury_qc(runner):
 
 
 def step_14_final_qc(runner):
-    """Step 14 - Final QC: BUSCO + Telomere + QUAST + Merqury on final assembly."""
-    runner.log("Step 14 - Final QC (BUSCO + Telomere + QUAST + Merqury on final)")
+    """Step 13 - Final QC: BUSCO + Telomere + QUAST + Merqury on final assembly."""
+    runner.log("Step 13 - Final QC (BUSCO + Telomere + QUAST + Merqury on final)")
     _final_busco_qc(runner)
     _final_telomere_qc(runner)
     _final_quast_qc(runner)
@@ -6528,19 +6530,19 @@ def step_14_final_qc(runner):
 
 
 def step_15_report_cleanup(runner):
-    """Step 15 - Final comparison report + cleanup."""
-    runner.log("Step 15 - Final comparison report and cleanup")
+    """Step 14 - Final comparison report + cleanup."""
+    runner.log("Step 14 - Final comparison report and cleanup")
     _final_comparison_report(runner)
     _cleanup_outputs(runner)
 
 
 def step_16_assembly_only_full(runner):
-    """Step 16 - Assembly-only comparison summary with cleanup.
+    """Step 15 - Assembly-only comparison summary with cleanup.
 
-    Reuses Step 11 metric outputs, builds the unified comparison table,
-    and copies assembly-only results into final_results/.
+    Reuses Step 10 metric outputs (BUSCO, telomere, QUAST, Merqury),
+    builds the unified comparison table, and copies results into final_results/.
     """
-    runner.log("Step 16 - Assembly-only comparison and cleanup")
+    runner.log("Step 15 - Assembly-only comparison and cleanup")
     _assembly_only_summary(runner)
     # Cleanup for assembly-only mode
     os.makedirs("final_results", exist_ok=True)
@@ -6577,26 +6579,27 @@ def step_16_assembly_only_full(runner):
 
 
 STEP_FUNCTIONS = {
-    0: step_00_input_qc,           # Input QC and validation
+    0: step_00_input_qc,              # Input QC and validation
     # ---- Assemblers (Steps 1-9) ----
-    1: step_01_canu,               # HiCanu assembly
-    2: step_02_nextdenovo,         # NextDenovo assembly
-    3: step_03_peregrine,          # Peregrine assembly
-    4: step_04_ipa,                # IPA assembly
-    5: step_05_flye,               # Flye assembly
-    6: step_06_hifiasm,            # Hifiasm assembly
-    7: step_07_lja,                # LJA assembly
-    8: step_08_mbg,                # MBG assembly
-    9: step_09_raven,              # Raven assembly
-    # ---- Normalize + pre-refinement QC/comparison (Steps 10-11) ----
-    10: step_10_normalize,         # Legacy standalone normalize step
-    11: step_11_assembly_qc_comparison,  # Normalize + BUSCO + telomere + QUAST + Merqury
-    # ---- Telomere pool + refinement (Steps 12-13) ----
-    12: step_10_telomere_pool,     # Build telomere contig pool after QC comparison
-    13: step_12_refine,            # Backbone selection + refinement
-    # ---- Final QC + report (Steps 14-15) ----
-    14: step_14_final_qc,          # BUSCO + Telomere + QUAST + Merqury on final
-    15: step_15_report_cleanup,    # Final report + cleanup
-    # ---- Assembly-only mode (Step 16) ----
-    16: step_16_assembly_only_full,  # Assembly-only comparison + cleanup
+    1: step_01_canu,                  # HiCanu
+    2: step_02_nextdenovo,            # NextDenovo
+    3: step_03_peregrine,             # Peregrine
+    4: step_04_ipa,                   # IPA
+    5: step_05_flye,                  # Flye
+    6: step_06_hifiasm,               # Hifiasm
+    7: step_07_lja,                   # LJA
+    8: step_08_mbg,                   # MBG
+    9: step_09_raven,                 # Raven
+    # ---- Normalize + QC comparison (Step 10) ----
+    10: step_10_normalize_and_qc,     # Normalize + BUSCO + Telomere + QUAST + Merqury
+    # ---- Telomere pool (Step 11) ----
+    11: step_10_telomere_pool,        # Quickmerge pairwise + build telomere pool
+    # ---- Backbone refinement (Step 12) ----
+    12: step_12_refine,               # Backbone selection + refinement
+    # ---- Final QC (Step 13) ----
+    13: step_14_final_qc,             # BUSCO + Telomere + QUAST + Merqury on final
+    # ---- Report + cleanup (Step 14) ----
+    14: step_15_report_cleanup,       # Final report + cleanup
+    # ---- Assembly-only (Step 15) ----
+    15: step_16_assembly_only_full,   # Assembly-only comparison + cleanup
 }
