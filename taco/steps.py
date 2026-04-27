@@ -621,7 +621,9 @@ def _run_shell_capture(runner, cmd, label, stdout_log=None, stderr_log=None, cwd
         text=True,
         cwd=cwd,
     )
-    runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
+    runner.log(
+        f"Command exit={result.returncode} "
+        f"elapsed={time.time() - start:.1f}s")
     if stdout_log and _write_text_log(stdout_log, result.stdout):
         _log_file_status(runner, stdout_log, f"{label} stdout log")
     if stderr_log and _write_text_log(stderr_log, result.stderr):
@@ -1043,9 +1045,24 @@ def step_08_mbg(runner):
     os.makedirs("mbg_out", exist_ok=True)
     runner.log_version("mbg", mbg_bin)
 
-    cmd = (f"{mbg_bin} -i {runner.fastq} -o mbg_out/mbg.gfa "
-           f"-t {runner.threads} 2> mbg_out/mbg.log")
-    result = runner.run_cmd(cmd, desc="Running MBG", check=False)
+    mbg_k = _resolve_mbg_k(runner)
+    cmd_args = [
+        mbg_bin,
+        "-i", runner.fastq,
+        "-o", "mbg_out/mbg.gfa",
+        "-k", str(mbg_k),
+        "-t", str(runner.threads),
+    ]
+    runner.log(f"Running MBG (k={mbg_k})")
+    runner.log(
+        "$ "
+        + " ".join(shlex.quote(str(c)) for c in cmd_args)
+        + " 2> mbg_out/mbg.log"
+    )
+    start = time.time()
+    with open("mbg_out/mbg.log", "w") as err_fh:
+        result = subprocess.run(cmd_args, stderr=err_fh, text=True)
+    runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
     if result.returncode != 0:
         runner.log_warn("Step 8: MBG failed. Skipping. See mbg_out/mbg.log")
         _log_file_tail(runner, "mbg_out/mbg.log", "MBG log tail")
@@ -1057,9 +1074,10 @@ def step_08_mbg(runner):
     mbg_fa = "mbg_out/mbg.fasta"
     if os.path.isfile(gfa_file) and os.path.getsize(gfa_file) > 0:
         _log_file_status(runner, gfa_file, "MBG GFA output")
-        cmd = f"awk '/^S/{{print \">\"$2; print $3}}' {gfa_file} > {mbg_fa}"
-        runner.run_cmd(cmd, desc="Converting MBG GFA to FASTA", check=False)
-        if os.path.isfile(mbg_fa) and os.path.getsize(mbg_fa) > 0:
+        n_segments = _gfa_segments_to_fasta(gfa_file, mbg_fa)
+        if (n_segments > 0
+                and os.path.isfile(mbg_fa)
+                and os.path.getsize(mbg_fa) > 0):
             runner.log(f"MBG assembly: {mbg_fa}")
             _log_file_status(runner, mbg_fa, "MBG assembly output")
         else:
@@ -1068,6 +1086,53 @@ def step_08_mbg(runner):
     else:
         runner.log_warn("Step 8: MBG produced no GFA output.")
         _log_file_tail(runner, "mbg_out/mbg.log", "MBG log tail")
+
+
+def _resolve_mbg_k(runner):
+    """Resolve MBG k-mer size.
+
+    MBG requires an odd k-mer size of at least 31. The upstream example uses
+    k=1501, which is a conservative default for long HiFi reads.
+    """
+    raw = (
+        os.environ.get("TACO_MBG_K", "").strip()
+        or getattr(runner, "mbg_k", None)
+        or "1501"
+    )
+    try:
+        k = int(raw)
+    except (TypeError, ValueError):
+        runner.log_warn(f"Invalid TACO_MBG_K value '{raw}'; using k=1501")
+        return 1501
+
+    if k < 31:
+        runner.log_warn(
+            f"MBG k-mer size {k} is below the minimum 31; using k=1501")
+        return 1501
+    if k % 2 == 0:
+        adjusted = k + 1
+        runner.log_warn(f"MBG k-mer size must be odd; using k={adjusted}")
+        return adjusted
+    return k
+
+
+def _gfa_segments_to_fasta(gfa_path, fasta_path):
+    """Write GFA segment records to FASTA and return the number written."""
+    n_segments = 0
+    with open(gfa_path, "r", errors="ignore") as in_fh, \
+            open(fasta_path, "w") as out_fh:
+        for line in in_fh:
+            if not line.startswith("S\t"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if (len(fields) < 3
+                    or not fields[1]
+                    or not fields[2]
+                    or fields[2] == "*"):
+                continue
+            out_fh.write(f">{fields[1]}\n{fields[2]}\n")
+            n_segments += 1
+    return n_segments
 
 
 def step_09_raven(runner):
@@ -1087,29 +1152,49 @@ def step_09_raven(runner):
     raven_log = "raven_out/raven.log"
     threads = max(1, int(getattr(runner, "threads", 1) or 1))
     flag_override = os.environ.get("TACO_RAVEN_THREADS_FLAG", "").strip()
+    raven_help = _tool_help_text(raven_bin)
+    if raven_help and not _looks_like_raven_assembler(raven_help):
+        runner.log_warn(
+            "Step 9: 'raven' on PATH does not look like the LBCB Raven "
+            "assembler. Install the Bioconda package 'raven-assembler' and "
+            "ensure that executable appears first on PATH. Skipping Raven.")
+        return
 
     attempts = []
     if flag_override.lower() in {"0", "false", "none", "off", "no"}:
-        attempts.append(([raven_bin, runner.fastq], "Raven without thread flag", "no_threads"))
+        attempts.append((
+            [raven_bin, runner.fastq],
+            "Raven without thread flag",
+            "no_threads",
+        ))
     elif flag_override:
         attempts.append((
             [raven_bin, flag_override, str(threads), runner.fastq],
             f"Raven with {flag_override}",
             "override_threads",
         ))
-        attempts.append(([raven_bin, runner.fastq], "Raven without thread flag", "no_threads"))
+        attempts.append((
+            [raven_bin, runner.fastq],
+            "Raven without thread flag",
+            "no_threads",
+        ))
     else:
+        thread_flag = _raven_thread_flag(raven_help)
+        if thread_flag:
+            attempts.append((
+                [raven_bin, thread_flag, str(threads), runner.fastq],
+                f"Raven with {thread_flag}",
+                "threads",
+            ))
+        else:
+            runner.log_info(
+                "Raven help does not advertise a thread option; "
+                "running without one.")
         attempts.append((
-            [raven_bin, "--threads", str(threads), runner.fastq],
-            "Raven with --threads",
-            "long_threads",
+            [raven_bin, runner.fastq],
+            "Raven without thread flag",
+            "no_threads",
         ))
-        attempts.append((
-            [raven_bin, "-t", str(threads), runner.fastq],
-            "Raven with -t",
-            "short_threads",
-        ))
-        attempts.append(([raven_bin, runner.fastq], "Raven without thread flag", "no_threads"))
 
     unsupported_thread_flag = (
         "no such option",
@@ -1134,7 +1219,9 @@ def step_09_raven(runner):
                 stderr=err_fh,
                 text=True,
             )
-        runner.log(f"Command exit={result.returncode} elapsed={time.time() - start:.1f}s")
+        runner.log(
+            f"Command exit={result.returncode} "
+            f"elapsed={time.time() - start:.1f}s")
         try:
             shutil.copyfile(attempt_log, raven_log)
         except OSError:
@@ -1175,6 +1262,46 @@ def step_09_raven(runner):
     else:
         runner.log_warn(f"Step 9: Raven produced no output. See {raven_log}")
         _log_file_tail(runner, raven_log, "Raven log tail")
+
+
+def _tool_help_text(binary):
+    """Return combined CLI help text for a binary, or an empty string."""
+    texts = []
+    for flag in ("--help", "-h"):
+        try:
+            result = subprocess.run(
+                [binary, flag],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            continue
+        text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if text:
+            texts.append(text)
+    return "\n".join(texts)
+
+
+def _looks_like_raven_assembler(help_text):
+    """Return True when help text matches the LBCB Raven assembler CLI."""
+    lowered = help_text.lower()
+    return (
+        "fasta/fastq" in lowered
+        or "polishing-rounds" in lowered
+        or "graphical-fragment-assembly" in lowered
+        or "input file in fasta" in lowered
+    )
+
+
+def _raven_thread_flag(help_text):
+    """Choose one supported Raven thread flag from help text."""
+    if not help_text:
+        return None
+    lowered = help_text.lower()
+    if "--threads" in lowered:
+        return "--threads"
+    if re.search(r"(^|\s)-t([,\s]|$)", lowered):
+        return "-t"
+    return None
 
 
 def step_10_normalize(runner, embedded=False):

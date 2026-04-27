@@ -197,8 +197,8 @@ Incompatible assemblers are automatically skipped with a warning.
 | Peregrine | default mode | skipped | default mode | HiFi and CLR only |
 | NextDenovo | via config file | via config file | via config file | All platforms; config auto-generated |
 | LJA | default mode | skipped | skipped | HiFi-only; very contiguous assemblies |
-| MBG | default mode | skipped | skipped | HiFi-only; minimizer-based; included via Bioconda |
-| Raven | default mode | default mode | default mode | All platforms; fast OLC assembler |
+| MBG | default mode | skipped | skipped | HiFi-only; minimizer-based; included via Bioconda; uses `TACO_MBG_K` if set (default k=1501) |
+| Raven | default mode | default mode | default mode | All platforms; fast OLC assembler from the `raven-assembler` package |
 
 **Platform summary:** HiFi runs up to 9 assemblers, Nanopore runs 4 (Canu, Flye, NextDenovo, Raven), CLR runs 5 (Canu, Flye, NextDenovo, Peregrine, Raven).
 

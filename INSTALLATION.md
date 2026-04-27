@@ -31,7 +31,7 @@ After installation, the `taco` command is available anywhere within the conda en
 
 The conda environment provides all external bioinformatics tools. The `pip install -e .` step registers the `taco` command so you can run it from any directory.
 
-**Assemblers (via conda):** Canu, NextDenovo, Flye, Hifiasm, Peregrine, IPA, LJA, Raven
+**Assemblers (via conda):** Canu, NextDenovo, Flye, Hifiasm, Peregrine, IPA, LJA, Raven (`raven-assembler`)
 
 **HiCanu:** The conda environment includes `canu` and `openjdk>=11` to provide a working Java runtime and avoid the `undefined symbol: JLI_StringDup` error. If you still get Java errors (e.g. from a bioconda dev build), download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. If canu is missing or fails, Step 1 is skipped and all other assemblers continue normally.
 
@@ -41,7 +41,7 @@ The conda environment provides all external bioinformatics tools. The `pip insta
 
 **QV scoring (via conda):** Merqury, Meryl (auto-enabled for all platforms when installed; builds a reads `.meryl` database from input reads with `--merqury-k auto` by default. QV is most accurate with PacBio HiFi or Illumina; ONT/CLR QV may underestimate true quality, and relative ranking/completeness should be interpreted cautiously)
 
-**Additional HiFi assembler:** MBG (Multiplex de Bruijn Graph, HiFi-only) is included in `taco-env.yml` via Bioconda. For an existing environment, install with `mamba install -c conda-forge -c bioconda mbg`. If the package is unavailable on your platform, build from source: `git clone https://github.com/maickrau/MBG && cd MBG && make`, then place the `MBG` binary on PATH.
+**Additional HiFi assembler:** MBG (Multiplex de Bruijn Graph, HiFi-only) is included in `taco-env.yml` via Bioconda. For an existing environment, install with `mamba install -c conda-forge -c bioconda mbg`. TACO passes MBG's required odd `-k` k-mer size with a default of `1501`; set `TACO_MBG_K` to override. If the package is unavailable on your platform, build from source: `git clone https://github.com/maickrau/MBG && cd MBG && make`, then place the `MBG` binary on PATH.
 
 ## Sequencing Platform Support
 

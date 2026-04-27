@@ -22,7 +22,7 @@ dependencies:
   # Additional assemblers for broader comparison
   - lja               # La Jolla Assembler (HiFi-only, very contiguous)
   - mbg               # Multiplex de Bruijn Graph assembler (HiFi-only)
-  - raven>=1.8        # Fast OLC assembler (all long-read platforms)
+  - raven-assembler>=1.8  # Fast OLC assembler (all long-read platforms)
   # Analysis tools
   - busco>=5.4
   - quast>=5.2

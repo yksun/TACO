@@ -290,6 +290,7 @@ class PipelineRunner:
         "merqury": ["merqury"],
         "nextPolish2": ["nextpolish2"],
         "purge_dups": ["purge_dups", "purge-dups"],
+        "raven": ["raven-assembler"],
         "python": ["python"],
     }
 

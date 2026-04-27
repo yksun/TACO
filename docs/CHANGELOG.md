@@ -64,19 +64,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - **Fixed** `purge_dups` version parsing.  Error output such as
   `[E::hit_read] can not open PAF file version` is rejected as non-version
   text, and TACO falls back to the active conda package version when available.
-- **Fixed** Raven command compatibility.  Step 9 now tries Raven's long and
-  short thread options, then automatically retries without a thread flag when
-  the installed Raven build rejects thread options.  Each attempt keeps its own
-  stderr log and failed attempts print a short diagnostic tail.
+- **Fixed** Raven command compatibility.  Step 9 now inspects the installed
+  Raven CLI before running, uses a thread flag only when the executable
+  advertises one, and skips non-assembler `raven` executables with a clearer
+  `raven-assembler` installation hint.  Each attempt keeps its own stderr log
+  and failed attempts print a short diagnostic tail.
 - **Improved** step diagnostics.  Per-step logs now include START/END markers,
   preflight restore/missing-input messages, command exit codes, elapsed command
   times, expected assembler output paths, and short tails from tool-specific
   logs when assembler, BUSCO, QUAST, purge_dups, polishing, or Merqury commands
   fail or produce empty output.
 - **Improved** MBG handling.  MBG remains included in the assembler comparison
-  when installed, is now included in `taco-env.yml` via Bioconda, and missing
-  MBG is treated as an optional HiFi assembler skip with a clearer warning
-  instead of a broad environment warning.
+  when installed, is now included in `taco-env.yml` via Bioconda, and TACO now
+  passes MBG's required odd `-k` k-mer size (default `1501`, override with
+  `TACO_MBG_K`) while treating missing MBG as an optional HiFi assembler skip
+  with a clearer warning instead of a broad environment warning.
 - **Changed** default step flow.  Step 11 now runs assembly normalization before
   BUSCO, telomere, QUAST, and Merqury comparison.  Step 10 is retained as a
   legacy standalone normalization step, but default full mode runs Steps 0-9
