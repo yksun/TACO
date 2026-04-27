@@ -1995,7 +1995,7 @@ def step_10_telomere_pool(runner):
         else:
             pool_provenance[new_name] = ("unknown", old_name, "unknown")
 
-    # Save provenance TSV for Step 13 GFF generation
+    # Save provenance TSV for Step 12 GFF generation
     # Extended format with quickmerge pair info and region detail
     prov_tsv = "pool_contig_provenance.tsv"
     with open(prov_tsv, "w") as f:
@@ -2104,7 +2104,7 @@ def step_10_telomere_pool(runner):
     # We track the source assembler for each contig by noting which input file
     # contributed it.
     # Map pool contigs to source assembler using the provenance map
-    # (accurately tracked through concatenation and sort in Step 12).
+    # (accurately tracked through concatenation and sort in Step 11).
     pool_contig_asm = {}  # pool_contig_name -> asm_key
     for pname, prov in pool_provenance.items():
         pool_contig_asm[pname] = prov[0] if prov else "unknown"
@@ -2838,7 +2838,7 @@ def _auto_select_backbone(runner):
     """Auto-select best backbone assembler using smart scoring or N50 mode.
 
     Reads assembly_info.csv (transposed format: Metric,canu,flye,...) and
-    applies the scoring formula matching refinement Step 13B.
+    applies the scoring formula matching refinement Step 12B.
     """
     info_csv = "assemblies/assembly_info.csv"
     mode = runner.auto_mode or "smart"
@@ -3208,7 +3208,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
       - source_assembler: which assembler originally produced this contig
       - role: backbone, upgrade_donor, novel_t2t
       - original_name: contig name before sort/rename (the pool contig name)
-      - assembler_contig: the ORIGINAL assembler contig name (before Step 12 pool renaming)
+      - assembler_contig: the ORIGINAL assembler contig name (before Step 11 pool renaming)
       - source_type: assembler or quickmerge
       - replacement_class: (for donors) upgrade_tier2_to_t2t, fill_missing_end, etc.
       - replaced_contig: (for donors) which backbone contig was replaced
@@ -3273,7 +3273,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
                    base in donor_names:
                     lookup_name = base
 
-        # Look up full provenance from Step 12 TSV
+        # Look up full provenance from the Step 11 telomere-pool TSV
         # Quickmerge entries are 6-tuples: (asm, orig, source_type, asm1, asm2, regions)
         # Normal entries are 3-tuples: (asm, orig, source_type)
         prov = pool_provenance_map.get(lookup_name)
@@ -4232,33 +4232,33 @@ def step_12_refine(runner):
       These can be deduped, replaced, rescued, purged, and polished.
 
     Sub-steps:
-      13A  Merqury QV scoring (optional, auto-detected)
-      13B  Auto-select backbone assembler
-      13C  Prepare cleaned backbone + chimera safety check
-      13D  Backbone classification and pool T2T analysis:
-           13D1  Classify backbone contigs by telomere status
-           13D2  Find pool T2T donors that upgrade Tier 2 backbone contigs
-           13D3  Optional backbone self-dedup, disabled by default
-           13D4  Taxon-aware non-telomeric dedup against Tier 1
+      12A  Merqury QV scoring (optional, auto-detected)
+      12B  Auto-select backbone assembler
+      12C  Prepare cleaned backbone + chimera safety check
+      12D  Backbone classification and pool T2T analysis:
+           12D1  Classify backbone contigs by telomere status
+           12D2  Find pool T2T donors that upgrade Tier 2 backbone contigs
+           12D3  Optional backbone self-dedup, disabled by default
+           12D4  Taxon-aware non-telomeric dedup against Tier 1
                  (fungi: aggressive 70%/85%; plant/vertebrate: conservative 85%/92%)
-           13D5  Taxon-aware non-telomeric self-dedup
+           12D5  Taxon-aware non-telomeric self-dedup
                  (fungi: 80%/90%; plant/vertebrate: 90%/95%)
-      13E  Telomere rescue with donor verification + replacement class tagging:
+      12E  Telomere rescue with donor verification + replacement class tagging:
            only accept donors with verified telomere signal;
            never replace Tier 1 contigs (unless --allow-t2t-replace)
-      13F  BUSCO trial validation:
+      12F  BUSCO trial validation:
            taxon-aware thresholds for C-drop, M-rise, AND D-rise;
            reject if telomere evidence weakens or size drops suspiciously
-      13G  Final combine (backbone with accepted upgrades + novel T2T additions)
-      13H  purge_dups default cleanup (taxon-aware)
-      13I  Platform-aware polishing (Medaka/NextPolish2/Racon)
-      13J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
+      12G  Final combine (backbone with accepted upgrades + novel T2T additions)
+      12H  purge_dups default cleanup (taxon-aware)
+      12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
+      12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.0)")
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.1)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
-    # ---- 13A. Merqury QV scoring (optional, auto-detected if installed) ----
+    # ---- 12A. Merqury QV scoring (optional, auto-detected if installed) ----
     if runner.merqury_enable:
         db_src = runner.merqury_db or "(auto-detected)"
         runner.log_info(f"Merqury enabled (db: {db_src})")
@@ -4270,7 +4270,7 @@ def step_12_refine(runner):
     _write_merqury_csv()
     _build_assembly_info(runner)
 
-    # ---- 13B. Auto-select backbone assembler ----
+    # ---- 12B. Auto-select backbone assembler ----
     assembler = runner.assembler
     if not assembler:
         runner.log_info("Selection criteria: BUSCO + telomere + Merqury + contiguity + N50")
@@ -4296,7 +4296,7 @@ def step_12_refine(runner):
         runner.log_error(f"Selected assembler '{assembler}' has no valid FASTA at {asm_fa}")
         raise RuntimeError("Invalid assembler selection")
 
-    # Read protected telomere pool from Step 12
+    # Read protected telomere pool from Step 11
     protected_fasta = ""
     protected_mode = "none"
     if os.path.isfile("protected_telomere_contigs.fasta") and \
@@ -4309,7 +4309,7 @@ def step_12_refine(runner):
     runner.log_info(f"Protected mode: {protected_mode}")
     runner.log_info(f"Selected backbone: {asm_fa}")
 
-    # ---- 13C. Prepare cleaned backbone + chimera safety ----
+    # ---- 12C. Prepare cleaned backbone + chimera safety ----
     # Chimera detection uses two complementary strategies:
     #   1. Size gate: contigs > 1.5× the largest individual assembler contig
     #      are likely chimeric (spurious joins across chromosomes).
@@ -4437,7 +4437,7 @@ def step_12_refine(runner):
     taxon = getattr(runner, 'taxon', 'other')
     allow_t2t_replace = getattr(runner, 'allow_t2t_replace', False)
 
-    # ---- 13D. Classify backbone contigs by telomere status ----
+    # ---- 12D. Classify backbone contigs by telomere status ----
     # This MUST happen before any dedup, so we know which backbone contigs
     # are T2T (Tier 1) and which are non-T2T (Tier 2).
     runner.log_info("Classifying backbone contigs by telomere status")
@@ -4461,7 +4461,7 @@ def step_12_refine(runner):
 
     pool_t2t_fa = "assemblies/protected.telomere.fa"
 
-    # ---- 13D2. Find novel pool T2T contigs (not redundant to backbone) ----
+    # ---- 12D2. Find novel pool T2T contigs (not redundant to backbone) ----
     # Pool T2T contigs that cover the same chromosomes as backbone Tier 1
     # are redundant — the backbone version is preferred (preserves BUSCO).
     # Only pool T2T contigs covering regions where backbone LACKS T2T are
@@ -4567,7 +4567,7 @@ def step_12_refine(runner):
                    f"{len(redundant_to_tier1)} redundant to backbone T2T, "
                    f"{len(upgrade_donors)} upgrade donors, "
                    f"{len(novel_pool_ids) - len(upgrade_donors)} novel additions")
-        # ---- 13D2b. Report un-upgraded Tier 2 backbone contigs ----
+        # ---- 12D2b. Report un-upgraded Tier 2 backbone contigs ----
         # For Tier 2 contigs that no pool T2T covers ≥80%, log a diagnostic
         # to help identify potential chimeric backbone contigs.
         bb_name_lens = {n: len(s) for n, s in _read_fasta_records(backbone_fa)}
@@ -4601,12 +4601,12 @@ def step_12_refine(runner):
         with open(novel_pool_t2t_fa, "w") as f:
             pass
 
-    # ---- 13D3. Backbone internal redundancy ----
+    # ---- 12D3. Backbone internal redundancy ----
     # Backbone self-dedup is DISABLED by default.  Even conservative thresholds
     # (95%/95%) can remove contigs whose 5% unique region contains BUSCO genes,
     # causing significant completeness loss (e.g. C drops from 97.4% to 92.9%
     # when 2 "redundant" contigs carry ~77 unique genes).  purge_dups at Step
-    # 13H handles haplotig removal more safely using read-coverage evidence.
+    # 12H handles haplotig removal more safely using read-coverage evidence.
     #
     # Enable with SELFDEDUP_ENABLE=1 if you have known internal duplications
     # that purge_dups does not catch.
@@ -4639,7 +4639,7 @@ def step_12_refine(runner):
         runner.log(f"Backbone self-dedup: skipped (preserving all backbone contigs "
                    f"for BUSCO completeness; purge_dups handles haplotig removal)")
 
-    # ---- 13E. Telomere upgrade: replace Tier 2 with pool T2T donors ----
+    # ---- 12E. Telomere upgrade: replace Tier 2 with pool T2T donors ----
     # Two types of upgrades:
     #   1. Direct upgrade: pool T2T contig replaces a specific Tier 2 contig
     #      (aligned as covering the same chromosome region).
@@ -4673,7 +4673,7 @@ def step_12_refine(runner):
     backbone_seqs = dict(_read_fasta_records(working_backbone_fa))
     backbone_nodup_fa = working_backbone_fa  # alias for downstream compat
 
-    # ---- 13E1. Build upgrade candidates from pool T2T donors ----
+    # ---- 12E1. Build upgrade candidates from pool T2T donors ----
     if upgrade_donors and shutil.which("minimap2"):
         pool_donor_seqs = dict(_read_fasta_records(novel_pool_t2t_fa))
 
@@ -4704,7 +4704,7 @@ def step_12_refine(runner):
         donor_t2t_verified = novel_pool_ids.copy()  # pool T2T are already T2T-verified
         donor_telo_verified = novel_pool_ids.copy()
 
-    # ---- 13E2. Also screen single-end telomere pool for rescue ----
+    # ---- 12E2. Also screen single-end telomere pool for rescue ----
     if single_tel_src and shutil.which("minimap2"):
         runner.log_info(f"Screening additional rescue candidates from {single_tel_src}")
 
@@ -4825,7 +4825,7 @@ def step_12_refine(runner):
 
     _write_candidates_tsv(candidates, "assemblies/single_tel.candidates.tsv")
 
-    # ---- 13F. BUSCO trial validation (enhanced) ----
+    # ---- 12F. BUSCO trial validation (enhanced) ----
     # Taxon-aware max rescue limits:
     if taxon == "fungal":
         default_max = "20"
@@ -4835,14 +4835,14 @@ def step_12_refine(runner):
         default_max = "10"
     else:
         default_max = "15"
-    # STEP12_* aliases are kept so existing run scripts do not break after the
-    # public refinement step moved to Step 13.
+    # STEP12_* names match the public refinement step; STEP13_* remains as a
+    # legacy fallback for run scripts from the older numbering.
     max_accepted = int(os.environ.get(
-        "STEP13_MAX_ACCEPTED",
-        os.environ.get("STEP12_MAX_ACCEPTED", default_max)))
+        "STEP12_MAX_ACCEPTED",
+        os.environ.get("STEP13_MAX_ACCEPTED", default_max)))
     min_bp_ratio = float(os.environ.get(
-        "STEP13_MIN_BP_RATIO",
-        os.environ.get("STEP12_MIN_BP_RATIO", "0.90")))
+        "STEP12_MIN_BP_RATIO",
+        os.environ.get("STEP13_MIN_BP_RATIO", "0.90")))
 
     # Taxon-aware BUSCO thresholds (C-drop, M-rise, D-rise):
     default_c_drop, default_m_rise, default_d_rise = "2.5", "0.5", "3.0"
@@ -4855,14 +4855,14 @@ def step_12_refine(runner):
         default_d_rise = "2.0"  # fungi: duplication almost always artefactual
 
     max_busco_c_drop = float(os.environ.get(
-        "STEP13_MAX_BUSCO_C_DROP",
-        os.environ.get("STEP12_MAX_BUSCO_C_DROP", default_c_drop)))
+        "STEP12_MAX_BUSCO_C_DROP",
+        os.environ.get("STEP13_MAX_BUSCO_C_DROP", default_c_drop)))
     max_busco_m_rise = float(os.environ.get(
-        "STEP13_MAX_BUSCO_M_RISE",
-        os.environ.get("STEP12_MAX_BUSCO_M_RISE", default_m_rise)))
+        "STEP12_MAX_BUSCO_M_RISE",
+        os.environ.get("STEP13_MAX_BUSCO_M_RISE", default_m_rise)))
     max_busco_d_rise = float(os.environ.get(
-        "STEP13_MAX_BUSCO_D_RISE",
-        os.environ.get("STEP12_MAX_BUSCO_D_RISE", default_d_rise)))
+        "STEP12_MAX_BUSCO_D_RISE",
+        os.environ.get("STEP13_MAX_BUSCO_D_RISE", default_d_rise)))
 
     lineage = runner.busco_lineage
     busco_available = shutil.which("busco") is not None and lineage is not None
@@ -5043,7 +5043,7 @@ def step_12_refine(runner):
         if tr["accepted"]:
             replaced_map[tr["donor"]] = (tr["backbone"], tr["replacement_class"])
 
-    # ---- 13F2. Add novel pool T2T contigs (D-aware duplicate filter) ----
+    # ---- 12F2. Add novel pool T2T contigs (D-aware duplicate filter) ----
     # Before adding a "novel" T2T contig, check if it overlaps existing backbone.
     # Three possible outcomes for each candidate:
     #   (a) Overlaps a Tier 2 (non-T2T) backbone contig → UPGRADE: replace the
@@ -5305,16 +5305,16 @@ def step_12_refine(runner):
     _write_fasta(list(current_backbone.items()),
                  "assemblies/backbone.telomere_rescued.fa")
 
-    # ---- 13G. Final assembly ----
+    # ---- 12G. Final assembly ----
     # In backbone-first mode, the assembly IS the backbone (with upgrades).
     # No separate pool + backbone merge needed.
     raw_out = "assemblies/final_merge.raw.fasta"
     shutil.copy("assemblies/backbone.telomere_rescued.fa", raw_out)
 
-    # ---- 13G2. Post-upgrade dedup (safety net) ----
+    # ---- 12G2. Post-upgrade dedup (safety net) ----
     # Only check if novel additions are redundant to existing backbone contigs.
     # Protect ALL backbone contigs (including non-telomeric Tier 2) to avoid
-    # BUSCO completeness loss.  purge_dups at 13H handles true haplotig removal.
+    # BUSCO completeness loss.  purge_dups at 12H handles true haplotig removal.
     if novel_additions > 0 and shutil.which("minimap2"):
         # Protect everything that was in the backbone (all original names)
         all_backbone_names = set(backbone_seqs.keys())
@@ -5341,7 +5341,7 @@ def step_12_refine(runner):
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
-    # ---- 13H. purge_dups default cleanup ----
+    # ---- 12H. purge_dups default cleanup ----
     if not getattr(runner, 'no_purge_dups', False):
         purged_fa = "assemblies/final_merge.purged.fasta"
         _run_purge_dups(runner, raw_out, purged_fa)
@@ -5350,7 +5350,7 @@ def step_12_refine(runner):
     else:
         runner.log_info("purge_dups skipped (--no-purge-dups)")
 
-    # ---- 13I. Platform-aware polishing ----
+    # ---- 12I. Platform-aware polishing ----
     if not getattr(runner, 'no_polish', False):
         polished_fa = "assemblies/final_merge.polished.fasta"
         _run_polishing(runner, raw_out, polished_fa)
@@ -5359,7 +5359,7 @@ def step_12_refine(runner):
     else:
         runner.log_info("Polishing skipped (--no-polish)")
 
-    # ---- 13J. Genome-size-aware pruning (safety net) ----
+    # ---- 12J. Genome-size-aware pruning (safety net) ----
     # Never prune telomere-bearing contigs.  Classify the final
     # assembly and protect anything with telomere signal, not just the
     # original T2T pool.
@@ -5431,7 +5431,7 @@ def step_12_refine(runner):
             prot_ids.add(pname)
 
     # 2. replaced_map: {donor_name: (backbone_name, replacement_class)}
-    # Already initialized before 13F2 with trial results + novel upgrades.
+    # Already initialized before 12F2 with trial results + novel upgrades.
     # Merge any entries from the .ids file (in case of restart from mid-step).
     repl_ids_path = "assemblies/single_tel.replaced.ids"
     if os.path.isfile(repl_ids_path):
@@ -5498,7 +5498,7 @@ def step_12_refine(runner):
     # Also copy GFF to final_results when cleanup runs
     runner.log("Wrote assemblies/final.merged.provenance.gff3")
 
-    # ---- 13K. Final assembly coverage QC ----
+    # ---- 12K. Final assembly coverage QC ----
     # Map reads to the final assembly and compute sliding-window coverage
     # to detect assembly errors: zero-coverage gaps, sudden coverage drops
     # (potential misjoins), and abnormally low regions.
@@ -5754,7 +5754,7 @@ def step_12_refine(runner):
     elif not samtools_bin or not minimap2_bin:
         runner.log_info("Coverage QC skipped (requires samtools + minimap2)")
 
-    # ---- 13L. "Do no harm" safety comparison ----
+    # ---- 12L. "Do no harm" safety comparison ----
     # Compare final assembly vs original backbone to ensure refinement
     # didn't degrade quality.  If it did, keep both and warn.
     asm_fa = f"assemblies/{assembler}.result.fasta"
@@ -6073,28 +6073,28 @@ def _final_quast_qc(runner):
 def _final_comparison_report(runner):
     """Generate final comparison report.
 
-    Ensures final Merqury metrics exist (if enabled), then combines
-    per-assembler metrics (assembly_info.csv) with final-merged metrics into
-    final_results/final_result.csv.
+    Combines per-assembler metrics (assembly_info.csv) with final-merged
+    metrics from Step 13 into final_results/final_result.csv.
     """
     runner.log("Final report - Final assembly comparison")
+    os.makedirs("assemblies", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
     os.makedirs("merqury", exist_ok=True)
 
-    # Step 14 normally runs final Merqury.  This call is idempotent so Step 15
-    # also works when run directly or after a partial resume.
-    _final_merqury_qc(runner)
-
-    # Write merged Merqury CSV
+    # Write merged Merqury CSV from Step 13 outputs, if present.
     qv = _parse_merqury_metric_for_label("final", ".qv", _parse_merqury_qv)
     comp = _parse_merqury_metric_for_label(
         "final", ".completeness.stats", _parse_merqury_completeness)
-    with open("assemblies/merged.merqury.csv", "w", newline="") as f:
-        csv.writer(f).writerows([
-            ["Metric", "merged"],
-            ["Merqury QV", qv],
-            ["Merqury completeness (%)", comp],
-        ])
+    merged_merqury_csv = "assemblies/merged.merqury.csv"
+    if qv or comp or not os.path.isfile(merged_merqury_csv):
+        with open(merged_merqury_csv, "w", newline="") as f:
+            csv.writer(f).writerows([
+                ["Metric", "merged"],
+                ["Merqury QV", qv],
+                ["Merqury completeness (%)", comp],
+            ])
+    else:
+        runner.log_info("Using existing assemblies/merged.merqury.csv")
 
     # ---- Build comprehensive final report ----
     # Load all merged metric files
@@ -6183,9 +6183,9 @@ def _final_comparison_report(runner):
     # Rescue counts
     try:
         with open("assemblies/single_tel.replaced.ids") as f:
-            final_map["Step13 rescued telomere replacements"] = str(sum(1 for _ in f))
+            final_map["Step12 rescued telomere replacements"] = str(sum(1 for _ in f))
     except Exception:
-        final_map["Step13 rescued telomere replacements"] = ""
+        final_map["Step12 rescued telomere replacements"] = ""
 
     # ---- Combine assembly_info.csv with merged metrics ----
     info_csv = "assemblies/assembly_info.csv"
@@ -6457,8 +6457,8 @@ def _assembly_only_summary(runner):
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("final_results", exist_ok=True)
 
-    # Step 11 already runs BUSCO, telomere, QUAST, and optional Merqury.
-    # Rebuild only when component metric CSVs are present.  If Step 16 is run
+    # Step 10 already runs BUSCO, telomere, QUAST, and optional Merqury.
+    # Rebuild only when component metric CSVs are present.  If Step 14B is run
     # alone after cleanup, preserve a restored assembly_info.csv instead of
     # replacing it with a mostly empty table.
     component_csvs = [
@@ -6485,7 +6485,7 @@ def _assembly_only_summary(runner):
             "summary; component metric CSVs were not present for rebuild.")
     else:
         runner.log_warn(
-            "No Step 11 assembly_info.csv or component metric CSVs found; "
+            "No Step 10 assembly_info.csv or component metric CSVs found; "
             "writing an empty assembly-only comparison skeleton.")
         _write_merqury_csv()
         _build_assembly_info(runner)
@@ -6520,8 +6520,8 @@ def _final_merqury_qc(runner):
                               "final assembly")
 
 
-def step_14_final_qc(runner):
-    """Step 13 - Final QC: BUSCO + Telomere + QUAST + Merqury on final assembly."""
+def step_13_final_qc(runner):
+    """Step 13 - Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly."""
     runner.log("Step 13 - Final QC (BUSCO + Telomere + QUAST + Merqury on final)")
     _final_busco_qc(runner)
     _final_telomere_qc(runner)
@@ -6529,20 +6529,30 @@ def step_14_final_qc(runner):
     _final_merqury_qc(runner)
 
 
-def step_15_report_cleanup(runner):
-    """Step 14 - Final comparison report + cleanup."""
-    runner.log("Step 14 - Final comparison report and cleanup")
-    _final_comparison_report(runner)
-    _cleanup_outputs(runner)
+def step_14_report(runner):
+    """Step 14 - Final report and cleanup.
+
+    Two sub-modes selected automatically:
+      14A (full mode): builds final comparison table from Step 13 QC metrics
+           + per-assembler metrics from Step 10, then cleans up into final_results/.
+      14B (assembly-only): builds assembly-only comparison table from Step 10
+           metrics, copies to final_results/.
+    """
+    if runner.assembly_only:
+        step_14b_assembly_only_report(runner)
+    else:
+        runner.log("Step 14A - Final comparison report and cleanup")
+        _final_comparison_report(runner)
+        _cleanup_outputs(runner)
 
 
-def step_16_assembly_only_full(runner):
-    """Step 15 - Assembly-only comparison summary with cleanup.
+def step_14b_assembly_only_report(runner):
+    """Step 14B - Assembly-only comparison summary with cleanup.
 
     Reuses Step 10 metric outputs (BUSCO, telomere, QUAST, Merqury),
     builds the unified comparison table, and copies results into final_results/.
     """
-    runner.log("Step 15 - Assembly-only comparison and cleanup")
+    runner.log("Step 14B - Assembly-only comparison and cleanup")
     _assembly_only_summary(runner)
     # Cleanup for assembly-only mode
     os.makedirs("final_results", exist_ok=True)
@@ -6597,9 +6607,7 @@ STEP_FUNCTIONS = {
     # ---- Backbone refinement (Step 12) ----
     12: step_12_refine,               # Backbone selection + refinement
     # ---- Final QC (Step 13) ----
-    13: step_14_final_qc,             # BUSCO + Telomere + QUAST + Merqury on final
+    13: step_13_final_qc,            # BUSCO + Telomere + QUAST + Merqury on final
     # ---- Report + cleanup (Step 14) ----
-    14: step_15_report_cleanup,       # Final report + cleanup
-    # ---- Assembly-only (Step 15) ----
-    15: step_16_assembly_only_full,   # Assembly-only comparison + cleanup
+    14: step_14_report,              # 14A: full report + cleanup / 14B: assembly-only
 }

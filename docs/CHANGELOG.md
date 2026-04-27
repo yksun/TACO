@@ -13,7 +13,7 @@ Versions follow [Semantic Versioning](https://semver.org/).
   of `.qv` files and completeness from the fifth column of
   `.completeness.stats` (preferring the `all` row), avoiding accidental use of
   k-mer count columns in assembly scoring and comparison tables.
-- **Improved** Merqury database handling.  Step 11 and Step 14 now share one
+- **Improved** Merqury database handling.  Step 10 and Step 13 now share one
   resolver that finds an existing reads `.meryl` database or builds
   `merqury/reads.k{K}.meryl` from the input FASTQ when `meryl` is installed.
 - **Improved** Merqury k-mer selection.  `--merqury-k` now defaults to `auto`;
@@ -21,10 +21,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
   published genome-size/collision-rate formula, clamped to k=17-31 for broad
   eukaryotic assemblies.  The fallback collision rate is configurable with
   `MERQURY_COLLISION_RATE` (default 0.001).
-- **Improved** final-QC logic.  Step 14 runs Merqury on the final refined
-  assembly, and Step 15 idempotently reuses or creates those outputs when
-  building `final_results/final_result.csv`, so partial resumes keep the all-QC
-  comparison complete without duplicating successful Merqury runs.
+- **Improved** final-QC logic.  Step 13 is now the only final-QC step
+  (BUSCO, telomere detection, QUAST, and Merqury on the final refined
+  assembly).  Step 14A builds the full report from those Step 13 metrics, and
+  Step 14B is reserved for `--assembly-only`.
 - **Documented** the non-high-accuracy warning for Nanopore and PacBio CLR
   reads in the README and installation guide, including cautious
   interpretation of QV/completeness from non-HiFi reads.
@@ -57,7 +57,7 @@ Versions follow [Semantic Versioning](https://semver.org/).
   transient work directories into structured `temp/` subfolders.
 - **Improved** resume and selected-step warnings.  Tool preflight checks are now
   based on the requested steps rather than every platform-compatible assembler,
-  so resume runs such as `-s 13-15` no longer warn about missing Step 1-9
+  so resume runs such as `-s 13-14` no longer warn about missing Step 1-9
   assembler binaries.  Before each resumed step, TACO warns about missing
   upstream files and can restore common inputs from `final_results/` or
   `telomere_pool/`.
@@ -79,22 +79,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
   passes MBG's required odd `-k` k-mer size (default `1501`, override with
   `TACO_MBG_K`) while treating missing MBG as an optional HiFi assembler skip
   with a clearer warning instead of a broad environment warning.
-- **Changed** default step flow.  Step 11 now runs assembly normalization before
-  BUSCO, telomere, QUAST, and Merqury comparison.  Step 10 is retained as a
-  legacy standalone normalization step, but default full mode runs Steps 0-9
-  and 11-15, and `--assembly-only` runs Steps 0-9, 11, and 16.
+- **Changed** default step flow.  Step 10 now runs assembly normalization plus
+  BUSCO, telomere, QUAST, and Merqury comparison.  Default full mode runs
+  Steps 0-14.  `--assembly-only` runs Steps 0-10 and 14, where Step 14 selects
+  14B only because assembly-only mode is enabled.
 - **Improved** output organization.  Final cleanup and assembly-only cleanup
   now move raw assembler work directories (`hicanu/`, `flye/`, `raven_out/`,
   and peers) into `temp/assemblers/` after normalized FASTAs and comparison
-  tables have been written; Step 11 can normalize from those organized
+  tables have been written; Step 10 can normalize from those organized
   directories during resumed runs.
 - **Improved** selected-step preflight.  Standalone runs now warn about the
   specific upstream files they need: Step 10 checks for assembler outputs from
-  Steps 1-9 or existing normalized FASTAs, Step 12+ checks for Step 11
-  comparison outputs before telomere-pool/refinement/final reporting, and
-  Step 16 preserves restored `assembly_info.csv` when component metric CSVs are
-  unavailable.  Deprecated step 17 requests now produce guidance for the
-  current 0-16 step layout.
+  Steps 1-9 or existing normalized FASTAs, Step 12 checks for Step 10
+  comparison outputs and Step 11 telomere-pool files, Step 13 checks only for
+  the final refined FASTA, and Step 14 adapts its report preflight to 14A or
+  14B.  Invalid requests above Step 14 now produce guidance for the current
+  0-14 step layout.
 - **Fixed** Merqury result discovery.  TACO now searches exact, prefix-based,
   and nested Merqury output paths for `.qv` and `.completeness.stats` files
   before writing `assembly.merqury.csv` or final Merqury metrics, and logs a
@@ -125,20 +125,21 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **New** Step 0 — Input QC: validates FASTQ exists, estimates coverage,
   warns for low coverage per-platform (HiFi <25×, ONT <40×, CLR <50×),
   logs compatible assemblers.  Runs in both full and assembly-only modes.
-- **Renumbered** pipeline to 16 public steps (0-15):
+- **Renumbered** pipeline to 15 public steps (0-14):
   - Steps 1-6: original assemblers (Canu, NextDenovo, Peregrine, IPA, Flye, Hifiasm)
   - Steps 7-9: **new** assemblers (LJA, MBG, Raven)
   - Step 10: normalize + QC comparison (BUSCO + Telomere + QUAST + Merqury → assembly_info.csv)
   - Step 11: build telomere pool (pairwise quickmerge + structural validation)
   - Step 12: backbone selection + telomere-aware refinement
   - Step 13: final QC (BUSCO + Telomere + QUAST + Merqury on refined assembly)
-  - Step 14: final comparison report + cleanup
-  - Step 15: assembly-only comparison + cleanup (for `--assembly-only`)
+  - Step 14: report + cleanup — auto-selects sub-mode:
+    14A (full): final comparison report + cleanup into `final_results/`
+    14B (assembly-only): assembly-only comparison + cleanup
 - **Unified** assembler lists: all downstream code (BUSCO CSV, QUAST CSV,
   Merqury CSV, assembly_info, backbone selection, chimera check) now imports
   `ALL_ASSEMBLERS` from `utils.py` instead of hardcoding names.  Adding a
   new assembler requires only one change in `utils.py`.
-- **Assembly-only mode** (`--assembly-only`) runs Steps 0-10, 15
+- **Assembly-only mode** (`--assembly-only`) runs Steps 0-10, 14
   (assemblers + normalize/QC + assembly-only report).
   Full mode runs Steps 0-14 (adds telomere pool, refinement, final QC,
   report+cleanup).
@@ -149,8 +150,8 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **New** Merqury auto-enabled for ALL platforms: when `merqury.sh` + `meryl`
   are installed, Merqury is enabled by default for HiFi, ONT, and CLR.  TACO
   builds a reads `.meryl` database automatically from input reads, runs Merqury
-  on every assembler output (Step 11), and on the final refined assembly
-  (Step 14).  For non-HiFi platforms, a warning is logged: QV values may
+  on every assembler output (Step 10), and on the final refined assembly
+  (Step 13).  For non-HiFi platforms, a warning is logged: QV values may
   underestimate true quality, so Merqury completeness and relative QV ranking
   across assemblers should be interpreted cautiously.  Disable with
   `--no-merqury`.
@@ -168,7 +169,7 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **New** `--merqury-k` flag for configurable Merqury k-mer size (default
   `auto`; use a fixed integer such as 21 or 31 for cross-run comparability).
   Auto-built databases are named `reads.k{K}.meryl`.
-- **New** Step 13L "do no harm" comparison: after refinement, compares final
+- **New** Step 12L "do no harm" comparison: after refinement, compares final
   vs backbone for size, telomere count, and genome size deviation.  If quality
   degraded, saves both assemblies + `refinement_warning.txt`.
 
@@ -179,7 +180,7 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   contig ≥80%).  Previously only checked query coverage, allowing a 1.06M
   pool T2T to "upgrade" a 1.73M backbone contig (losing 667K bp of content
   and ~77 BUSCO genes).
-- **New** D-aware duplicate filter (13F2) with three-tier logic for novel
+- **New** D-aware duplicate filter (12F2) with three-tier logic for novel
   pool T2T contigs:
   - Overlaps Tier 1 (T2T) backbone: reject (pure duplicate).
   - Overlaps Tier 2 (non-T2T) backbone at ≥80% target coverage: upgrade
@@ -193,7 +194,7 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
   - Overlaps Tier 2 at < 50%: reject (insufficient overlap).
   - No overlap: add as genuinely novel (with optional BUSCO D check).
 - **New** diagnostic logging for un-upgraded Tier 2 backbone contigs
-  (13D2b): reports which Tier 2 contigs have no full T2T upgrade and
+  (12D2b): reports which Tier 2 contigs have no full T2T upgrade and
   identifies partial T2T hits, flagging potentially chimeric backbone.
 - **Disabled** backbone self-dedup by default.  purge_dups handles haplotig
   removal using read-coverage evidence.  Re-enable with `SELFDEDUP_ENABLE=1`.
@@ -204,13 +205,13 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **Fixed** NextPolish2 v0.2.2: requires sorted BAM as first argument.
   TACO now maps reads with minimap2, sorts with samtools, passes BAM correctly.
 - **Fixed** final BUSCO caching: always clears stale results before rerun
-  (now part of Step 14 final QC).
+  (now part of Step 13 final QC).
 - **Fixed** GFF provenance: backbone contigs show clean names (purge_dups
   suffix stripped), `source_type=assembler`; provenance TSV lookup checks
   `final_results/` fallback.
 - **Fixed** cleanup file move: uses explicit remove-then-copy to avoid silent
   failures.
-- **New** final assembly coverage QC (Step 13K): maps reads to the final
+- **New** final assembly coverage QC (Step 12K): maps reads to the final
   assembly and computes sliding-window coverage (default 5 kb window).  Detects
   zero-coverage gaps, very low coverage regions (< 15% of global median), and
   mixed low-coverage windows.  Three output files in `final_results/`:
@@ -241,11 +242,11 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 | `NOVEL_DUP_ID` | 0.90 | Min identity for duplicate detection |
 | `NOVEL_UPGRADE_TCOV` | 0.80 | Min backbone coverage for T2T upgrade |
 | `NOVEL_MAX_D_RISE` | taxon default | Max BUSCO D rise allowed for novel additions |
-| `STEP13_MAX_ACCEPTED` | taxon default | Max accepted rescue candidates in refinement |
-| `STEP13_MIN_BP_RATIO` | 0.90 | Min donor/backbone bp ratio for replacement candidates |
-| `STEP13_MAX_BUSCO_C_DROP` | taxon default | Max BUSCO C% drop allowed during trial validation |
-| `STEP13_MAX_BUSCO_M_RISE` | taxon default | Max BUSCO M% rise allowed during trial validation |
-| `STEP13_MAX_BUSCO_D_RISE` | taxon default | Max BUSCO D% rise allowed during trial validation |
+| `STEP12_MAX_ACCEPTED` | taxon default | Max accepted rescue candidates in refinement |
+| `STEP12_MIN_BP_RATIO` | 0.90 | Min donor/backbone bp ratio for replacement candidates |
+| `STEP12_MAX_BUSCO_C_DROP` | taxon default | Max BUSCO C% drop allowed during trial validation |
+| `STEP12_MAX_BUSCO_M_RISE` | taxon default | Max BUSCO M% rise allowed during trial validation |
+| `STEP12_MAX_BUSCO_D_RISE` | taxon default | Max BUSCO D% rise allowed during trial validation |
 | `CHIMERIC_COV_RATIO` | 0.30 | If uncovered region coverage < this × covered → chimeric |
 | `PURGE_DUPS_CALCUTS` | auto | Override calcuts coverage thresholds |
 | `SELFDEDUP_ENABLE` | 0 | Set to 1 to re-enable backbone self-dedup |
@@ -417,8 +418,8 @@ is an optional override.
   polyploidy); vertebrate 3% / 0.5% / 4%.
 - **New** BUSCO D-rise (duplicated %) threshold: catches rescue candidates
   that introduce redundant copies of single-copy orthologs.  Configurable
-  via `STEP13_MAX_BUSCO_D_RISE` environment variable (`STEP12_*` names remain
-  accepted for compatibility).
+  via `STEP12_MAX_BUSCO_D_RISE` environment variable (`STEP13_*` names remain
+  accepted for compatibility with older run scripts).
 - **New** two-tier confidence model: Tier 1 (immutable T2T contigs) and
   Tier 2 (editable backbone contigs).  Tier 1 contigs are never replaced
   during rescue unless `--allow-t2t-replace` is explicitly set.
@@ -428,8 +429,8 @@ is an optional override.
   recorded in `rescue_trial_summary.tsv` and `replaced.ids`.
 - **New** taxon-aware rescue limits: fungi 20, vertebrate 10, plant 8,
   other 15.  Prevents runaway replacement in complex genomes.
-- **New** taxon-aware 13D4/13D5 dedup thresholds: fungi 70%/85% (13D4)
-  and 80%/90% (13D5); plant/vertebrate 85%/92% and 90%/95%; other
+- **New** taxon-aware 12D4/12D5 dedup thresholds: fungi 70%/85% (12D4)
+  and 80%/90% (12D5); plant/vertebrate 85%/92% and 90%/95%; other
   75%/88% and 85%/92%.
 - **New** telomere-evidence safety check: `replace_single_with_better`
   candidates are rejected if telomere evidence weakens at either end

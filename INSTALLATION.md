@@ -71,7 +71,7 @@ Override the BUSCO lineage with `--busco <lineage_name>` if your organism needs 
 
 ## Running TACO
 
-TACO runs 17 public steps (0-16). Step 0 (Input QC) always runs first — it validates the FASTQ, estimates coverage, and logs compatible assemblers. In full mode (Steps 0-15), TACO assembles, runs combined assembly QC/comparison, builds the telomere pool, selects a backbone, refines it, and produces a final assembly. In assembly-only mode (Steps 0-11 and 16), TACO benchmarks all assemblers without refinement.
+TACO runs 15 public steps (0-14). Step 0 (Input QC) always runs first — it validates the FASTQ, estimates coverage, and logs compatible assemblers. In full mode (Steps 0-14), TACO assembles, runs combined assembly QC/comparison, builds the telomere pool, selects and refines a backbone, runs final QC, then writes the full report and cleanup outputs in Step 14A. In assembly-only mode (Steps 0-10 and 14), TACO benchmarks all assemblers without refinement and writes the assembly-only report in Step 14B.
 
 ```bash
 mkdir -p my_project && cd my_project
@@ -94,8 +94,8 @@ taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --benchmark
 # Optional publication-grade input checksums with benchmark logs
 TACO_BENCHMARK_SHA256=1 taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal --benchmark
 
-# Resume from a specific step (e.g., rerun from refinement)
-taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal -s 13-15
+# Resume from a specific step (e.g., rerun from refinement through report)
+taco -g 12m -t 16 --fastq /path/to/reads.fastq.gz --taxon fungal -s 12-14
 ```
 
 **Alternative (without pip install):** Use the shell wrapper which sets PYTHONPATH automatically:

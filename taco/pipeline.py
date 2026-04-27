@@ -534,50 +534,51 @@ class PipelineRunner:
             else:
                 add_optional(binary, f"Step {step} {asm} assembly")
 
-        if 11 in step_set:
+        if 10 in step_set:
             if self.run_busco:
-                add_required("busco", "Step 11 BUSCO comparison")
-            add_required(["quast.py", "quast"], "Step 11 QUAST comparison")
+                add_required("busco", "Step 10 BUSCO comparison")
+            add_required(["quast.py", "quast"], "Step 10 QUAST comparison")
             if self.merqury_enable:
-                add_optional("merqury.sh", "Step 11 Merqury comparison")
+                add_optional("merqury.sh", "Step 10 Merqury comparison")
                 if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
-                    add_optional("meryl", "Step 11 Merqury read database build")
+                    add_optional("meryl", "Step 10 Merqury read database build")
+
+        if 11 in step_set:
+            add_optional("minimap2", "Step 11 telomere-pool clustering/quickmerge validation")
+            add_optional("merge_wrapper.py", "Step 11 optional quickmerge T2T recovery")
 
         if 12 in step_set:
-            add_optional("minimap2", "Step 12 telomere-pool clustering/quickmerge validation")
-            add_optional("merge_wrapper.py", "Step 12 optional quickmerge T2T recovery")
-
-        if 13 in step_set:
-            add_optional("minimap2", "Step 13 rescue alignment, polishing, coverage QC, purge_dups")
+            add_optional("minimap2", "Step 12 rescue alignment, polishing, coverage QC, purge_dups")
+            if self.run_busco:
+                add_optional("busco", "Step 12 BUSCO trial validation")
+            if self.merqury_enable:
+                add_optional("merqury.sh", "Step 12 backbone scoring Merqury refresh")
+                if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
+                    add_optional("meryl", "Step 12 Merqury read database build")
             if not getattr(self, 'no_coverage_qc', False):
-                add_optional("samtools", "Step 13 final assembly coverage QC")
+                add_optional("samtools", "Step 12 final assembly coverage QC")
             if not getattr(self, 'no_purge_dups', False):
                 for tool in ["purge_dups", "pbcstat", "calcuts", "split_fa", "get_seqs"]:
-                    add_optional(tool, "Step 13 purge_dups cleanup")
+                    add_optional(tool, "Step 12 purge_dups cleanup")
             if not getattr(self, 'no_polish', False):
                 if self.platform == "pacbio-hifi":
-                    add_optional("nextPolish2", "Step 13 HiFi polishing")
-                    add_optional("yak", "Step 13 HiFi polishing")
-                    add_optional("samtools", "Step 13 HiFi polishing read alignment")
+                    add_optional("nextPolish2", "Step 12 HiFi polishing")
+                    add_optional("yak", "Step 12 HiFi polishing")
+                    add_optional("samtools", "Step 12 HiFi polishing read alignment")
                 elif self.platform == "nanopore":
-                    add_optional("medaka_consensus", "Step 13 Nanopore polishing")
-                    add_optional("racon", "Step 13 Nanopore polishing fallback")
+                    add_optional("medaka_consensus", "Step 12 Nanopore polishing")
+                    add_optional("racon", "Step 12 Nanopore polishing fallback")
                 else:
-                    add_optional("racon", "Step 13 PacBio CLR polishing")
+                    add_optional("racon", "Step 12 PacBio CLR polishing")
 
-        if 14 in step_set:
+        if 13 in step_set:
             if self.run_busco:
-                add_required("busco", "Step 14 final BUSCO QC")
-            add_required(["quast.py", "quast"], "Step 14 final QUAST QC")
+                add_required("busco", "Step 13 final BUSCO QC")
+            add_required(["quast.py", "quast"], "Step 13 final QUAST QC")
             if self.merqury_enable:
-                add_optional("merqury.sh", "Step 14 final Merqury QC")
+                add_optional("merqury.sh", "Step 13 final Merqury QC")
                 if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
-                    add_optional("meryl", "Step 14 Merqury read database build")
-
-        if 15 in step_set and self.merqury_enable:
-            add_optional("merqury.sh", "Step 15 final report Merqury completion")
-            if getattr(self, 'merqury_build_db', False) or not self.merqury_db:
-                add_optional("meryl", "Step 15 Merqury read database build")
+                    add_optional("meryl", "Step 13 Merqury read database build")
 
         missing_required = {
             self._format_tool_spec(tool): sorted(reasons)
@@ -647,13 +648,13 @@ class PipelineRunner:
 
     def restore_resume_inputs_for_step(self, step):
         """Restore inputs moved by older cleanup runs before a resumed step."""
-        if step in (12, 13, 14, 15, 16):
+        if step in (12, 14):
             self._copy_resume_input(
                 "assemblies/assembly_info.csv",
                 ["final_results/assembly_info.csv",
                  "final_results/assembly_only_result.csv"],
             )
-        if step in (16,):
+        if step == 14 and self.assembly_only:
             for metric_csv in [
                 "assembly.busco.csv",
                 "assembly.quast.csv",
@@ -664,7 +665,18 @@ class PipelineRunner:
                     os.path.join("assemblies", metric_csv),
                     [os.path.join("final_results", metric_csv)],
                 )
-        if step in (13, 15):
+        if step == 14 and not self.assembly_only:
+            for metric_csv in [
+                "merged.busco.csv",
+                "merged.quast.csv",
+                "merged.telo.csv",
+                "merged.merqury.csv",
+            ]:
+                self._copy_resume_input(
+                    os.path.join("assemblies", metric_csv),
+                    [os.path.join("final_results", metric_csv)],
+                )
+        if step == 12:
             self._copy_resume_input(
                 "pool_contig_provenance.tsv",
                 ["telomere_pool/pool_contig_provenance.tsv",
@@ -679,7 +691,7 @@ class PipelineRunner:
                 ["telomere_pool/protected_telomere_mode.txt",
                  "final_results/protected_telomere_mode.txt"],
             )
-        if step in (14, 15):
+        if step == 13 or (step == 14 and not self.assembly_only):
             self._copy_resume_input(
                 "assemblies/final.merged.fasta",
                 ["final_results/final.merged.fasta",
@@ -790,46 +802,49 @@ class PipelineRunner:
                  "Step 11 (telomere pool)"),
                 ("normalized assembler FASTA files",
                  ["assemblies/*.result.fasta"],
-                 "Step 11"),
-            ],
-            14: [
-                ("final merged assembly",
-                 ["assemblies/final.merged.fasta",
-                  "final_results/final.merged.fasta",
-                  "final_results/final_assembly.fasta"],
-                 "Step 12 (refinement)"),
-            ],
-            14: [
-                ("final merged assembly",
-                 ["assemblies/final.merged.fasta",
-                  "final_results/final.merged.fasta",
-                  "final_results/final_assembly.fasta"],
-                 "Step 12 (refinement)"),
-                ("assembly comparison table",
-                 ["assemblies/assembly_info.csv",
-                  "final_results/assembly_info.csv"],
                  "Step 10"),
-                ("final QC tables",
-                 ["assemblies/merged.telo.csv",
-                  "assemblies/merged.quast.csv",
-                  "assemblies/merged.busco.csv"],
-                 "Step 13 (final QC)"),
             ],
-            15: [
-                ("assembly comparison table or component metric CSVs",
+            13: [
+                ("final merged assembly",
+                 ["assemblies/final.merged.fasta",
+                  "final_results/final.merged.fasta",
+                  "final_results/final_assembly.fasta"],
+                 "Step 12 (refinement)"),
+            ],
+            14: [
+                ("assembly comparison table",
                  ["assemblies/assembly_info.csv",
                   "final_results/assembly_info.csv",
                   "final_results/assembly_only_result.csv"] + component_metric_patterns,
                  "Step 10 (normalize + QC)"),
             ],
         }
-        if step == 14 and self.merqury_enable:
-            checks[14].append(
-                ("final Merqury QC files",
-                 ["merqury/final.qv",
-                  "merqury/final.completeness.stats",
-                  "assemblies/merged.merqury.csv"],
-                 "Step 13 (final QC) Merqury run")
+        if step == 14 and not self.assembly_only:
+            checks[14].extend([
+                ("final merged assembly",
+                 ["assemblies/final.merged.fasta",
+                  "final_results/final.merged.fasta",
+                  "final_results/final_assembly.fasta"],
+                 "Step 12 (refinement)"),
+                ("final BUSCO metric table",
+                 ["assemblies/merged.busco.csv",
+                  "final_results/merged.busco.csv"],
+                 "Step 13 (final QC)"),
+                ("final telomere metric table",
+                 ["assemblies/merged.telo.csv",
+                  "final_results/merged.telo.csv"],
+                 "Step 13 (final QC)"),
+                ("final QUAST metric table",
+                 ["assemblies/merged.quast.csv",
+                  "final_results/merged.quast.csv"],
+                 "Step 13 (final QC)"),
+            ])
+        if step == 13 and self.merqury_enable:
+            checks[13].append(
+                ("Merqury database for final QC",
+                 ["merqury/reads.meryl", "merqury/reads.k*.meryl",
+                  "*.meryl"],
+                 "Step 10 or Step 13 (auto-built from reads)")
             )
         missing = []
         for desc, patterns, producer in checks.get(step, []):
@@ -1397,7 +1412,7 @@ nextgraph_options = -a 1
             self.log_info(f"User telomere motif: {self.motif}")
         else:
             self.log_info("No user motif supplied; using auto-discovery + built-in families")
-        default_full_steps = list(range(0, 10)) + list(range(11, 16))
+        default_full_steps = list(range(0, 15))
         if self.assembly_only:
             self.log_info("Assembly-only mode enabled")
         elif self.steps != default_full_steps:

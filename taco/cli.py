@@ -18,8 +18,7 @@ STEP_NAMES = {
     11: "Build telomere pool (quickmerge + validation)",
     12: "Backbone selection and refinement",
     13: "Final QC (BUSCO + Telomere + QUAST + Merqury on final)",
-    14: "Final comparison report and cleanup",
-    15: "Assembly-only comparison and cleanup",
+    14: "Report + cleanup (14A: full comparison / 14B: assembly-only)",
 }
 
 
@@ -113,21 +112,22 @@ def parse_args():
         args.merqury = True
     
     if args.assembly_only:
-        # Steps 0-10, 15: assemblers + normalize/QC + assembly-only report
-        args.steps = list(range(0, 11)) + [15]
+        # Steps 0-10, 14: assemblers + normalize/QC + report (14B assembly-only)
+        # Skips 11 (telomere pool), 12 (refinement), 13 (final QC)
+        args.steps = list(range(0, 11)) + [14]
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
         except ValueError as e:
             parser.error(str(e))
     else:
-        # Full mode: Steps 0-14
+        # Full mode: Steps 0-14 (14A runs automatically)
         args.steps = list(range(0, 15))
     
     for s in args.steps:
-        if s < 0 or s > 15:
+        if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.3.0 uses steps 0-15. "
-                f"Full mode: 0-14. Assembly-only: 0-10, 15. "
-                f"Resume refinement: -s 12-14.")
+                f"Invalid step: {s}. TACO v1.3.1 uses steps 0-14. "
+                f"Full mode: 0-14. Assembly-only: 0-10, 14. "
+                f"Resume from refinement: -s 12-14.")
     return args
