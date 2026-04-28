@@ -2,15 +2,17 @@
 
 # TACO
 
-**Telomere-Aware Contig Optimization**
+**Telomere-Aware Contig Optimization for long-read genome assembly comparison and refinement**
 
-TACO is a telomere-aware all-in-one multi-assembler comparison and refinement pipeline for genome assembly benchmarking, decision-making, and chromosome-end improvement. Developed for small eukaryotic genomes with a focus on fungal genomes, TACO runs multiple assemblers, standardizes their outputs, evaluates assembly quality, detects telomere-supported contigs, and can either **(1)** stop after generating a unified assembler comparison table for benchmarking, or **(2)** continue into telomere-aware backbone refinement for an improved chromosome-scale candidate assembly.
+TACO is a reproducible multi-assembler pipeline for long-read genome assembly benchmarking, backbone selection, and conservative chromosome-end improvement. It was developed for small to moderate eukaryotic genomes, with a particular focus on fungal genomes, but also includes taxon-aware settings for plants, vertebrates, insects, and other organisms.
+
+From one input read set, TACO runs compatible assemblers, standardizes their outputs, evaluates assembly quality with BUSCO, QUAST, telomere metrics, and optional Merqury, then follows one of two workflows: **assembly-only benchmarking** or **full telomere-aware refinement**.
 
 TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natural History**.
 
-**What TACO is:** TACO compares multiple long-read assemblies generated from a single dataset, selects the best backbone assembly, and conservatively improves it using telomere-supported contigs from all assemblers. It produces a primary-style chromosome-level assembly with full provenance tracking and coverage QC.
+**What TACO is:** TACO compares multiple long-read assemblies generated from a single dataset, selects the best-supported backbone assembly, and conservatively improves it using telomere-supported contigs from all assemblers. It produces a primary-style chromosome-level candidate assembly with provenance tracking, final QC, and coverage diagnostics.
 
-**What TACO is not:** TACO does not perform Hi-C scaffolding (no YaHS/3D-DNA), does not require Hi-C data, and does not attempt full chromosome scaffolding. It is not a diploid/polyploid phasing tool. For scaffolding, use TACO's output as input to a dedicated scaffolder.
+**What TACO is not:** TACO does not perform Hi-C scaffolding, does not require Hi-C data, and does not attempt full chromosome scaffolding. It is not a diploid/polyploid phasing tool. For scaffolding, use TACO output as input to a dedicated scaffolder such as YaHS or 3D-DNA.
 
 ![Latest Version](https://img.shields.io/github/v/tag/yksun/TACO?sort=semver&label=Latest%20Version)
 ![Last Commit](https://img.shields.io/github/last-commit/yksun/TACO)
@@ -22,15 +24,16 @@ TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natu
 ## Table of Contents
 
 - [Overview](#overview)
-- [Features](#features)
+- [Workflow At A Glance](#workflow-at-a-glance)
+- [Key Features](#key-features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-- [Usage](#usage)
+- [Command-Line Reference](#command-line-reference)
 - [Sequencing Platform Support](#sequencing-platform-support)
 - [Pipeline Steps](#pipeline-steps)
 - [Telomere Detection](#telomere-detection)
 - [Assembly Selection Strategy](#assembly-selection-strategy)
-- [Output Structure](#output-structure)
+- [Outputs And Reports](#outputs-and-reports)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
 - [Citation](#citation)
@@ -42,9 +45,21 @@ TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natu
 
 Genome assemblers often produce different results from the same long-read dataset. One assembler may recover longer contigs, another may preserve more complete chromosome ends, and another may provide a better balance of completeness, contiguity, and redundancy. TACO makes these comparisons systematic, interpretable, and reproducible.
 
-TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the pipeline runs all assemblers, standardizes their outputs, evaluates quality with BUSCO, QUAST, telomere detection, and optional Merqury, then produces a unified comparison table at `assemblies/assembly_info.csv`. In **full refinement mode**, TACO continues from the comparison step into telomere-pool construction and backbone refinement, producing an improved chromosome-scale candidate assembly with preserved telomeric ends.
+TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the pipeline runs all compatible assemblers, standardizes their outputs, evaluates quality with BUSCO, QUAST, telomere detection, and optional Merqury, then produces a unified comparison table. In **full refinement mode** (default), TACO continues into telomere-pool construction, backbone refinement, final QC, and report cleanup.
 
-## Features
+## Workflow At A Glance
+
+| Goal | Command mode | Steps run | Main result |
+|---|---|---|---|
+| Compare assemblers without changing any assembly | `--assembly-only` | 0-10, then 14B | `assemblies/assembly_info.csv` and `final_results/assembly_only_result.csv` |
+| Produce a refined candidate assembly | default full mode | 0-14 | `final_results/final_assembly.fasta` and `final_results/final_result.csv` |
+| Resume final QC and reporting after refinement | `-s 13-14` | 13, then 14A | refreshed final QC metrics and final report |
+| Rebuild only the full final report/cleanup | `-s 14` | 14A | `final_results/final_result.csv` |
+| Rebuild only assembly-only summary/cleanup | `--assembly-only -s 14` | 14B | `final_results/assembly_only_result.csv` |
+
+TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mode-adaptive: **14A** runs in full mode for final reporting and cleanup, while **14B** runs only when `--assembly-only` is set.
+
+## Key Features
 
 - Runs up to nine long-read assemblers (HiCanu, NextDenovo, Peregrine, IPA, Flye, Hifiasm, LJA, MBG, Raven) from a single command
 - Supports PacBio HiFi, Oxford Nanopore, and PacBio CLR reads via `--platform`; automatically selects compatible assemblers per platform
@@ -52,14 +67,15 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 - Standardizes assembly outputs for direct cross-assembler comparison
 - Hybrid telomere detection with de novo k-mer discovery, built-in motif families, and per-end composite scoring
 - Three-tier telomere classification: strict T2T, single-end strong, and telomere-supported
-- Benchmarks all assembler outputs AND the final refined assembly with BUSCO, QUAST, telomere metrics, and Merqury QV/completeness (auto-enabled for all platforms when `merqury.sh` + `meryl` installed; builds a reads `.meryl` database automatically)
+- Benchmarks all assembler outputs and the final refined assembly with BUSCO, QUAST, telomere metrics, and Merqury QV/completeness when available
 - Taxon-aware scoring: BUSCO S rewarded, BUSCO D penalized, Merqury QV/completeness, telomere metrics, N50, contig count, and genome size deviation — with per-taxon weights for fungal, plant, vertebrate, insect, and other genomes
 - Taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota, `--taxon plant` → embryophyta, etc.
-- Assembly-only mode (`--assembly-only`) for convenient benchmarking without refinement
+- Assembly-only mode (`--assembly-only`) for publication-ready assembler benchmarking without refinement
 - Conservative telomere-aware backbone refinement: D-aware duplicate filter, read-coverage diagnostic for partial overlaps, BUSCO trial validation, and "do no harm" safety comparison
 - Structural quickmerge validation with parent alignment checks
 - Coverage QC: sliding-window read depth analysis with GFF3 output for genome browser visualization
 - Full provenance tracking: GFF3 annotation tracing every contig to its original assembler, with quickmerge region-level mapping
+- Mode-aware final reporting: Step 14A creates the full final comparison report; Step 14B creates the assembly-only summary
 - Optional machine-readable benchmark logs with `--benchmark`, plus decision tables and version tracking for reproducible reporting
 
 ## Installation
@@ -131,7 +147,7 @@ taco -g 12m -t 16 \
   -m TTAGGG
 ```
 
-## Usage
+## Command-Line Reference
 
 ### Parameters
 
@@ -142,12 +158,12 @@ taco -g 12m -t 16 \
 | `--fastq` | Input FASTQ file (use absolute path) |
 | `--taxon` | Taxonomy preset for telomere detection: `vertebrate`, `animal`, `plant`, `insect`, `fungal`, or `other` (default). Sets motif-family priors and detection behavior automatically. |
 | `-m`, `--motif` | Telomere motif override (optional). Only use when the exact motif is biologically known for the species. When omitted, taxon-aware hybrid detection is used instead. |
-| `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio`. Also determines default polishing tool. |
-| `-s`, `--steps` | Run selected steps only (e.g., `1,3-5`) |
+| `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio`. Determines compatible assemblers and the default polishing tool. |
+| `-s`, `--steps` | Run selected public steps only (e.g., `1,3-5`, `13-14`). TACO uses steps 0-14; `-s 14` runs 14A unless `--assembly-only` is set. |
 | `--reference`, `-ref` | Reference FASTA for comparison. Included as the "reference" assembler in all comparison tables. |
-| `--busco` | Run BUSCO (optionally specify lineage dataset) |
+| `--busco` | BUSCO lineage override. If omitted, TACO uses a taxon-aware default when available. |
 | `--choose` | Manually choose the backbone assembler |
-| `--assembly-only` | Stop after assembler comparison |
+| `--assembly-only` | Run assembler comparison only: steps 0-10, then Step 14B cleanup/reporting |
 | `--auto-mode` | Backbone selection mode: `smart` (default) or `n50` |
 | `--merqury` | Force-enable Merqury; if no database is provided, builds one when `meryl` is installed |
 | `--merqury-db` | Enable Merqury with a specific `.meryl` database path |
@@ -160,7 +176,11 @@ taco -g 12m -t 16 \
 
 ### Assembly-Only Mode
 
-Use `--assembly-only` when the goal is assembler benchmarking and comparison without refinement. TACO runs all assemblers, standardizes outputs inside Step 10, runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes the combined comparison table to `assemblies/assembly_info.csv` and a summary to `final_results/assembly_only_result.csv` in Step 14B. Use `--benchmark` separately only when you also want machine-readable step timing and run metadata in `benchmark_logs/`.
+Use `--assembly-only` when the goal is assembler benchmarking and comparison without refinement. TACO runs all compatible assemblers, standardizes outputs inside Step 10, runs BUSCO, telomere detection, QUAST, and optional Merqury, then writes the combined comparison table to `assemblies/assembly_info.csv` and a summary to `final_results/assembly_only_result.csv` in Step 14B.
+
+Assembly-only mode never runs the telomere pool, refinement, or final refined-assembly QC steps. If you run `--assembly-only -s 14`, TACO runs Step 14B. If you run `-s 14` without `--assembly-only`, TACO runs Step 14A for the full final report.
+
+Use `--benchmark` separately only when you also want machine-readable step timing and run metadata in `benchmark_logs/`.
 
 ### Benchmark Provenance Mode
 
@@ -170,7 +190,11 @@ Use `--benchmark` when a run needs publication-ready provenance. It writes extra
 
 ### Resuming And File Organization
 
-When running selected steps with `-s`/`--steps`, TACO checks only the tools needed by those requested steps. For example, `-s 13-14` will not warn about missing assembler binaries from Steps 1-9. Before each resumed step, TACO checks for expected upstream files and prints a specific warning naming the missing file type and the earlier step that should have produced it. Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs; Step 12 and later check for the Step 10/11 outputs they need. For common cleanup outputs, TACO can also restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step. TACO v1.3.2 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+When running selected steps with `-s`/`--steps`, TACO checks only the tools needed by those requested steps. For example, `-s 13-14` will not warn about missing assembler binaries from Steps 1-9. Before each resumed step, TACO checks for expected upstream files and prints a specific warning naming the missing file type and the earlier step that should have produced it.
+
+Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs. Step 12 and later check for the Step 10/11 outputs they need. Step 13 runs only final QC on the refined assembly. Step 14 does not rerun final QC; it builds the report and organizes outputs. In full mode, `-s 14` always runs 14A. In assembly-only mode, `--assembly-only -s 14` runs 14B.
+
+For common cleanup outputs, TACO can restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step. TACO v1.3.2 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -227,6 +251,8 @@ Incompatible assemblers are automatically skipped with a warning.
 
 ## Pipeline Steps
 
+TACO exposes 15 public steps by number: **0-14**. Step 14 has two internal reporting modes, but it is still invoked as step `14` from the command line.
+
 | Step | Description | Phase |
 |---|---|---|
 | 0 | Input QC and validation | Setup |
@@ -234,13 +260,24 @@ Incompatible assemblers are automatically skipped with a warning.
 | 10 | Normalize + QC comparison: BUSCO + Telomere + QUAST + Merqury on all assemblies | QC |
 | 11 | Build telomere pool (pairwise quickmerge + structural validation) | Telomere pool |
 | 12 | Backbone selection and telomere-aware refinement | Refinement |
-| 13 | Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
-| 14A | Final comparison report + cleanup into `final_results/` (full mode) | Report |
-| 14B | Assembly-only comparison summary + cleanup (assembly-only mode) | Report |
+| 13 | Final QC only: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
+| 14 / 14A | Final comparison report + cleanup into `final_results/` (full mode) | Report |
+| 14 / 14B | Assembly-only comparison summary + cleanup (only with `--assembly-only`) | Report |
 
 ### Step 0 — Input QC
 
 Step 0 runs automatically before assembly. It validates that the FASTQ file exists and is non-empty, parses the genome size, estimates total read bases and coverage by sampling the first 100K reads, and warns if coverage is below recommended thresholds (HiFi: 25×, ONT: 40×, CLR: 50×). It also logs which assemblers are compatible with the selected platform and confirms the BUSCO lineage setting. Step 0 runs in both full and assembly-only modes.
+
+### Step 13 — Final QC Only
+
+Step 13 evaluates the refined assembly produced by Step 12. It runs BUSCO, telomere detection, QUAST, and optional Merqury on `final.merged.fasta`, then writes component metric files used by Step 14A. Step 13 does not perform cleanup and does not create the full final comparison report by itself.
+
+### Step 14 — Mode-Adaptive Reporting
+
+Step 14 chooses its sub-mode from the run mode:
+
+- **14A full report**: used in full refinement mode, including `-s 14`. It combines Step 10 per-assembler metrics with Step 13 final-assembly metrics, writes `final_results/final_result.csv`, and organizes final outputs.
+- **14B assembly-only report**: used only when `--assembly-only` is set. It reuses Step 10 metrics, writes `final_results/assembly_only_result.csv`, and performs assembly-only cleanup.
 
 ### Full Refinement Mode (default)
 
@@ -424,7 +461,20 @@ Example workflow for inspecting weak spots:
 # 4. Navigate to flagged regions to inspect assembly quality
 ```
 
-## Output Structure
+## Outputs And Reports
+
+### Key Output Files
+
+| File | Produced by | Purpose |
+|---|---|---|
+| `assemblies/assembly_info.csv` | Step 10 | Unified assembler comparison table used for benchmarking and backbone selection |
+| `final_results/assembly_only_result.csv` | Step 14B | Publication-facing summary for `--assembly-only` runs |
+| `final_results/final_assembly.fasta` | Step 14A | Final refined candidate assembly for downstream analysis |
+| `final_results/final_result.csv` | Step 14A | Final report combining assembler metrics with the final refined assembly metrics |
+| `final_results/final.merged.provenance.gff3` | Step 12/14A | Contig-level and region-level provenance for the refined assembly |
+| `final_results/coverage_summary.tsv` | Step 12K/14A | Per-contig read-depth QC summary for the final assembly |
+| `final_results/weak_regions.tsv` and `.gff3` | Step 12K/14A | Coverage-warning regions for manual inspection in IGV/JBrowse |
+| `benchmark_logs/` | `--benchmark` | Optional reproducibility metadata, software versions, timing, and manifest files |
 
 ```
 project_directory/
@@ -442,9 +492,9 @@ project_directory/
 │   ├── final_merge.raw.fasta            # Pre-purge combined assembly
 │   └── *.busco/                         # BUSCO results per assembly
 ├── final_results/
-│   ├── final_result.csv                 # Final comparison report
-│   ├── final.merged.fasta               # Refined assembly with internal TACO name
-│   ├── final_assembly.fasta             # Refined assembly (full mode)
+│   ├── final_result.csv                 # Full-mode final comparison report (Step 14A)
+│   ├── final.merged.fasta               # Refined assembly used internally for final QC
+│   ├── final_assembly.fasta             # Publication-facing refined assembly copy
 │   ├── final.merged.provenance.gff3     # GFF3 provenance: full assembler tracing per contig
 │   ├── pool_contig_provenance.tsv       # Pool contig → assembler + original name mapping
 │   ├── quickmerge_validation.tsv        # Quickmerge structural validation decisions
@@ -458,7 +508,7 @@ project_directory/
 │   ├── weak_regions.gff3                # GFF3 coverage warnings: load in IGV to see weak spots
 │   ├── {backbone}.backbone.original.fasta  # Original backbone (for do-no-harm comparison)
 │   ├── refinement_warning.txt           # Quality warnings if refinement degraded backbone
-│   └── assembly_only_result.csv         # Comparison summary (assembly-only)
+│   └── assembly_only_result.csv         # Assembly-only comparison summary (Step 14B)
 ├── telomere_pool/                       # Structured copy of telomere-pool intermediates
 │   ├── protected_telomere_contigs.fasta
 │   ├── t2t_clean.fasta
@@ -500,7 +550,7 @@ TACO/
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
-│   ├── steps.py            # All 15 public step implementations
+│   ├── steps.py            # Step implementations (0-14, including 14A/14B)
 │   ├── utils.py            # Shared utilities and FASTA I/O
 │   ├── telomere_detect.py  # Hybrid telomere detection engine
 │   ├── telomere_pool.py    # Telomere pool classification
@@ -521,15 +571,21 @@ TACO/
 
 **IPA or Peregrine skipped:** These assemblers only support certain platforms. IPA requires PacBio HiFi; Peregrine does not support Nanopore. Use `--platform` to match your data type.
 
+**Raven skipped even after installing `raven-assembler`:** Confirm that the environment where TACO is running is the same environment where Raven was installed. Activate the environment and check `which raven`. With micromamba, use `micromamba activate taco` before running TACO, or make sure `/path/to/env/bin` is on `PATH`. The Bioconda package is `raven-assembler`, but the executable TACO looks for is `raven`.
+
 **Telomere motif appears incorrect:** Do not force `--motif` unless the telomere repeat is biologically known for your species. Use `--taxon` to select the appropriate preset instead. TACO's built-in motif families cover canonical TTAGGG, budding yeast TG1-3, Candida, plant TTTAGGG, and insect TTAGG repeats.
 
 **purge_dups or polishing not running:** These tools must be installed in the conda environment. Use `conda install -c bioconda purge_dups nextpolish2 yak racon medaka` or skip with `--no-purge-dups` / `--no-polish`. For HiFi polishing, NextPolish2 and yak are both required. For Nanopore polishing, Medaka is preferred; if unavailable, Racon is used as fallback.
 
-**`TACO.sh: command not found`:** Add the TACO directory to your PATH or run with the full path.
+**`taco: command not found`:** Activate the TACO conda/micromamba environment and reinstall the package with `pip install -e .` from the repository root. If you prefer the wrapper, run `./run_taco` from the repository directory.
 
-**Missing Python modules:** TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and the `taco/` directory is alongside `TACO.sh`.
+**Missing Python modules:** TACO uses only the Python standard library. If you see import errors, ensure Python >= 3.8 is installed and that you are running the installed `taco` command or the repository-local `./run_taco` wrapper.
 
 **Merqury not working:** Merqury is enabled by default when `merqury.sh` + `meryl` are installed. The reads `.meryl` database is built automatically from input reads. If you have a pre-built database, use `--merqury-db path/to/reads.meryl`. Install with `conda install -c bioconda merqury meryl`. TACO writes organized outputs such as `merqury/canu/canu.qv` and also searches legacy flat prefixes such as `merqury/canu.qv`; if `assembly.merqury.csv` is empty, check the step log for the warning that lists which Merqury files were found. Nanopore and PacBio CLR runs log a warning because QV from non-high-accuracy reads can be underestimated; completeness and relative assembler ranking are still reported but should be interpreted cautiously. Disable with `--no-merqury`.
+
+**Merqury completeness exists but QV is `NA`:** This means Merqury produced a completeness file but no parseable `.qv` file for that assembly. TACO reports `NA` rather than leaving the final report blank. Check the corresponding `merqury/{label}/` directory and step log to confirm whether Merqury wrote a QV table under a non-standard name.
+
+**`-s 14` produced the full report instead of assembly-only output:** This is expected. Step 14A is the default full-mode report. Step 14B runs only with `--assembly-only`, for example `taco ... --assembly-only -s 14`.
 
 ## Citation
 
