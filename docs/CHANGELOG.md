@@ -5,6 +5,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.2] — 2026-04-28
+
+### Final report metric completeness
+
+- **Fixed** final BUSCO report rows.  Step 13 now writes `BUSCO C (count)`
+  and `BUSCO M (count)` for the merged assembly, matching the per-assembler
+  BUSCO rows already present in `assemblies/assembly_info.csv`.
+- **Improved** Merqury QV reporting.  TACO now searches nested Merqury output
+  paths for `.qv` files, reports `NA` instead of a silent blank when Merqury is
+  enabled but no parseable QV file exists, and logs a warning naming the
+  command log and QV candidates when completeness is present but QV is missing.
+- **Improved** final report clarity.  Missing final QC values are now explicit
+  where they reflect a missing upstream metric rather than a CSV formatting
+  gap.
+
+---
+
 ## [1.3.1] — 2026-04-25
 
 ### Merqury QC flow hardening

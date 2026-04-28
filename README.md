@@ -170,7 +170,7 @@ Use `--benchmark` when a run needs publication-ready provenance. It writes extra
 
 ### Resuming And File Organization
 
-When running selected steps with `-s`/`--steps`, TACO checks only the tools needed by those requested steps. For example, `-s 13-14` will not warn about missing assembler binaries from Steps 1-9. Before each resumed step, TACO checks for expected upstream files and prints a specific warning naming the missing file type and the earlier step that should have produced it. Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs; Step 12 and later check for the Step 10/11 outputs they need. For common cleanup outputs, TACO can also restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step. TACO v1.3.1 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+When running selected steps with `-s`/`--steps`, TACO checks only the tools needed by those requested steps. For example, `-s 13-14` will not warn about missing assembler binaries from Steps 1-9. Before each resumed step, TACO checks for expected upstream files and prints a specific warning naming the missing file type and the earlier step that should have produced it. Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs; Step 12 and later check for the Step 10/11 outputs they need. For common cleanup outputs, TACO can also restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step. TACO v1.3.2 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -252,7 +252,7 @@ Steps 0-10, 14: runs all assemblers (1-9), normalizes and QC-compares all assemb
 
 ## Telomere Detection
 
-TACO v1.3.1 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.2 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -496,7 +496,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.1)
+│   ├── __init__.py         # Package metadata (v1.3.2)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking

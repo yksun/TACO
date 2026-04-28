@@ -5,5 +5,5 @@ A telomere-aware all-in-one multi-assembler comparison and refinement
 pipeline for genome assembly benchmarking, decision-making, and
 chromosome-end improvement.
 """
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 __author__ = "Yukun Sun"
