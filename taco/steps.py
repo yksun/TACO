@@ -16,6 +16,7 @@ import json
 import math
 import tempfile
 import time
+import signal
 from pathlib import Path
 from collections import defaultdict
 
@@ -3644,28 +3645,133 @@ def _write_candidates_tsv(candidates, path):
             ])
 
 
-def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir):
+def _step12_busco_timeout():
+    """Return BUSCO trial timeout in seconds; 0 disables the timeout."""
+    raw = os.environ.get(
+        "STEP12_BUSCO_TRIAL_TIMEOUT",
+        os.environ.get("STEP13_BUSCO_TRIAL_TIMEOUT", "43200"))
+    try:
+        timeout = int(float(raw))
+    except (TypeError, ValueError):
+        timeout = 43200
+    return max(0, timeout)
+
+
+def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir,
+                     runner=None):
     """Run BUSCO on a trial assembly and return parsed metrics dict or None."""
     busco_bin = shutil.which("busco")
     if not busco_bin:
+        if runner:
+            runner.log_warn("BUSCO trial skipped: 'busco' binary not found")
         return None
 
     trial_out = os.path.join(out_dir, trial_label)
     if os.path.isdir(trial_out):
         shutil.rmtree(trial_out)
 
-    # Try --offline first, fall back to normal mode if lineage not cached
-    cmd = (f"busco -o {trial_label} -i {trial_fa} -l {lineage} "
-           f"-m genome -c {threads} --out_path {out_dir} --offline")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    timeout = _step12_busco_timeout()
+    timeout_arg = timeout if timeout > 0 else None
+    stdout_log = os.path.join(out_dir, f"{trial_label}.busco.stdout.log")
+    stderr_log = os.path.join(out_dir, f"{trial_label}.busco.stderr.log")
+    if runner:
+        timeout_msg = f"{timeout}s" if timeout_arg else "disabled"
+        runner.log_info(
+            f"BUSCO trial {trial_label}: input={trial_fa}, "
+            f"lineage={lineage}, threads={threads}, timeout={timeout_msg}")
+        runner.log_info(
+            f"BUSCO trial {trial_label}: logs={stdout_log}, {stderr_log}")
+
+    def run_attempt(args, mode_label):
+        if runner:
+            display = " ".join(shlex.quote(str(a)) for a in args)
+            runner.log(f"Running BUSCO trial {trial_label} ({mode_label})")
+            runner.log(f"$ {display}")
+        start = time.time()
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            stdout, stderr = proc.communicate(timeout=timeout_arg)
+        except OSError as exc:
+            elapsed = time.time() - start
+            stdout, stderr = "", str(exc)
+            _write_text_log(stdout_log, stdout)
+            _write_text_log(stderr_log, stderr)
+            if runner:
+                runner.log_warn(
+                    f"BUSCO trial {trial_label} ({mode_label}) failed to start "
+                    f"after {elapsed:.1f}s: {exc}")
+                _log_file_tail(
+                    runner, stderr_log,
+                    f"BUSCO trial {trial_label} stderr tail")
+            return None
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            if proc is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    stdout, stderr = proc.communicate(timeout=10)
+                except Exception:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    stdout, stderr = proc.communicate()
+            else:
+                stdout, stderr = "", ""
+            _write_text_log(stdout_log, stdout)
+            _write_text_log(stderr_log, stderr)
+            if runner:
+                runner.log_warn(
+                    f"BUSCO trial {trial_label} ({mode_label}) timed out "
+                    f"after {elapsed:.1f}s")
+                _log_file_tail(
+                    runner, stderr_log,
+                    f"BUSCO trial {trial_label} stderr tail")
+            return None
+
+        elapsed = time.time() - start
+        result = subprocess.CompletedProcess(
+            args, proc.returncode, stdout, stderr)
+        _write_text_log(stdout_log, stdout)
+        _write_text_log(stderr_log, stderr)
+        if runner:
+            runner.log(
+                f"BUSCO trial {trial_label} ({mode_label}) exit="
+                f"{result.returncode} elapsed={elapsed:.1f}s")
+            if result.returncode != 0:
+                _log_file_tail(
+                    runner, stderr_log,
+                    f"BUSCO trial {trial_label} stderr tail")
+        return result
+
+    # Try --offline first, fall back to normal mode if lineage not cached.
+    cmd = [
+        "busco", "-o", trial_label, "-i", trial_fa, "-l", lineage,
+        "-m", "genome", "-c", str(threads), "--out_path", out_dir,
+        "--offline",
+    ]
+    result = run_attempt(cmd, "offline")
+    if result is None:
+        return None
 
     if result.returncode != 0:
         # Retry without --offline (lineage may need download)
         if os.path.isdir(trial_out):
             shutil.rmtree(trial_out)
-        cmd = (f"busco -o {trial_label} -i {trial_fa} -l {lineage} "
-               f"-m genome -c {threads} --out_path {out_dir}")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = [
+            "busco", "-o", trial_label, "-i", trial_fa, "-l", lineage,
+            "-m", "genome", "-c", str(threads), "--out_path", out_dir,
+        ]
+        result = run_attempt(cmd, "online")
+        if result is None:
+            return None
 
     # Parse BUSCO summary
     for root_dir in [trial_out, os.path.join(out_dir, f"run_{trial_label}")]:
@@ -4873,9 +4979,20 @@ def step_12_refine(runner):
         os.environ.get("STEP13_MAX_BUSCO_D_RISE", default_d_rise)))
 
     lineage = runner.busco_lineage
-    busco_available = shutil.which("busco") is not None and lineage is not None
+    skip_busco_trial = os.environ.get("STEP12_SKIP_BUSCO_TRIAL", "0") == "1"
+    busco_available = (
+        shutil.which("busco") is not None
+        and lineage is not None
+        and not skip_busco_trial
+    )
     if lineage is None:
-        runner.log_warn("No BUSCO lineage set; rescue validation will use structural checks only.")
+        runner.log_warn(
+            "No BUSCO lineage set; rescue validation will use structural "
+            "checks only.")
+    if skip_busco_trial:
+        runner.log_warn(
+            "STEP12_SKIP_BUSCO_TRIAL=1; rescue validation will use "
+            "structural checks only.")
 
     trial_dir = "assemblies/rescue_trials"
     os.makedirs(trial_dir, exist_ok=True)
@@ -4890,8 +5007,9 @@ def step_12_refine(runner):
                     f"busco_available={busco_available}")
     if busco_available and candidates:
         runner.log_info("Computing baseline BUSCO for trial validation")
-        baseline_busco = _run_busco_trial(working_backbone_fa, lineage,
-                                           runner.threads, "baseline", trial_dir)
+        baseline_busco = _run_busco_trial(
+            working_backbone_fa, lineage, runner.threads, "baseline",
+            trial_dir, runner=runner)
         if baseline_busco:
             runner.log(f"Baseline BUSCO (backbone): C={baseline_busco['C']:.1f}% "
                        f"D={baseline_busco.get('D', 0):.1f}% "
@@ -4959,8 +5077,9 @@ def step_12_refine(runner):
         c_delta = d_delta = m_delta = 0.0
         if busco_available and baseline_busco:
             trial_label = f"trial_{cand['candidate_rank']}"
-            trial_busco = _run_busco_trial(trial_fa, lineage,
-                                            runner.threads, trial_label, trial_dir)
+            trial_busco = _run_busco_trial(
+                trial_fa, lineage, runner.threads, trial_label, trial_dir,
+                runner=runner)
 
         accepted = True
         reason = "accepted"
@@ -5270,7 +5389,7 @@ def step_12_refine(runner):
                     _write_fasta(trial_recs, trial_fa)
                     trial_busco = _run_busco_trial(
                         trial_fa, lineage, runner.threads,
-                        f"novel_{pname}", trial_dir)
+                        f"novel_{pname}", trial_dir, runner=runner)
                     if trial_busco and baseline_busco:
                         d_delta = trial_busco.get("D", 0) - \
                                   baseline_busco.get("D", 0)

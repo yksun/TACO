@@ -369,7 +369,7 @@ When validating rescue candidates via BUSCO trial, the maximum acceptable C% dro
 
 A D-rise (duplicated BUSCO increase) check catches cases where a rescue introduces redundant copies of single-copy orthologs — a sign of retained haplotigs or mis-joined contigs. All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP`, `STEP12_MAX_BUSCO_M_RISE`, and `STEP12_MAX_BUSCO_D_RISE` environment variables. Legacy `STEP13_*` names are still accepted for compatibility with older run scripts.
 
-Additional environment variables for fine-tuning Step 12: `STEP12_MAX_ACCEPTED`, `STEP12_MIN_BP_RATIO`, `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `SELFDEDUP_ENABLE` plus `SELFDEDUP_COV` / `SELFDEDUP_ID` (optional self-dedup), `RESCUE_MIN_IDENT`, `RESCUE_MIN_ALN_BP`, `RESCUE_MIN_COV_BB`, `RESCUE_MIN_COV_DONOR`, `RESCUE_MIN_EXT`, `NOVEL_DUP_COV`, `NOVEL_DUP_ID`, `NOVEL_UPGRADE_TCOV`, and `NOVEL_MAX_D_RISE`.
+Additional environment variables for fine-tuning Step 12: `STEP12_MAX_ACCEPTED`, `STEP12_MIN_BP_RATIO`, `STEP12_BUSCO_TRIAL_TIMEOUT` (seconds per BUSCO trial attempt, default 43200; set 0 to disable), `STEP12_SKIP_BUSCO_TRIAL` (set 1 to use structural rescue checks only), `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `SELFDEDUP_ENABLE` plus `SELFDEDUP_COV` / `SELFDEDUP_ID` (optional self-dedup), `RESCUE_MIN_IDENT`, `RESCUE_MIN_ALN_BP`, `RESCUE_MIN_COV_BB`, `RESCUE_MIN_COV_DONOR`, `RESCUE_MIN_EXT`, `NOVEL_DUP_COV`, `NOVEL_DUP_ID`, `NOVEL_UPGRADE_TCOV`, and `NOVEL_MAX_D_RISE`.
 
 ### Taxon-Specific Rescue Limits (Step 12F)
 
@@ -425,6 +425,8 @@ Backbone contigs are preserved by default to maintain BUSCO completeness — pur
 ### BUSCO Trial Validation
 
 TACO validates each telomere rescue candidate by building a trial assembly where one backbone contig is replaced by one donor contig, then running BUSCO with the same lineage selected by the user. Rejection is triggered by three independent BUSCO metrics: C% drop (completeness loss), M% rise (missing gene increase), and D% rise (duplicated BUSCO increase, catching retained haplotigs). Rejection thresholds are taxon-aware: fungi use strict thresholds (2% C-drop, 2% D-rise), plants use relaxed thresholds (4% C-drop, 6% D-rise, accounting for polyploidy), and vertebrates use moderate thresholds (3% C-drop, 4% D-rise). An additional safety check rejects `replace_single_with_better` candidates if telomere evidence weakens at either end after replacement (suspicious size drops >30% also trigger rejection). This greedy, sequential approach ensures that each accepted rescue improves or maintains assembly quality. The trial summary TSV includes `replacement_class` and `D` (duplicated %) columns for full traceability.
+
+Trial BUSCO stdout/stderr logs are written to `assemblies/rescue_trials/*.busco.*.log`. Each BUSCO attempt has a timeout controlled by `STEP12_BUSCO_TRIAL_TIMEOUT` (default 43200 seconds; set to 0 to disable). If BUSCO is unavailable or wedged on a cluster, set `STEP12_SKIP_BUSCO_TRIAL=1` to resume Step 12 with structural rescue checks only.
 
 ### Post-Refinement Stack
 

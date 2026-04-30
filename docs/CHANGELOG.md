@@ -261,6 +261,8 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 | `NOVEL_MAX_D_RISE` | taxon default | Max BUSCO D rise allowed for novel additions |
 | `STEP12_MAX_ACCEPTED` | taxon default | Max accepted rescue candidates in refinement |
 | `STEP12_MIN_BP_RATIO` | 0.90 | Min donor/backbone bp ratio for replacement candidates |
+| `STEP12_BUSCO_TRIAL_TIMEOUT` | 43200 | Timeout in seconds for each Step 12 BUSCO trial attempt; 0 disables |
+| `STEP12_SKIP_BUSCO_TRIAL` | 0 | Set to 1 to use structural rescue validation only |
 | `STEP12_MAX_BUSCO_C_DROP` | taxon default | Max BUSCO C% drop allowed during trial validation |
 | `STEP12_MAX_BUSCO_M_RISE` | taxon default | Max BUSCO M% rise allowed during trial validation |
 | `STEP12_MAX_BUSCO_D_RISE` | taxon default | Max BUSCO D% rise allowed during trial validation |
