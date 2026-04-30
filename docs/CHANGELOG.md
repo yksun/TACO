@@ -5,6 +5,62 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.3] — 2026-04-30
+
+### Coverage-guided partial T2T replacement and upstream-aligned purge_dups
+
+Investigation of a fungal HiFi run (Step 12, 2026-04-30) where the pool
+contained three "strict T2T" contigs (`contig_118` at 207 kb covering ~20 %
+of a 1.04 Mb backbone contig, plus `contig_4819` and `contig_5514` at ~2 kb
+each — telomere-repeat fragments, not whole chromosomes) revealed two
+behavioural gaps that 1.3.3 fixes.
+
+- **Behavioural fix.** The strict-T2T fragments correctly cannot
+  replace Mb-scale backbone contigs.  However, a substantial partial T2T
+  hit (e.g. 207 kb at 99.8 % identity covering 20 % of a 1.04 Mb backbone)
+  used to be silently rejected because target coverage fell below the 50 %
+  full-replacement floor.  TACO now drops into a **read-coverage
+  diagnostic** for these cases instead of rejecting outright.  If the
+  unmatched backbone region has < 30 % of the matched-region coverage
+  (configurable via `CHIMERIC_COV_RATIO`), the backbone is treated as
+  chimeric/duplicated and replaced by the T2T contig; otherwise the
+  backbone is kept.  Tiny (≤ taxon `PARTIAL_T2T_MIN_BP`) telomere-repeat
+  fragments still cannot replace large backbone contigs.
+- **Taxon-aware partial-T2T thresholds.** Coverage-guided partial
+  replacement now has explicit per-taxon defaults (fungi/insect: tcov ≥
+  15 %, len ≥ 50 kb, qcov ≥ 80 %, identity ≥ 90 %; plant/vertebrate/
+  animal: tcov ≥ 50 %, len ≥ 200 kb, qcov ≥ 85 %, identity ≥ 92 %; other:
+  tcov ≥ 30 %, len ≥ 100 kb).  All four thresholds are independently
+  overridable via `PARTIAL_T2T_MIN_TCOV`, `PARTIAL_T2T_MIN_BP`,
+  `PARTIAL_T2T_MIN_QCOV`, `PARTIAL_T2T_MIN_IDENT`.
+- **purge_dups safety harmonised with genome-size budget.** The bp-drop
+  safety check now accepts large drops when they move an over-large
+  assembly closer to the expected genome size *and* stay above the
+  expected-size floor (`PURGE_DUPS_MIN_EXPECTED_RATIO`).  The Step 12L
+  "do no harm" comparison uses the same expected-size logic, so the
+  shrink warning no longer fires when purging usefully right-sizes an
+  assembly.
+- **Fungal purge_dups defaults aligned with upstream.** The fungal
+  preset now uses `-2 -f 0.80 -l 10000 -E 15000`, matching the
+  upstream binary defaults and the recommended example pipeline in
+  `dfguan/purge_dups`.  This is safer than the previous short-match
+  fungal tuning (`-l 5000 -E 5000`) when the selected backbone is
+  already close to the expected genome size.  `get_seqs -e` (end-only
+  duplication removal) remains the default, matching the upstream
+  recommendation.
+- **Diagnostic logging.** Tier 2 backbone contigs without a full T2T
+  upgrade now report the best partial T2T hit and flag potential
+  chimeric backbones explicitly in the Step 12 log.
+
+### Final report metric completeness (carried forward)
+
+- Final BUSCO report rows still include `BUSCO C (count)` and
+  `BUSCO M (count)` for the merged assembly.
+- Merqury QV reporting still searches nested Merqury output paths and
+  reports `NA` (rather than blank) when QV is missing.
+
+---
+
 ## [1.3.2] — 2026-04-28
 
 ### Final report metric completeness
@@ -262,6 +318,10 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 | `NOVEL_DUP_ID` | 0.90 | Min identity for duplicate detection |
 | `NOVEL_UPGRADE_TCOV` | 0.80 | Min backbone coverage for T2T upgrade |
 | `NOVEL_MAX_D_RISE` | taxon default | Max BUSCO D rise allowed for novel additions |
+| `PARTIAL_T2T_MIN_TCOV` | taxon default | Min backbone coverage for coverage-guided partial T2T replacement |
+| `PARTIAL_T2T_MIN_BP` | taxon default | Min T2T contig length for partial replacement testing |
+| `PARTIAL_T2T_MIN_QCOV` | taxon default | Min T2T query coverage for partial replacement testing |
+| `PARTIAL_T2T_MIN_IDENT` | taxon default | Min identity for partial replacement testing |
 | `STEP12_MAX_ACCEPTED` | taxon default | Max accepted rescue candidates in refinement |
 | `STEP12_MIN_BP_RATIO` | 0.90 | Min donor/backbone bp ratio for replacement candidates |
 | `STEP12_BUSCO_TRIAL_TIMEOUT` | 43200 | Timeout in seconds for each Step 12 BUSCO trial attempt; 0 disables |
@@ -368,13 +428,20 @@ is an optional override.
   removed backbone contigs with unique BUSCO genes.  purge_dups at 12H
   handles haplotig removal more safely.  Re-enable with `SELFDEDUP_ENABLE=1`.
 - **Improved** purge_dups taxon-aware strategy: fungi/haploid genomes now use
-  two-round purging (`-2`) with shorter fungal thresholds; vertebrate, animal,
-  and insect genomes use two-round purging for heterozygous duplicate cleanup.
+  two-round purging (`-2`) with upstream-default chaining lengths; vertebrate,
+  animal, and insect genomes use two-round purging for heterozygous duplicate cleanup.
   Plants use conservative single-round settings to preserve homeologs.  TACO
   runs `get_seqs -e` by default, treats an empty `dups.bed` as a valid
   no-duplicates result, and rejects likely over-purged output before replacing
-  the assembly.  Coverage cutoffs are logged for debugging.  Override with
+  the assembly.  If the purged assembly moves an overlarge input closer to the
+  expected genome size without dropping below the floor, the size drop is
+  accepted.  Coverage cutoffs are logged for debugging.  Override with
   `PURGE_DUPS_CALCUTS` env var.
+- **Improved** partial strict-T2T handling: substantial taxon-aware partial
+  T2T hits now trigger a read-coverage diagnostic on the unmatched backbone
+  sequence. Low uncovered coverage promotes the T2T contig to replace a
+  duplicated/chimeric backbone contig; normal or inconclusive coverage keeps
+  the backbone to preserve BUSCO content.
 - **Fixed** NextPolish2 v0.2.2 invocation: requires sorted BAM as first
   argument (`nextPolish2 -t N reads.sorted.bam genome.fa k21.yak k31.yak`).
   TACO now maps HiFi reads with `minimap2 -ax map-hifi`, sorts with

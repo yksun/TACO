@@ -194,7 +194,7 @@ When running selected steps with `-s`/`--steps`, TACO checks only the tools need
 
 Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs. Step 12 and later check for the Step 10/11 outputs they need. Step 13 runs only final QC on the refined assembly. Step 14 does not rerun final QC; it builds the report and organizes outputs. In full mode, `-s 14` always runs 14A. In assembly-only mode, `--assembly-only -s 14` runs 14B.
 
-For common cleanup outputs, TACO can restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step. TACO v1.3.2 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+For common cleanup outputs, TACO can restore active inputs from `final_results/` or `telomere_pool/` back into the working locations needed by a resumed step. TACO v1.3.3 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -244,7 +244,7 @@ Incompatible assemblers are automatically skipped with a warning.
 | **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
 | **Backbone scoring** | S×1000 - D×600 + T2T×350 | S×1000 - D×300 + T2T×200 | S×1000 - D×500 + T2T×200 | S×1000 - D×500 + T2T×300 |
 | **BUSCO trial C-drop** | 2% (strict) | 4% (relaxed) | 3% (moderate) | 2.5% (default) |
-| **purge_dups mode** | two-round, fungal-short defaults | conservative single-round + polyploid warning | two-round | insect: two-round; other: conservative single-round |
+| **purge_dups mode** | two-round, upstream-default chaining | conservative single-round + polyploid warning | two-round | insect: two-round; other: conservative single-round |
 | **Polishing (HiFi)** | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) | NextPolish2 (yak k-mer based) |
 | **Polishing (ONT)** | Medaka → Racon | Medaka → Racon | Medaka → Racon | Medaka → Racon |
 | **Polishing (CLR)** | Racon | Racon | Racon | Racon |
@@ -289,7 +289,7 @@ Steps 0-10, 14: runs all assemblers (1-9), normalizes and QC-compares all assemb
 
 ## Telomere Detection
 
-TACO v1.3.2 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.3 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -369,7 +369,7 @@ When validating rescue candidates via BUSCO trial, the maximum acceptable C% dro
 
 A D-rise (duplicated BUSCO increase) check catches cases where a rescue introduces redundant copies of single-copy orthologs — a sign of retained haplotigs or mis-joined contigs. All thresholds can be overridden via `STEP12_MAX_BUSCO_C_DROP`, `STEP12_MAX_BUSCO_M_RISE`, and `STEP12_MAX_BUSCO_D_RISE` environment variables. Legacy `STEP13_*` names are still accepted for compatibility with older run scripts.
 
-Additional environment variables for fine-tuning Step 12: `STEP12_MAX_ACCEPTED`, `STEP12_MIN_BP_RATIO`, `STEP12_BUSCO_TRIAL_TIMEOUT` (seconds per BUSCO trial attempt, default 43200; set 0 to disable), `STEP12_BUSCO_ALLOW_DOWNLOAD` (default 0; set 1 to permit online BUSCO lineage fallback), `STEP12_SKIP_BUSCO_TRIAL` (set 1 to use structural rescue checks only), `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `SELFDEDUP_ENABLE` plus `SELFDEDUP_COV` / `SELFDEDUP_ID` (optional self-dedup), `RESCUE_MIN_IDENT`, `RESCUE_MIN_ALN_BP`, `RESCUE_MIN_COV_BB`, `RESCUE_MIN_COV_DONOR`, `RESCUE_MIN_EXT`, `NOVEL_DUP_COV`, `NOVEL_DUP_ID`, `NOVEL_UPGRADE_TCOV`, and `NOVEL_MAX_D_RISE`.
+Additional environment variables for fine-tuning Step 12: `STEP12_MAX_ACCEPTED`, `STEP12_MIN_BP_RATIO`, `STEP12_BUSCO_TRIAL_TIMEOUT` (seconds per BUSCO trial attempt, default 43200; set 0 to disable), `STEP12_BUSCO_ALLOW_DOWNLOAD` (default 0; set 1 to permit online BUSCO lineage fallback), `STEP12_SKIP_BUSCO_TRIAL` (set 1 to use structural rescue checks only), `CHIMERA_MIN_CROSS_COV` (minimum cross-assembly coverage for chimera mapping check, default 0.60), `SELFDEDUP_ENABLE` plus `SELFDEDUP_COV` / `SELFDEDUP_ID` (optional self-dedup), `RESCUE_MIN_IDENT`, `RESCUE_MIN_ALN_BP`, `RESCUE_MIN_COV_BB`, `RESCUE_MIN_COV_DONOR`, `RESCUE_MIN_EXT`, `NOVEL_DUP_COV`, `NOVEL_DUP_ID`, `NOVEL_UPGRADE_TCOV`, `NOVEL_MAX_D_RISE`, and `PARTIAL_T2T_MIN_TCOV` / `PARTIAL_T2T_MIN_BP` / `PARTIAL_T2T_MIN_QCOV` / `PARTIAL_T2T_MIN_IDENT` for coverage-guided partial T2T replacement.
 
 ### Taxon-Specific Rescue Limits (Step 12F)
 
@@ -389,7 +389,7 @@ Thresholds: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID` (default 0.90), `NOVE
 
 ### Taxon-Specific purge_dups Behaviour (Step 12H)
 
-purge_dups strategy is taxon-aware. Fungi use two-round purging (`-2`) with shorter chaining thresholds for compact haploid genomes. Vertebrate, animal, and insect genomes use two-round purging for high-heterozygosity haplotig/overlap cleanup. Plant genomes use conservative single-round purging with stricter sequence-level evidence to avoid collapsing homeologous sequences in polyploid species — use `--no-purge-dups` or `PURGE_DUPS_MODE=skip` if this is still too aggressive. TACO runs `get_seqs -e` by default, so only end duplications are removed, and rejects purged output if the taxon-specific size drop or expected genome-size floor suggests over-purging. Coverage cutoffs from `calcuts` are logged for debugging; override with `PURGE_DUPS_CALCUTS`. Advanced overrides: `PURGE_DUPS_MODE` (`auto`, `single`, `two-round`, `skip`), `PURGE_DUPS_EXTRA_OPTS`, `PURGE_DUPS_GET_SEQS_OPTS`, `PURGE_DUPS_MAX_BP_DROP`, and `PURGE_DUPS_MIN_EXPECTED_RATIO`.
+purge_dups strategy is taxon-aware. Fungi use two-round purging (`-2`) with upstream-default chaining lengths, which is safer than short-match fungal tuning when the selected backbone is already close to the expected genome size. Vertebrate, animal, and insect genomes use two-round purging for high-heterozygosity haplotig/overlap cleanup. Plant genomes use conservative single-round purging with stricter sequence-level evidence to avoid collapsing homeologous sequences in polyploid species — use `--no-purge-dups` or `PURGE_DUPS_MODE=skip` if this is still too aggressive. TACO runs `get_seqs -e` by default, so only end duplications are removed, and rejects purged output if the taxon-specific size drop or expected genome-size floor suggests over-purging. If purging makes an overlarge assembly substantially closer to the expected genome size without falling below the floor, TACO accepts that drop instead of preserving duplicated sequence. Coverage cutoffs from `calcuts` are logged for debugging; override with `PURGE_DUPS_CALCUTS`. Advanced overrides: `PURGE_DUPS_MODE` (`auto`, `single`, `two-round`, `skip`), `PURGE_DUPS_EXTRA_OPTS`, `PURGE_DUPS_GET_SEQS_OPTS`, `PURGE_DUPS_MAX_BP_DROP`, and `PURGE_DUPS_MIN_EXPECTED_RATIO`.
 
 ### N50-only Mode
 
@@ -430,7 +430,9 @@ Trial BUSCO stdout/stderr logs are written to `assemblies/rescue_trials/*.busco.
 
 ### Post-Refinement Stack
 
-After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups strategy is taxon-aware and guarded against over-purging: fungi use two-round purging with shorter fungal thresholds; vertebrate, animal, and insect genomes use two-round purging; plants use conservative single-round purging to preserve homeologs. TACO keeps the unpurged assembly if `dups.bed` is empty or if the purged output fails the taxon-specific size safety check. Coverage cutoffs from `calcuts` are logged; override with `PURGE_DUPS_CALCUTS` if automatic thresholds are incorrect. This is followed by automatic polishing selected from `--platform`: HiFi assemblies use NextPolish2 (maps HiFi reads to assembly with minimap2, sorts BAM with samtools, builds yak k-mer databases, then runs k-mer-based correction), Nanopore uses Medaka (falls back to Racon), and CLR uses Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish`.
+After the rescued/combined assembly is produced, TACO runs purge_dups by default to remove leftover haplotigs, overlapping fragments, and residual duplicates. purge_dups strategy is taxon-aware and guarded against over-purging: fungi use two-round purging with upstream-default chaining lengths; vertebrate, animal, and insect genomes use two-round purging; plants use conservative single-round purging to preserve homeologs. TACO keeps the unpurged assembly if `dups.bed` is empty or if the purged output fails the taxon-specific size safety check. Coverage cutoffs from `calcuts` are logged; override with `PURGE_DUPS_CALCUTS` if automatic thresholds are incorrect. This is followed by automatic polishing selected from `--platform`: HiFi assemblies use NextPolish2 (maps HiFi reads to assembly with minimap2, sorts BAM with samtools, builds yak k-mer databases, then runs k-mer-based correction), Nanopore uses Medaka (falls back to Racon), and CLR uses Racon. Both steps can be skipped with `--no-purge-dups` and `--no-polish`.
+
+Strict T2T pool contigs only replace backbone contigs directly when they cover most of the target backbone contig. For smaller but substantial partial T2T hits, TACO runs a read-coverage diagnostic on the unmatched backbone sequence. If the unmatched region has low coverage, the backbone is treated as duplicated/chimeric and replaced by the T2T contig; if coverage is normal or inconclusive, TACO keeps the backbone to preserve BUSCO gene content. Tiny telomere-repeat fragments are rejected as partial replacement donors.
 
 ### Diploid and Polyploid Note
 
@@ -548,7 +550,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.2)
+│   ├── __init__.py         # Package metadata (v1.3.3)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
