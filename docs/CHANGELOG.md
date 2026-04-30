@@ -216,9 +216,12 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 - **Disabled** backbone self-dedup by default.  purge_dups handles haplotig
   removal using read-coverage evidence.  Re-enable with `SELFDEDUP_ENABLE=1`.
 - **Improved** purge_dups taxon strategy: fungi now use two-round purging
-  (`-2`) for aggressive duplicate detection in haploid genomes.  Plants use
-  conservative single-round.  Coverage cutoffs logged.  Override with
-  `PURGE_DUPS_CALCUTS`.
+  (`-2`) for aggressive duplicate detection in haploid genomes.  Vertebrate,
+  animal, and insect presets use two-round purging for heterozygous
+  haplotig/overlap cleanup.  Plants use conservative single-round settings.
+  TACO keeps the unpurged assembly when `dups.bed` is empty or when the
+  purged result fails taxon-aware size safety checks.  Coverage cutoffs are
+  logged.  Override with `PURGE_DUPS_CALCUTS`.
 - **Fixed** NextPolish2 v0.2.2: requires sorted BAM as first argument.
   TACO now maps reads with minimap2, sorts with samtools, passes BAM correctly.
 - **Fixed** final BUSCO caching: always clears stale results before rerun
@@ -262,12 +265,18 @@ scoring, BUSCO lineage defaults, Merqury integration, and assembly safety.
 | `STEP12_MAX_ACCEPTED` | taxon default | Max accepted rescue candidates in refinement |
 | `STEP12_MIN_BP_RATIO` | 0.90 | Min donor/backbone bp ratio for replacement candidates |
 | `STEP12_BUSCO_TRIAL_TIMEOUT` | 43200 | Timeout in seconds for each Step 12 BUSCO trial attempt; 0 disables |
+| `STEP12_BUSCO_ALLOW_DOWNLOAD` | 0 | Set to 1 to permit online BUSCO lineage fallback during Step 12/final BUSCO |
 | `STEP12_SKIP_BUSCO_TRIAL` | 0 | Set to 1 to use structural rescue validation only |
 | `STEP12_MAX_BUSCO_C_DROP` | taxon default | Max BUSCO C% drop allowed during trial validation |
 | `STEP12_MAX_BUSCO_M_RISE` | taxon default | Max BUSCO M% rise allowed during trial validation |
 | `STEP12_MAX_BUSCO_D_RISE` | taxon default | Max BUSCO D% rise allowed during trial validation |
 | `CHIMERIC_COV_RATIO` | 0.30 | If uncovered region coverage < this × covered → chimeric |
 | `PURGE_DUPS_CALCUTS` | auto | Override calcuts coverage thresholds |
+| `PURGE_DUPS_MODE` | auto | Override purge_dups profile: auto, single, two-round, or skip |
+| `PURGE_DUPS_EXTRA_OPTS` | empty | Extra options appended to the purge_dups command |
+| `PURGE_DUPS_GET_SEQS_OPTS` | -e | Options for get_seqs; default removes only end duplications |
+| `PURGE_DUPS_MAX_BP_DROP` | taxon default | Reject purged output if bp loss exceeds this fraction |
+| `PURGE_DUPS_MIN_EXPECTED_RATIO` | taxon default | Reject purged output below this fraction of expected genome size |
 | `SELFDEDUP_ENABLE` | 0 | Set to 1 to re-enable backbone self-dedup |
 | `COV_QC_WINDOW` | 5000 | Sliding window size (bp) for coverage QC |
 | `COV_QC_LOW` | 5 | Reads below this depth counted as low-coverage |
@@ -359,10 +368,12 @@ is an optional override.
   removed backbone contigs with unique BUSCO genes.  purge_dups at 12H
   handles haplotig removal more safely.  Re-enable with `SELFDEDUP_ENABLE=1`.
 - **Improved** purge_dups taxon-aware strategy: fungi/haploid genomes now use
-  two-round purging (`-2`) for more aggressive duplicate detection since
-  coverage differences between primary and duplicate are subtle in haploid
-  assemblies.  Plants use conservative single-round to preserve homeologs.
-  Coverage cutoffs are logged for debugging.  Override with
+  two-round purging (`-2`) with shorter fungal thresholds; vertebrate, animal,
+  and insect genomes use two-round purging for heterozygous duplicate cleanup.
+  Plants use conservative single-round settings to preserve homeologs.  TACO
+  runs `get_seqs -e` by default, treats an empty `dups.bed` as a valid
+  no-duplicates result, and rejects likely over-purged output before replacing
+  the assembly.  Coverage cutoffs are logged for debugging.  Override with
   `PURGE_DUPS_CALCUTS` env var.
 - **Fixed** NextPolish2 v0.2.2 invocation: requires sorted BAM as first
   argument (`nextPolish2 -t N reads.sorted.bam genome.fa k21.yak k31.yak`).

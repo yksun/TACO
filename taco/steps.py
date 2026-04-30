@@ -3657,6 +3657,11 @@ def _step12_busco_timeout():
     return max(0, timeout)
 
 
+def _step12_busco_allow_download():
+    """Return True when BUSCO trials may fall back to online lineage lookup."""
+    return os.environ.get("STEP12_BUSCO_ALLOW_DOWNLOAD", "0") == "1"
+
+
 def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir,
                      runner=None):
     """Run BUSCO on a trial assembly and return parsed metrics dict or None."""
@@ -3762,6 +3767,14 @@ def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir,
         return None
 
     if result.returncode != 0:
+        if not _step12_busco_allow_download():
+            if runner:
+                runner.log_warn(
+                    f"BUSCO trial {trial_label} offline attempt failed; "
+                    "skipping online retry. Set STEP12_BUSCO_ALLOW_DOWNLOAD=1 "
+                    "to permit BUSCO lineage downloads/checks.")
+            return None
+
         # Retry without --offline (lineage may need download)
         if os.path.isdir(trial_out):
             shutil.rmtree(trial_out)
@@ -3908,6 +3921,128 @@ def _check_backbone_coverage(backbone_name, backbone_seq, t2t_start, t2t_end,
     }
 
 
+def _purge_dups_profile(taxon):
+    """Return conservative, taxon-aware purge_dups defaults."""
+    profiles = {
+        "fungal": {
+            "mode": "two-round",
+            "opts": ["-2", "-f", "0.85", "-l", "5000", "-E", "5000"],
+            "max_bp_drop": 0.25,
+            "min_expected_ratio": 0.85,
+            "note": "haploid-aggressive, shorter fungal duplications",
+        },
+        "plant": {
+            "mode": "single-round",
+            "opts": ["-f", "0.95", "-l", "30000", "-E", "30000"],
+            "max_bp_drop": 0.30,
+            "min_expected_ratio": 0.75,
+            "note": "polyploid-conservative, protects homeologs",
+        },
+        "vertebrate": {
+            "mode": "two-round",
+            "opts": ["-2", "-f", "0.80", "-l", "10000", "-E", "15000"],
+            "max_bp_drop": 0.40,
+            "min_expected_ratio": 0.75,
+            "note": "diploid-aware, VGP-style cleanup",
+        },
+        "animal": {
+            "mode": "two-round",
+            "opts": ["-2", "-f", "0.80", "-l", "10000", "-E", "15000"],
+            "max_bp_drop": 0.40,
+            "min_expected_ratio": 0.75,
+            "note": "diploid-aware cleanup",
+        },
+        "insect": {
+            "mode": "two-round",
+            "opts": ["-2", "-f", "0.80", "-l", "8000", "-E", "10000"],
+            "max_bp_drop": 0.35,
+            "min_expected_ratio": 0.75,
+            "note": "high-heterozygosity-aware cleanup",
+        },
+    }
+    return profiles.get(taxon, {
+        "mode": "single-round",
+        "opts": ["-f", "0.90", "-l", "10000", "-E", "15000"],
+        "max_bp_drop": 0.30,
+        "min_expected_ratio": 0.75,
+        "note": "balanced conservative cleanup",
+    })
+
+
+def _apply_purge_dups_mode(profile, mode_override):
+    """Apply PURGE_DUPS_MODE override to a purge_dups profile."""
+    mode = (mode_override or "auto").strip().lower()
+    opts = [o for o in profile["opts"] if o != "-2"]
+    if mode in ("two", "two-round", "2", "aggressive"):
+        opts.insert(0, "-2")
+        profile["mode"] = "two-round"
+    elif mode in ("single", "single-round", "1", "conservative"):
+        profile["mode"] = "single-round"
+    elif "-2" in profile["opts"]:
+        opts.insert(0, "-2")
+    return opts
+
+
+def _write_purge_dups_safety_report(path, metrics):
+    cols = [
+        "verdict", "reason", "taxon", "mode", "before_contigs",
+        "after_contigs", "before_bp", "after_bp", "bp_drop_frac",
+        "max_bp_drop", "expected_bp", "min_expected_bp",
+    ]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(cols)
+        w.writerow([metrics.get(c, "") for c in cols])
+
+
+def _purge_dups_safety_check(runner, before_recs, after_recs, profile, mode,
+                             report_path):
+    """Reject likely over-purging before replacing the assembly."""
+    before_bp = sum(len(s) for _, s in before_recs)
+    after_bp = sum(len(s) for _, s in after_recs)
+    max_drop = float(os.environ.get(
+        "PURGE_DUPS_MAX_BP_DROP", str(profile["max_bp_drop"])))
+    min_expected_ratio = float(os.environ.get(
+        "PURGE_DUPS_MIN_EXPECTED_RATIO",
+        str(profile["min_expected_ratio"])))
+    expected_bp = _parse_genome_size(getattr(runner, "genomesize", ""))
+    min_expected_bp = int(expected_bp * min_expected_ratio) if expected_bp else 0
+
+    if not after_recs:
+        verdict, reason = "reject", "empty_output"
+    elif after_bp > before_bp:
+        verdict, reason = "reject", "output_larger_than_input"
+    elif before_bp > 0 and (before_bp - after_bp) / before_bp > max_drop:
+        verdict, reason = "reject", "bp_drop_exceeds_taxon_limit"
+    elif min_expected_bp and after_bp < min_expected_bp:
+        verdict, reason = "reject", "below_expected_genome_size_floor"
+    else:
+        verdict, reason = "accept", "ok"
+
+    metrics = {
+        "verdict": verdict,
+        "reason": reason,
+        "taxon": getattr(runner, "taxon", "other"),
+        "mode": mode,
+        "before_contigs": len(before_recs),
+        "after_contigs": len(after_recs),
+        "before_bp": before_bp,
+        "after_bp": after_bp,
+        "bp_drop_frac": (
+            f"{(before_bp - after_bp) / before_bp:.4f}"
+            if before_bp else "0.0000"),
+        "max_bp_drop": max_drop,
+        "expected_bp": expected_bp,
+        "min_expected_bp": min_expected_bp,
+    }
+    _write_purge_dups_safety_report(report_path, metrics)
+    if verdict == "reject":
+        runner.log_warn(
+            f"purge_dups safety rejected output: {reason} "
+            f"({before_bp:,} -> {after_bp:,} bp)")
+    return verdict == "accept", reason
+
+
 def _run_purge_dups(runner, input_fa, output_fa):
     """Run purge_dups on the assembly to remove haplotigs and overlaps.
 
@@ -3926,11 +4061,24 @@ def _run_purge_dups(runner, input_fa, output_fa):
 
     # Taxon-aware warning for polyploid-prone taxa
     taxon = getattr(runner, 'taxon', 'other')
+    profile = _purge_dups_profile(taxon)
+    mode_override = os.environ.get("PURGE_DUPS_MODE", "auto")
+    if mode_override.strip().lower() == "skip":
+        runner.log_warn("PURGE_DUPS_MODE=skip; keeping unpurged assembly")
+        shutil.copy(input_fa, output_fa)
+        return False
+    purge_opts = _apply_purge_dups_mode(profile, mode_override)
+    extra_opts = shlex.split(os.environ.get("PURGE_DUPS_EXTRA_OPTS", ""))
+    if extra_opts:
+        purge_opts.extend(extra_opts)
+
     if taxon == "plant":
         runner.log_warn("purge_dups may collapse homeologous sequences in polyploid plants. "
                         "Use --no-purge-dups if this is a polyploid genome.")
 
-    runner.log_info("Running purge_dups for haplotig/overlap cleanup")
+    runner.log_info(
+        f"Running purge_dups for haplotig/overlap cleanup "
+        f"(taxon={taxon}, mode={profile['mode']}, {profile['note']})")
     pd_dir = "assemblies/purge_dups_work"
     if os.path.isdir(pd_dir):
         shutil.rmtree(pd_dir)
@@ -4010,16 +4158,9 @@ def _run_purge_dups(runner, input_fa, output_fa):
         stderr_log=os.path.join(pd_dir, "05.self_alignment.stderr.log"))
     _log_file_status(runner, self_paf, "purge_dups self-alignment PAF")
 
-    # Step 4: Purge duplicates
-    # Taxon-aware purge_dups strategy:
-    #   - Fungi/haploid: single-round, but adjust calcuts low-coverage cutoff
-    #     downward.  In haploid genomes, true haplotigs have ~0.5× coverage
-    #     but purge_dups' auto calcuts often sets the boundary too low,
-    #     missing them.  Override with PURGE_DUPS_CALCUTS env var if needed.
-    #   - Plant/polyploid: conservative single-round to avoid removing
-    #     homeologous sequences.  Two-round purging is too aggressive.
-    #   - Vertebrate/diploid: two-round purging for thorough haplotig removal.
-    #   - Other: single-round, standard calcuts.
+    # Step 4: Purge duplicates.  The profile stays conservative: get_seqs -e
+    # below only removes end duplications, and the size guard rejects likely
+    # over-purged output before it can replace the assembly.
     base_cov = os.path.join(pd_dir, "PB.base.cov")
     dups_bed = os.path.join(pd_dir, "dups.bed")
 
@@ -4032,47 +4173,63 @@ def _run_purge_dups(runner, input_fa, output_fa):
     # Allow user override of calcuts thresholds
     custom_calcuts = os.environ.get("PURGE_DUPS_CALCUTS", "")
 
-    purge_flag = ""
-    if taxon in ("vertebrate", "animal"):
-        purge_flag = "-2"  # two-round for diploid genomes
-        runner.log_info("purge_dups strategy: vertebrate/diploid (two-round)")
-    elif taxon == "plant":
-        # Single-round, conservative — avoid collapsing homeologs
-        runner.log_info("purge_dups strategy: plant (single-round, conservative)")
-    elif taxon == "fungal":
-        # Fungi are typically haploid — duplicates should have ~0.5× coverage.
-        # Use -2 for more aggressive duplicate detection in haploid genomes
-        # where coverage differences between primary and duplicate are subtle.
-        purge_flag = "-2"
-        runner.log_info("purge_dups strategy: fungal/haploid (two-round, aggressive)")
-    else:
-        runner.log_info("purge_dups strategy: default (single-round)")
-
     if custom_calcuts:
         # User provided custom calcuts: e.g. "5 10 15 20 25 30"
         with open(cutoff_file, "w") as cf:
             cf.write(custom_calcuts + "\n")
         runner.log_info(f"Using custom calcuts override: {custom_calcuts}")
 
-    cmd = f"purge_dups {purge_flag} -c {base_cov} -T {cutoff_file} {self_paf} > {dups_bed}"
-    _run_shell_capture(
+    purge_opts_display = " ".join(purge_opts) if purge_opts else "(none)"
+    runner.log_info(f"purge_dups options: {purge_opts_display}")
+    purge_opts_cmd = " ".join(shlex.quote(str(o)) for o in purge_opts)
+    cmd = (f"purge_dups {purge_opts_cmd} -c {shlex.quote(base_cov)} "
+           f"-T {shlex.quote(cutoff_file)} {shlex.quote(self_paf)} "
+           f"> {shlex.quote(dups_bed)}")
+    result = _run_shell_capture(
         runner, cmd, "purge_dups: call duplicate regions",
         stderr_log=os.path.join(pd_dir, "06.purge_dups.stderr.log"))
 
-    if not os.path.isfile(dups_bed) or os.path.getsize(dups_bed) == 0:
-        runner.log_warn("purge_dups produced no dups.bed; skipping")
+    if result.returncode != 0 or not os.path.isfile(dups_bed):
+        runner.log_warn("purge_dups failed to produce dups.bed; keeping original")
         _log_file_tail(runner, os.path.join(pd_dir, "06.purge_dups.stderr.log"),
                        "purge_dups duplicate caller stderr tail")
         shutil.copy(input_fa, output_fa)
         return False
     _log_file_status(runner, dups_bed, "purge_dups duplicate BED")
 
+    if os.path.getsize(dups_bed) == 0:
+        runner.log_info("purge_dups found no duplicate regions; keeping original")
+        shutil.copy(input_fa, output_fa)
+        before_recs = list(_read_fasta_records(input_fa))
+        _write_purge_dups_safety_report(
+            os.path.join(pd_dir, "purge_dups_safety.tsv"),
+            {
+                "verdict": "accept",
+                "reason": "no_duplicate_regions",
+                "taxon": taxon,
+                "mode": profile["mode"],
+                "before_contigs": len(before_recs),
+                "after_contigs": len(before_recs),
+                "before_bp": sum(len(s) for _, s in before_recs),
+                "after_bp": sum(len(s) for _, s in before_recs),
+                "bp_drop_frac": "0.0000",
+                "max_bp_drop": profile["max_bp_drop"],
+                "expected_bp": _parse_genome_size(
+                    getattr(runner, "genomesize", "")),
+                "min_expected_bp": "",
+            })
+        return True
+
     # Step 5: Get purged sequences
     # get_seqs writes purged.fa and hap.fa in its working directory.
     # Use absolute path for input FASTA since we set cwd=pd_dir.
     abs_input = os.path.abspath(input_fa)
     abs_dups_bed = os.path.abspath(dups_bed)
-    cmd = f"get_seqs -e {abs_dups_bed} {abs_input}"
+    get_seqs_opts = shlex.split(os.environ.get(
+        "PURGE_DUPS_GET_SEQS_OPTS", "-e"))
+    get_seqs_opts_cmd = " ".join(shlex.quote(str(o)) for o in get_seqs_opts)
+    cmd = (f"get_seqs {get_seqs_opts_cmd} {shlex.quote(abs_dups_bed)} "
+           f"{shlex.quote(abs_input)}")
     result = _run_shell_capture(
         runner, cmd, "purge_dups: extract purged sequences",
         stdout_log=os.path.join(pd_dir, "07.get_seqs.stdout.log"),
@@ -4088,6 +4245,15 @@ def _run_purge_dups(runner, input_fa, output_fa):
         before_bp = sum(len(s) for _, s in before_recs)
         after_bp = sum(len(s) for _, s in after_recs)
         hap_n = len(list(_read_fasta_records(hap_fa))) if os.path.isfile(hap_fa) else 0
+        safety_ok, safety_reason = _purge_dups_safety_check(
+            runner, before_recs, after_recs, profile, profile["mode"],
+            os.path.join(pd_dir, "purge_dups_safety.tsv"))
+        if not safety_ok:
+            runner.log_warn(
+                "purge_dups output rejected to preserve assembly completeness; "
+                f"keeping unpurged assembly ({safety_reason})")
+            shutil.copy(input_fa, output_fa)
+            return False
         runner.log(f"purge_dups: {len(before_recs)} → {len(after_recs)} contigs "
                    f"({hap_n} haplotigs removed), "
                    f"{before_bp:,} → {after_bp:,} bp")
@@ -5992,20 +6158,19 @@ def _final_busco_qc(runner):
         runner.log_info(f"BUSCO on final (lineage={lineage}, threads={runner.threads})")
         runner.log_version("busco", "busco")
 
-        cwd = os.getcwd()
-        os.chdir("busco")
-        cmd = f"busco -o final -i ../{final_fa} -l {lineage} -m genome -c {runner.threads}"
-        try:
-            result = runner.run_cmd(cmd, desc="Running BUSCO on final", check=False)
-            if result.returncode != 0:
-                runner.log_warn("BUSCO failed for final assembly; checking BUSCO logs")
-                busco_logs = glob.glob("final/logs/*.log") + glob.glob("run_final/logs/*.log")
-                for log_path in sorted(busco_logs)[-3:]:
-                    _log_file_tail(runner, log_path, "Final BUSCO log tail")
-            else:
-                runner.log_info("BUSCO output directory for final: busco/final")
-        finally:
-            os.chdir(cwd)
+        final_busco = _run_busco_trial(
+            final_fa, lineage, runner.threads, "final", "busco",
+            runner=runner)
+        if final_busco:
+            runner.log_info("BUSCO output directory for final: busco/final")
+        else:
+            runner.log_warn("BUSCO failed for final assembly; checking BUSCO logs")
+            busco_logs = (
+                glob.glob("busco/final/logs/*.log")
+                + glob.glob("busco/run_final/logs/*.log")
+            )
+            for log_path in sorted(busco_logs)[-3:]:
+                _log_file_tail(runner, log_path, "Final BUSCO log tail")
 
     # Parse BUSCO results from busco/final or busco/run_final
     def _parse_busco_final():
