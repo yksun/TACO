@@ -8,6 +8,7 @@ import os
 import sys
 import glob
 import csv
+import gzip
 import re
 import shlex
 import shutil
@@ -664,32 +665,92 @@ def step_00_input_qc(runner):
         raise RuntimeError("Genome size must be > 0")
     runner.log(f"Expected genome size: {expected_size:,} bp")
 
-    # Estimate total read bases and coverage
-    total_bases = 0
-    read_count = 0
-    opener = gzip.open if fq.endswith('.gz') else open
-    try:
-        with opener(fq, 'rt') as f:
-            for i, line in enumerate(f):
-                if i % 4 == 1:  # sequence line
-                    total_bases += len(line.strip())
-                    read_count += 1
-                if read_count >= 100000:
-                    # Sample first 100K reads and extrapolate
-                    break
-        if read_count >= 100000:
-            # Extrapolate from sample
-            bytes_per_read = fq_size / read_count if read_count > 0 else 1
-            est_total_reads = int(fq_size / bytes_per_read)
-            avg_read_len = total_bases / max(1, read_count)
-            est_total_bases = int(est_total_reads * avg_read_len)
-        else:
-            est_total_reads = read_count
-            est_total_bases = total_bases
-    except Exception as e:
-        runner.log_warn(f"Could not estimate read stats: {e}")
-        est_total_reads = 0
-        est_total_bases = 0
+    # Estimate total read bases and coverage.
+    #
+    # Two strategies, tried in order:
+    #   1. seqkit stats -T  (exact and fast; handles .fastq and .fastq.gz)
+    #   2. Sample the first ~100K reads and scale by bytes consumed in the
+    #      sample vs. the total file size.  The previous implementation
+    #      computed bytes_per_read = fq_size / read_count and then
+    #      est_total_reads = fq_size / bytes_per_read, which is algebraically
+    #      always equal to read_count — i.e. it always reported the sample
+    #      size as the total.  The fix is to track *bytes actually consumed*
+    #      while reading the sample.
+    SAMPLE_LIMIT = 100_000
+    est_total_reads = 0
+    est_total_bases = 0
+    is_gz = fq.endswith('.gz')
+
+    seqkit_bin = shutil.which("seqkit")
+    if seqkit_bin:
+        try:
+            out = subprocess.check_output(
+                [seqkit_bin, "stats", "-T", fq],
+                stderr=subprocess.DEVNULL, text=True, timeout=900)
+            rows = [r.split("\t") for r in out.strip().splitlines()]
+            if len(rows) >= 2 and len(rows[1]) >= 5:
+                # Header: file format type num_seqs sum_len ...
+                est_total_reads = int(float(rows[1][3]))
+                est_total_bases = int(float(rows[1][4]))
+                runner.log_info(
+                    "Counted reads/bases exactly with seqkit stats")
+        except Exception as e:
+            runner.log_warn(
+                f"seqkit stats failed ({e}); falling back to sampling estimator")
+
+    if est_total_bases == 0:
+        sample_reads = 0
+        sample_seq_bases = 0
+        sample_bytes_consumed = 0
+        try:
+            if is_gz:
+                # For .gz, use raw.tell() on the underlying compressed file
+                # so the scale factor compares like-for-like with fq_size.
+                raw = open(fq, 'rb')
+                stream = gzip.open(raw, 'rt', errors='replace')
+            else:
+                raw = None
+                stream = open(fq, 'r', errors='replace')
+            try:
+                line_no = 0
+                for line in stream:
+                    line_no += 1
+                    if not is_gz:
+                        # text-mode line length ≈ uncompressed bytes
+                        sample_bytes_consumed += len(line)
+                    if line_no % 4 == 2:  # sequence line of a 4-line FASTQ record
+                        sample_reads += 1
+                        sample_seq_bases += len(line.rstrip("\n"))
+                        if sample_reads >= SAMPLE_LIMIT:
+                            break
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                if raw is not None:
+                    try:
+                        # Compressed bytes consumed (may overshoot slightly
+                        # due to read-ahead buffering — acceptable for a
+                        # rough estimate).
+                        sample_bytes_consumed = raw.tell()
+                    except Exception:
+                        sample_bytes_consumed = 0
+                    raw.close()
+
+            if sample_reads > 0 and sample_bytes_consumed > 0 and sample_reads >= SAMPLE_LIMIT:
+                # Scale up from the sample to the full file by bytes consumed.
+                scale = max(1.0, fq_size / sample_bytes_consumed)
+                est_total_reads = int(round(sample_reads * scale))
+                est_total_bases = int(round(sample_seq_bases * scale))
+            else:
+                # File fit within the sample limit — these *are* the totals.
+                est_total_reads = sample_reads
+                est_total_bases = sample_seq_bases
+        except Exception as e:
+            runner.log_warn(f"Could not estimate read stats: {e}")
+            est_total_reads = 0
+            est_total_bases = 0
 
     if est_total_bases > 0:
         coverage = est_total_bases / expected_size
