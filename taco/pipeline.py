@@ -95,10 +95,24 @@ class PipelineRunner:
         self.busco_lineage = args.busco  # may be None if --taxon other and no --busco
         self.run_busco = args.busco is not None
         if self.busco_lineage is None and self.taxon != "other":
-            # Fallback: use taxon default (should be set in cli.py)
+            # Fallback: use taxon default (should be set in cli.py).
+            # Note: "fungal" defaults to fungi_odb10 (the broad fungal lineage);
+            # use --busco ascomycota_odb10 (or similar) for sub-lineage scoring.
             from taco.cli import TAXON_BUSCO_LINEAGE
-            self.busco_lineage = TAXON_BUSCO_LINEAGE.get(self.taxon, "ascomycota_odb10")
+            self.busco_lineage = TAXON_BUSCO_LINEAGE.get(self.taxon, "fungi_odb10")
             self.run_busco = True
+
+        # Where BUSCO should look for / cache lineage datasets.  If neither
+        # --busco-download-path nor BUSCO_DOWNLOAD_PATH is set, BUSCO uses
+        # ./busco_downloads relative to the working directory (its default).
+        cli_dl = getattr(args, 'busco_download_path', None)
+        env_dl = os.environ.get("BUSCO_DOWNLOAD_PATH") or None
+        self.busco_download_path = cli_dl or env_dl
+        # Whether BUSCO is allowed to download missing lineages from the net.
+        # Default: yes (this is the behavior most users expect; offline-only
+        # users must opt in).  This replaces the earlier
+        # STEP12_BUSCO_ALLOW_DOWNLOAD=1 opt-in.
+        self.busco_offline_only = bool(getattr(args, 'busco_offline_only', False))
 
         # Merqury: explicitly disabled with --no-merqury; explicitly enabled
         # with --merqury or --merqury-db.  Otherwise, auto-enable when an

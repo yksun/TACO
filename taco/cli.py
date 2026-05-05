@@ -45,7 +45,10 @@ def expand_steps(step_str):
 
 
 TAXON_BUSCO_LINEAGE = {
-    "fungal": "ascomycota_odb10",
+    # Use the broadest reasonable lineage for each taxon by default.
+    # A specific sub-lineage (e.g. ascomycota_odb10) should only be used
+    # when the user explicitly passes --busco <lineage>.
+    "fungal": "fungi_odb10",
     "plant": "embryophyta_odb10",
     "vertebrate": "vertebrata_odb10",
     "animal": "metazoa_odb10",
@@ -75,7 +78,20 @@ def parse_args():
     parser.add_argument('--telo-kmer-max', type=int, default=30)
     parser.add_argument('--auto-mode', choices=['smart', 'n50'], default='smart')
     parser.add_argument('--choose', nargs='?', const='__prompt__')
-    parser.add_argument('--busco', type=str, help='BUSCO lineage database (e.g., ascomycota_odb10); if not provided, defaults based on --taxon')
+    parser.add_argument('--busco', type=str,
+                        help='BUSCO lineage database (e.g., ascomycota_odb10, fungi_odb10). '
+                             'Only used as-is when explicitly provided. If omitted, TACO picks a '
+                             'broad default based on --taxon (fungal -> fungi_odb10, plant -> '
+                             'embryophyta_odb10, vertebrate -> vertebrata_odb10, animal -> '
+                             'metazoa_odb10, insect -> insecta_odb10).')
+    parser.add_argument('--busco-download-path', dest='busco_download_path', type=str, default=None,
+                        help='Directory where BUSCO lineage datasets are cached '
+                             '(passed as --download_path to busco). Default: BUSCO_DOWNLOAD_PATH '
+                             'env var if set, otherwise ./busco_downloads relative to the run dir.')
+    parser.add_argument('--busco-offline-only', dest='busco_offline_only', action='store_true',
+                        help='Refuse to download BUSCO lineages over the network. If the lineage '
+                             'is not already cached in --busco-download-path, BUSCO will fail '
+                             'instead of falling back to an online lookup.')
     parser.add_argument('--merqury', action='store_true',
                         help='Force-enable Merqury. If no --merqury-db is provided, TACO builds a reads .meryl database when meryl is installed.')
     parser.add_argument('--merqury-db', type=str,

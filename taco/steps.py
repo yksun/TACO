@@ -1402,31 +1402,29 @@ def step_08_busco(runner):
             runner.log_error(f"Missing BUSCO metrics for '{base}' and 'busco' binary not available; cannot run.")
             raise RuntimeError("BUSCO not available")
 
-        force_flag = ""
+        # Drop any incomplete BUSCO directory so we get a clean run.
         if os.path.isdir(f"busco/{base}"):
-            runner.log_info(f"Incomplete BUSCO dir detected for {base} → re-running with -f")
-            force_flag = "-f"
+            runner.log_info(f"Incomplete BUSCO dir detected for {base} → re-running")
+            shutil.rmtree(f"busco/{base}")
 
         runner.log_info(f"BUSCO on {base} (lineage={lineage}, threads={runner.threads})")
         runner.log_version("busco", "busco")
 
-        cwd = os.getcwd()
-        os.chdir("busco")
-        cmd = f"busco -i ../{fasta_path} -l {lineage} -m genome -c {runner.threads} -o {base} {force_flag}"
-        try:
-            result = runner.run_cmd(cmd, desc=f"Running BUSCO on {base}", check=False)
-            if result.returncode != 0:
-                runner.log_warn(f"BUSCO failed for {base}; checking BUSCO logs")
-                busco_logs = (
-                    glob.glob(f"{base}/logs/*.log")
-                    + glob.glob(f"run_{base}/logs/*.log")
-                )
-                for log_path in sorted(busco_logs)[-3:]:
-                    _log_file_tail(runner, log_path, f"BUSCO log tail for {base}")
-            else:
-                runner.log_info(f"BUSCO output directory for {base}: busco/{base}")
-        finally:
-            os.chdir(cwd)
+        # Use the shared trial helper so all BUSCO call sites share the same
+        # offline/online fallback, --download_path handling, and logging.
+        result = _run_busco_trial(
+            fasta_path, lineage, runner.threads, base, "busco",
+            runner=runner)
+        if result is None:
+            runner.log_warn(f"BUSCO failed for {base}; checking BUSCO logs")
+            busco_logs = (
+                glob.glob(f"busco/{base}/logs/*.log")
+                + glob.glob(f"busco/run_{base}/logs/*.log")
+            )
+            for log_path in sorted(busco_logs)[-3:]:
+                _log_file_tail(runner, log_path, f"BUSCO log tail for {base}")
+        else:
+            runner.log_info(f"BUSCO output directory for {base}: busco/{base}")
 
     _build_busco_csv(runner)
     runner.log("Wrote assemblies/assembly.busco.csv")
@@ -3657,9 +3655,49 @@ def _step12_busco_timeout():
     return max(0, timeout)
 
 
-def _step12_busco_allow_download():
-    """Return True when BUSCO trials may fall back to online lineage lookup."""
-    return os.environ.get("STEP12_BUSCO_ALLOW_DOWNLOAD", "0") == "1"
+def _step12_busco_allow_download(runner=None):
+    """Return True when BUSCO trials may fall back to online lineage lookup.
+
+    Default is True (download is allowed) so a missing local cache does not
+    silently abort BUSCO.  Users can opt out via:
+      * --busco-offline-only on the CLI
+      * STEP12_BUSCO_ALLOW_DOWNLOAD=0 in the environment (legacy)
+    """
+    if runner is not None and getattr(runner, "busco_offline_only", False):
+        return False
+    env = os.environ.get("STEP12_BUSCO_ALLOW_DOWNLOAD")
+    if env is None:
+        return True
+    return env == "1"
+
+
+def _busco_download_path(runner=None):
+    """Return the BUSCO --download_path, or None to use BUSCO's default."""
+    if runner is not None:
+        path = getattr(runner, "busco_download_path", None)
+        if path:
+            return path
+    return os.environ.get("BUSCO_DOWNLOAD_PATH") or None
+
+
+def _busco_lineage_cached(lineage, runner=None):
+    """Best-effort check: is the BUSCO lineage already on disk?
+
+    Looks in --busco-download-path / BUSCO_DOWNLOAD_PATH (if set) and in the
+    default BUSCO cache (./busco_downloads).  Returns True only when we can
+    see the directory; absence does not guarantee the lineage is missing
+    (BUSCO may be using a different cache).
+    """
+    if not lineage:
+        return False
+    candidates = []
+    dl = _busco_download_path(runner)
+    if dl:
+        candidates.append(os.path.join(dl, "lineages", lineage))
+        candidates.append(os.path.join(dl, lineage))
+    candidates.append(os.path.join("busco_downloads", "lineages", lineage))
+    candidates.append(os.path.join("busco", "busco_downloads", "lineages", lineage))
+    return any(os.path.isdir(p) for p in candidates)
 
 
 def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir,
@@ -3756,32 +3794,55 @@ def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir,
                     f"BUSCO trial {trial_label} stderr tail")
         return result
 
-    # Try --offline first, fall back to normal mode if lineage not cached.
-    cmd = [
+    # Common args (including --download_path when configured)
+    download_path = _busco_download_path(runner)
+    base_cmd = [
         "busco", "-o", trial_label, "-i", trial_fa, "-l", lineage,
         "-m", "genome", "-c", str(threads), "--out_path", out_dir,
-        "--offline",
     ]
-    result = run_attempt(cmd, "offline")
-    if result is None:
-        return None
+    if download_path:
+        base_cmd += ["--download_path", download_path]
 
-    if result.returncode != 0:
-        if not _step12_busco_allow_download():
-            if runner:
-                runner.log_warn(
-                    f"BUSCO trial {trial_label} offline attempt failed; "
-                    "skipping online retry. Set STEP12_BUSCO_ALLOW_DOWNLOAD=1 "
-                    "to permit BUSCO lineage downloads/checks.")
+    # If we can confirm the lineage is already cached, prefer --offline
+    # (faster; no network calls).  If the cache isn't visible to us, skip
+    # the offline attempt entirely and go straight to the online run, unless
+    # the user has forced offline-only.
+    allow_download = _step12_busco_allow_download(runner)
+    cached = _busco_lineage_cached(lineage, runner)
+
+    if cached or not allow_download:
+        cmd = base_cmd + ["--offline"]
+        result = run_attempt(cmd, "offline")
+        if result is None:
             return None
-
-        # Retry without --offline (lineage may need download)
-        if os.path.isdir(trial_out):
-            shutil.rmtree(trial_out)
-        cmd = [
-            "busco", "-o", trial_label, "-i", trial_fa, "-l", lineage,
-            "-m", "genome", "-c", str(threads), "--out_path", out_dir,
-        ]
+        if result.returncode != 0:
+            if not allow_download:
+                if runner:
+                    runner.log_warn(
+                        f"BUSCO trial {trial_label} offline attempt failed and "
+                        "online fallback is disabled (--busco-offline-only or "
+                        "STEP12_BUSCO_ALLOW_DOWNLOAD=0). The lineage "
+                        f"'{lineage}' must be available under "
+                        f"{download_path or 'busco_downloads/lineages/'}.")
+                return None
+            # Cached check was wrong (or partial); fall through to online.
+            if runner:
+                runner.log_info(
+                    f"BUSCO trial {trial_label} offline attempt failed; "
+                    "retrying with online lineage lookup.")
+            if os.path.isdir(trial_out):
+                shutil.rmtree(trial_out)
+            cmd = list(base_cmd)
+            result = run_attempt(cmd, "online")
+            if result is None:
+                return None
+    else:
+        # Lineage not visibly cached and download is allowed; go online directly.
+        if runner:
+            runner.log_info(
+                f"BUSCO lineage '{lineage}' not found locally; running BUSCO "
+                "in online mode (will download if missing).")
+        cmd = list(base_cmd)
         result = run_attempt(cmd, "online")
         if result is None:
             return None
