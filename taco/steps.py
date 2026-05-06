@@ -7192,6 +7192,259 @@ def _compare_vs_final_report(runner):
                         r["identity_pct"], r["compare_coverage_pct"]])
     runner.log(f"Wrote {c2c_path} ({len(contig_rows)} compare contigs)")
 
+    # ---- Unique contigs ------------------------------------------------
+    # Read both FASTAs once so we know every contig that exists, not just
+    # those that landed in the PAF.
+    def _fasta_name_lengths(path):
+        names = {}
+        cur = None
+        cur_len = 0
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith(">"):
+                        if cur is not None:
+                            names[cur] = cur_len
+                        cur = line[1:].split()[0]
+                        cur_len = 0
+                    else:
+                        cur_len += len(line.strip())
+                if cur is not None:
+                    names[cur] = cur_len
+        except OSError:
+            return {}
+        return names
+
+    compare_lengths = _fasta_name_lengths(compare_fa)
+    final_lengths = _fasta_name_lengths(final_fa)
+
+    # "Unique compare" = compare contig with best-coverage < UNIQUE_THRESHOLD,
+    # OR no alignment at all.  Default 5 % is a deliberately permissive bar:
+    # anything below means the contig has effectively no homologue in final.
+    UNIQUE_THRESHOLD = 5.0
+    seen_compare = {r["compare_contig"]: r for r in contig_rows}
+    uniq_compare_path = os.path.join(out_dir, "unique_compare_contigs.tsv")
+    with open(uniq_compare_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["compare_contig", "compare_len", "compare_coverage_pct",
+                    "best_target_contig", "identity_pct", "reason"])
+        n_uniq_c = 0
+        for cname, clen in compare_lengths.items():
+            row = seen_compare.get(cname)
+            if row is None:
+                w.writerow([cname, clen, 0.0, "", 0.0, "no_alignment"])
+                n_uniq_c += 1
+            elif row["compare_coverage_pct"] < UNIQUE_THRESHOLD:
+                w.writerow([cname, clen, row["compare_coverage_pct"],
+                            row["best_target"], row["identity_pct"],
+                            f"coverage_below_{UNIQUE_THRESHOLD:.0f}pct"])
+                n_uniq_c += 1
+    runner.log(f"Wrote {uniq_compare_path} ({n_uniq_c} unique compare contigs)")
+
+    uniq_final_path = os.path.join(out_dir, "unique_final_contigs.tsv")
+    with open(uniq_final_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["final_contig", "final_len", "covered_bp_by_compare",
+                    "covered_frac", "reason"])
+        n_uniq_f = 0
+        for fname, flen in final_lengths.items():
+            covered = _covered_length(target_intervals.get(fname, []))
+            frac = covered / flen if flen else 0.0
+            if frac * 100.0 < UNIQUE_THRESHOLD:
+                reason = ("no_alignment" if covered == 0
+                          else f"coverage_below_{UNIQUE_THRESHOLD:.0f}pct")
+                w.writerow([fname, flen, covered, round(frac, 4), reason])
+                n_uniq_f += 1
+    runner.log(f"Wrote {uniq_final_path} ({n_uniq_f} unique final contigs)")
+
+    # ---- Synteny blocks: aggregated 1-to-1 best mappings ---------------
+    # Useful as an at-a-glance synteny summary (which compare contig
+    # corresponds to which final contig).  Filtered to mappings with
+    # coverage >= 50 % so noise contigs don't pollute the table.
+    synteny_path = os.path.join(out_dir, "synteny_blocks.tsv")
+    SYNTENY_MIN_COV = 50.0
+    with open(synteny_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["compare_contig", "final_contig",
+                    "compare_len", "final_len",
+                    "aligned_bases", "identity_pct",
+                    "compare_coverage_pct", "relationship"])
+        # Group compare contigs by their best target to detect splits/joins.
+        by_target = defaultdict(list)
+        for r in contig_rows:
+            if r["best_target"] and r["compare_coverage_pct"] >= SYNTENY_MIN_COV:
+                by_target[r["best_target"]].append(r)
+        for tname, rows in sorted(by_target.items()):
+            for r in rows:
+                if len(rows) == 1:
+                    rel = "1-to-1"
+                else:
+                    rel = f"many-to-1 (1 of {len(rows)} compare→{tname})"
+                w.writerow([r["compare_contig"], tname, r["compare_len"],
+                            r["target_len"], r["aligned_bases"],
+                            r["identity_pct"], r["compare_coverage_pct"], rel])
+    runner.log(f"Wrote {synteny_path}")
+
+    # ---- Circos config bundle ------------------------------------------
+    # Generate a minimal Circos configuration the user can run with:
+    #   cd final_results/compare_report/circos && circos -conf circos.conf
+    # Circos must be installed separately (http://circos.ca).  The config is
+    # tool-version agnostic and only references the karyotype.txt and
+    # links.txt we generate here.
+    circos_dir = os.path.join(out_dir, "circos")
+    os.makedirs(circos_dir, exist_ok=True)
+
+    # karyotype.txt: chr - <id> <label> <start> <end> <color>
+    # We prefix compare contigs with "C_" and final contigs with "F_" so
+    # there is no ID collision when the two assemblies share contig names.
+    karyotype_path = os.path.join(circos_dir, "karyotype.txt")
+    palette_compare = "spectral-9-div-1"
+    palette_final = "spectral-9-div-7"
+    with open(karyotype_path, "w") as f:
+        for name, length in sorted(compare_lengths.items(),
+                                    key=lambda kv: -kv[1]):
+            f.write(f"chr - C_{name} {name} 0 {length} {palette_compare}\n")
+        for name, length in sorted(final_lengths.items(),
+                                    key=lambda kv: -kv[1]):
+            f.write(f"chr - F_{name} {name} 0 {length} {palette_final}\n")
+    runner.log(f"Wrote {karyotype_path}")
+
+    # links.txt: one row per minimap2 alignment block (compare-contig →
+    # final-contig).  Format: src_id qstart qend dst_id tstart tend
+    # We re-parse the PAF here so the link coordinates are exact.
+    links_path = os.path.join(circos_dir, "links.txt")
+    LINK_MIN_LEN = 5000  # drop tiny anchors that just clutter the plot
+    n_links = 0
+    with open(paf_path) as fin, open(links_path, "w") as fout:
+        for line in fin:
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 11:
+                continue
+            qname, _qlen, qs, qe, _strand, tname, _tlen, ts, te, _matches, alen = (
+                cols[0], int(cols[1]), int(cols[2]), int(cols[3]),
+                cols[4], cols[5], int(cols[6]), int(cols[7]),
+                int(cols[8]), int(cols[9]), int(cols[10]))
+            if alen < LINK_MIN_LEN:
+                continue
+            fout.write(f"C_{qname} {qs} {qe} F_{tname} {ts} {te}\n")
+            n_links += 1
+    runner.log(f"Wrote {links_path} ({n_links} links >= {LINK_MIN_LEN} bp)")
+
+    circos_conf_path = os.path.join(circos_dir, "circos.conf")
+    with open(circos_conf_path, "w") as f:
+        f.write(
+            "# Circos configuration generated by TACO step 14C.\n"
+            "# Run with:    circos -conf circos.conf\n"
+            "# Requires Circos installed separately: http://circos.ca\n"
+            "\n"
+            "karyotype = karyotype.txt\n"
+            "chromosomes_units           = 1000000\n"
+            "chromosomes_display_default = yes\n"
+            "\n"
+            "<ideogram>\n"
+            "<spacing>\n"
+            "  default = 0.005r\n"
+            "</spacing>\n"
+            "  radius           = 0.85r\n"
+            "  thickness        = 25p\n"
+            "  fill             = yes\n"
+            "  show_label       = yes\n"
+            "  label_font       = default\n"
+            "  label_radius     = dims(ideogram,radius_outer) + 35p\n"
+            "  label_size       = 18\n"
+            "  label_parallel   = yes\n"
+            "</ideogram>\n"
+            "\n"
+            "<links>\n"
+            "<link>\n"
+            "  file          = links.txt\n"
+            "  ribbon        = yes\n"
+            "  flat          = yes\n"
+            "  radius        = 0.95r\n"
+            "  bezier_radius = 0r\n"
+            "  thickness     = 2\n"
+            "  color         = grey_a3\n"
+            "</link>\n"
+            "</links>\n"
+            "\n"
+            "<image>\n"
+            "  <<include etc/image.conf>>\n"
+            "</image>\n"
+            "<<include etc/colors_fonts_patterns.conf>>\n"
+            "<<include etc/housekeeping.conf>>\n"
+        )
+    runner.log(f"Wrote {circos_conf_path}")
+
+    circos_readme = os.path.join(circos_dir, "README.txt")
+    with open(circos_readme, "w") as f:
+        f.write(
+            "Circos plot inputs for compare-vs-final synteny\n"
+            "===============================================\n\n"
+            "Files in this directory:\n"
+            "  karyotype.txt - chromosome ideograms for both assemblies\n"
+            "                  (C_<name> = --compare contigs, F_<name> = TACO final)\n"
+            "  links.txt     - one ribbon per minimap2 alignment block\n"
+            f"                  (alignments >= {LINK_MIN_LEN} bp; {n_links} links total)\n"
+            "  circos.conf   - minimal Circos configuration\n\n"
+            "How to render the plot:\n"
+            "  1. Install Circos: http://circos.ca/software/download/\n"
+            "  2. cd into this directory:\n"
+            f"       cd {os.path.relpath(circos_dir)}\n"
+            "  3. Run Circos:\n"
+            "       circos -conf circos.conf\n"
+            "  4. Output PNG/SVG land in ./circos.png and ./circos.svg\n\n"
+            "Tweaks:\n"
+            "  - To hide tiny chromosomes, edit chromosomes_display_default in\n"
+            "    circos.conf and add chromosomes = ... with explicit IDs.\n"
+            "  - To color compare vs final differently, replace the\n"
+            "    'spectral-9-div-1' / '-7' tokens in karyotype.txt with any\n"
+            "    Circos brewer palette (e.g. 'red', 'blue', 'paired-12-qual-1').\n"
+            "  - Filter links: re-run TACO with a higher LINK_MIN_LEN, or\n"
+            "    awk '$3-$2 >= 20000' links.txt > links_20kb.txt and\n"
+            "    point links.file at links_20kb.txt.\n"
+        )
+    runner.log(f"Wrote {circos_readme}")
+
+    # ---- paftools.js call: SNV/SV calling from the asm-vs-asm PAF -----
+    # Ships with minimap2 (k8 + paftools.js), so usually available when
+    # minimap2 is.  Skipped silently when not on PATH.
+    paftools_bin = shutil.which("paftools.js")
+    k8_bin = shutil.which("k8")
+    if paftools_bin and k8_bin:
+        sorted_paf = os.path.join(out_dir, "compare_vs_final.sorted.paf")
+        # paftools.js call expects PAF sorted by target; sort -k6,6 -k8,8n.
+        runner.run_cmd(
+            f"sort -k6,6 -k8,8n {paf_path} > {sorted_paf}",
+            desc="Sorting PAF for paftools.js call", check=False)
+        variants_path = os.path.join(out_dir, "compare_paftools_variants.vcf")
+        # `paftools.js call -L 10000` requires alignment >= 10 kb to call
+        # SVs/SNVs (the standard recommendation).
+        runner.run_cmd(
+            f"{k8_bin} {paftools_bin} call -L 10000 {sorted_paf} > {variants_path}",
+            desc="paftools.js call (SVs + SNVs from compare-vs-final PAF)",
+            check=False)
+        try:
+            n_var = sum(1 for ln in open(variants_path) if not ln.startswith("#") and ln.strip())
+            runner.log(f"Wrote {variants_path} ({n_var} variant records)")
+        except Exception:
+            runner.log(f"Wrote {variants_path}")
+    else:
+        runner.log_info(
+            "Compare report: paftools.js / k8 not on PATH; skipping "
+            "compare_paftools_variants.vcf (install via minimap2 distribution).")
+
+    # ---- mash dist: scalar distance between compare and final ---------
+    if shutil.which("mash"):
+        mash_path = os.path.join(out_dir, "compare_mash_distance.tsv")
+        runner.run_cmd(
+            f"mash dist {compare_fa} {final_fa} > {mash_path}",
+            desc="mash dist compare-vs-final (k=21 default)", check=False)
+        runner.log(f"Wrote {mash_path}")
+    else:
+        runner.log_info(
+            "Compare report: mash not on PATH; skipping scalar distance "
+            "(install via 'mamba install -c bioconda mash' to enable).")
+
     # ---- weak_regions: 10 kb windows of final.merged.fasta with < 50% coverage
     # from any compare alignment.  Reports per-target coordinates.
     win = 10000

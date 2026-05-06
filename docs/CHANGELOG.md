@@ -7,6 +7,39 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [1.3.4] — 2026-05-06
 
+### Step 14C compare report — unique-contig listings, synteny blocks, Circos config
+
+- **`final_results/compare_report/unique_compare_contigs.tsv`** lists every
+  contig in the `--compare` FASTA whose best alignment to `final.merged.fasta`
+  covers less than 5 % of its length (or has no alignment at all).
+  Companion file **`unique_final_contigs.tsv`** does the same for
+  `final.merged.fasta` contigs that received < 5 % coverage from any
+  compare alignment. Each row carries length, coverage, best partner,
+  identity, and a `reason` column (`no_alignment` /
+  `coverage_below_5pct`).
+- **`synteny_blocks.tsv`** aggregates 1-to-1 best mappings (compare
+  coverage ≥ 50 %) and tags each block as `1-to-1` or `many-to-1`,
+  giving an at-a-glance synteny summary instead of forcing the user to
+  derive it from the per-alignment PAF.
+- **`compare_report/circos/`** is a self-contained, ready-to-render
+  Circos input bundle. TACO writes:
+  * `karyotype.txt` — every compare and final contig as an ideogram
+    (`C_<name>` for compare contigs, `F_<name>` for final contigs).
+  * `links.txt` — one ribbon per minimap2 alignment ≥ 5 kb.
+  * `circos.conf` — minimal Circos configuration referencing the two
+    files above; uses the standard Spectral palette so compare and final
+    contigs are colored differently.
+  * `README.txt` — instructions to install Circos and run
+    `cd circos && circos -conf circos.conf`.
+- **Optional `compare_paftools_variants.vcf`** — when `paftools.js` and
+  `k8` are on PATH (they ship with minimap2), TACO sorts the PAF by
+  target and runs `paftools.js call -L 10000` to emit assembly-vs-assembly
+  SNVs and SVs in VCF format. Skipped silently when the binaries are
+  missing.
+- **Optional `compare_mash_distance.tsv`** — when `mash` is on PATH,
+  TACO writes the scalar Mash distance between the two assemblies as a
+  quick "are these the same organism" check.
+
 ### `--compare` and `--final-fa`: passive comparison + arbitrary final assembly
 
 - **New `--compare <fasta>` flag.** A user-supplied FASTA can now be brought
