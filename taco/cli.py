@@ -59,7 +59,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.3 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.4 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -68,7 +68,26 @@ def parse_args():
     parser.add_argument('--taxon', choices=['vertebrate', 'animal', 'plant', 'insect', 'fungal', 'other'],
                         default='other', help='Taxonomy preset for telomere motif priors (default: other)')
     parser.add_argument('--platform', choices=['pacbio-hifi', 'nanopore', 'pacbio'], default='pacbio-hifi')
-    parser.add_argument('--reference', '-ref', type=str, help='Reference FASTA for comparison')
+    parser.add_argument('--reference', '-ref', type=str,
+                        help='Reference FASTA. Included as the "reference" row in '
+                             'comparison tables (BUSCO/Telomere/QUAST/Merqury). '
+                             'Excluded from backbone selection, quickmerge candidate '
+                             'pool, telomere-aware refinement, polish, and purge_dups.')
+    parser.add_argument('--compare', type=str,
+                        help='Compare-only FASTA (e.g. an external assembly to '
+                             'compare against). Same QC as --reference, AND TACO '
+                             'emits a contig-to-contig comparison report '
+                             '(final_results/compare_report/) against the final '
+                             'merged assembly: minimap2 asm5 alignment, per-contig '
+                             '1-to-1 mapping, alignment identity, and weak_regions '
+                             '(stretches of final.merged.fasta with no/low support '
+                             'from the compare assembly). Never used for selection, '
+                             'merging, or polishing.')
+    parser.add_argument('--final-fa', dest='final_fa', type=str,
+                        help='Use this FASTA as the final merged assembly for steps '
+                             '13/14 instead of assemblies/final.merged.fasta. Useful '
+                             'for re-running final QC against an externally produced '
+                             'assembly without rebuilding from step 12.')
     parser.add_argument('-s', '--steps', type=str, help='Steps to run')
     parser.add_argument('--assembly-only', action='store_true')
     parser.add_argument('--telomere-mode', choices=['known', 'auto', 'hybrid'], default='hybrid')
@@ -109,7 +128,7 @@ def parse_args():
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.3.3')
+    parser.add_argument('--version', action='version', version='TACO v1.3.4')
     
     args = parser.parse_args()
 
@@ -143,7 +162,7 @@ def parse_args():
     for s in args.steps:
         if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.3.3 uses steps 0-14. "
+                f"Invalid step: {s}. TACO v1.3.4 uses steps 0-14. "
                 f"Full mode: 0-14. Assembly-only: 0-10, 14. "
                 f"Resume from refinement: -s 12-14.")
     return args

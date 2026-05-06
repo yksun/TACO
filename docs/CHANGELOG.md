@@ -5,6 +5,95 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.4] — 2026-05-06
+
+### `--compare` and `--final-fa`: passive comparison + arbitrary final assembly
+
+- **New `--compare <fasta>` flag.** A user-supplied FASTA can now be brought
+  into the comparison tables (BUSCO, Telomere, QUAST, Merqury) without any
+  risk of contaminating the refinement pipeline. `--compare` is excluded
+  from backbone selection, the telomere-pool quickmerge candidate set,
+  polishing, and `purge_dups`. Step 14 adds a new sub-step **14C** that
+  runs whenever `--compare` is set: minimap2 `-cx asm5` aligns the compare
+  FASTA to `final.merged.fasta` and TACO writes
+  `final_results/compare_report/contig_to_contig.tsv` (per compare
+  contig: best 1-to-1 target, aligned bases, identity %, query coverage)
+  and `final_results/compare_report/weak_regions.tsv` (10 kb windows of
+  `final.merged.fasta` whose compare coverage is below 50 %). When QUAST
+  is available, `compare_quast/` adds reference-based metrics (genome
+  fraction, NA50, misassemblies relative to the compare genome). When
+  MUMmer's `dnadiff` is on PATH, `compare_dnadiff/out.report` adds a
+  SNP/indel summary; both side reports are skipped silently when their
+  binaries are missing. Works in two modes:
+  *full pipeline* (`taco ... --compare X` runs steps 0–14 and the report
+  lands in 14C), and *resume* (`taco ... -s 10,13,14 --compare X` after a
+  prior full run still produces the report and a `compare` row in
+  `final_result.csv`).
+- **New `--final-fa <fasta>` flag.** Steps 13 and 14 now accept an
+  externally produced final assembly via `--final-fa`. The flag is
+  authoritative — it copies into `assemblies/final.merged.fasta` even
+  when a stale copy is already present in the working directory. When
+  `--final-fa` is omitted, TACO continues to fall back to
+  `final_results/final.merged.fasta` (and `final_results/final_assembly.fasta`).
+- **`--reference` is a full pipeline participant; `--compare` is fully
+  passive.** ``EXCLUDED_FROM_REFINEMENT = {"compare"}`` controls every
+  refinement-stage filter (auto-selector, fallback "first-available"
+  picker, all-vs-all quickmerge candidate pool, telomere-pool input
+  filter, polish/purge_dups loops). `--reference` therefore continues to
+  contribute `*.telo.fasta` to the quickmerge candidate pool and is used
+  as a chimera-detection alignment target — exactly as the original
+  semantics imply. Only `--compare` is filtered out everywhere except QC
+  and the new step 14C. (Use `--choose <assembler>` if you need to lock
+  the backbone away from a high-scoring reference.)
+- **Resume restoration covers steps 8–14.** Re-running individual steps
+  after step-14 cleanup now restores normalized `assemblies/*.result.fasta`
+  from `temp/assemblers/...`, the `assembly_info.csv` and merged metric
+  CSVs from `final_results/`, telomere-pool FASTAs and provenance TSVs
+  from `telomere_pool/`, and `final.merged.fasta` from
+  `final_results/final.merged.fasta` (or from `--final-fa`).
+
+### BUSCO: offline-first, configurable cache, and consistent across all steps
+
+- **BUSCO trials are offline-first by default.** The previous default ran
+  `--offline` only when the lineage was visible in a hard-coded location;
+  otherwise it jumped straight to an online lookup that could timeout or
+  attempt downloads on cluster nodes. Every BUSCO call (steps 8, 12, 13)
+  now runs `--offline` first and only retries online when the offline
+  attempt fails *and* the user has not passed `--busco-offline-only`.
+- **New `--busco-download-path`.** Passed to BUSCO as `--download_path`
+  so the cluster's central lineage cache is honored regardless of cwd.
+  Falls back to the `BUSCO_DOWNLOAD_PATH` environment variable.
+- **New `--busco-offline-only`.** Refuses any online lineage download.
+  Replaces the older opt-in `STEP12_BUSCO_ALLOW_DOWNLOAD=1` flag (the env
+  var still works, inverted: `STEP12_BUSCO_ALLOW_DOWNLOAD=0` disables the
+  online fallback). Step 8's BUSCO loop now uses the same shared trial
+  helper as steps 12/13, so all three sites benefit from the same logic.
+- **`--taxon fungal` now defaults to `fungi_odb10`.** The previous default
+  (`ascomycota_odb10`) is a sub-lineage; for a generic "fungal" choice
+  TACO now picks the broad `fungi_odb10` lineage, matching the BUSCO
+  recommendation and what the reference Venturiaceae paper used. Pass
+  `--busco ascomycota_odb10` (or any other lineage) to override.
+
+### Step 0 input QC: coverage estimator was always wrong
+
+- **Bug fix: `step_00_input_qc` always reported the sample size as the
+  total.** The estimator computed
+  `bytes_per_read = fq_size / read_count; est_total_reads = fq_size / bytes_per_read`
+  which is algebraically `read_count` — the per-read byte ratio used
+  the *full* file size on both sides of the division. For a 12.57 GB ONT
+  FASTQ the estimator reported ~100k reads / 459 Mb / 11.5× instead of
+  the actual ~1.36M reads / 6.2 Gb / 155×. The estimator now (a) prefers
+  `seqkit stats -T` for an exact count when `seqkit` is on PATH, and
+  (b) falls back to a sampling estimator that tracks bytes consumed from
+  the sample (or, for `.gz` inputs, the underlying compressed file's
+  position). Verified on synthetic data: extrapolation is within ±0.5%
+  on uncompressed and gzipped inputs.
+- **Missing `gzip` import added** to `taco/steps.py` — the previous code
+  referenced `gzip.open` without importing the module, which would have
+  crashed on a `.fastq.gz` input.
+
+---
+
 ## [1.3.3] — 2026-04-30
 
 ### Coverage-guided partial T2T replacement and upstream-aligned purge_dups

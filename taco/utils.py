@@ -7,12 +7,35 @@ from collections import defaultdict
 
 
 # Canonical assembler list — all downstream code should import this instead
-# of hardcoding assembler names.  "reference" is included for optional
-# user-provided reference assembly comparison.
+# of hardcoding assembler names.
+#
+# "reference" and "compare" are not assemblers in the usual sense; they are
+# user-supplied FASTAs (via --reference and --compare) that participate in
+# the QC comparison tables (BUSCO / Telomere / QUAST / Merqury) but must
+# NOT participate in backbone selection, telomere-pool quickmerge, polish,
+# purge_dups, or any decision that mutates the final assembly.  Code paths
+# that iterate this list for *selection* purposes should filter against
+# EXCLUDED_FROM_BACKBONE.
 ALL_ASSEMBLERS = [
-    "canu", "reference", "flye", "ipa", "nextDenovo",
+    "canu", "reference", "compare", "flye", "ipa", "nextDenovo",
     "peregrine", "hifiasm", "lja", "mbg", "raven",
 ]
+
+# --compare is the only fully passive entry: it appears in QC tables and
+# the contig-to-contig report (step 14C) but never participates in backbone
+# selection, quickmerge, polish, purge_dups, or telomere-pool operations.
+#
+# --reference is a *full participant* — it can contribute T2T contigs to
+# the all-vs-all quickmerge pool, appears in chimera-detection alignments,
+# and is treated like any other assembler row when scoring.  Pass --choose
+# reference if you explicitly want the reference selected as the backbone.
+EXCLUDED_FROM_REFINEMENT = frozenset({"compare"})
+
+# Backwards-compat alias: existing imports of ``EXCLUDED_FROM_BACKBONE``
+# get the same set as ``EXCLUDED_FROM_REFINEMENT`` so previous behaviour
+# of excluding "compare" from selection / merging is preserved while
+# "reference" is no longer filtered out.
+EXCLUDED_FROM_BACKBONE = EXCLUDED_FROM_REFINEMENT
 
 ASSEMBLER_PLATFORMS = {
     "canu": {"pacbio-hifi": "-pacbio-hifi", "nanopore": "-nanopore", "pacbio": "-pacbio"},

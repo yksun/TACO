@@ -42,7 +42,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.3.3"
+    PIPELINE_NAME = "TACO-1.3.4"
 
     def __init__(self, args):
         # Core parameters
@@ -53,6 +53,12 @@ class PipelineRunner:
         self.taxon = getattr(args, 'taxon', 'other')
         self.platform = args.platform
         self.reference_fasta = args.reference
+        # Compare-only FASTA — passive QC + contig-vs-final report.  Never
+        # used for backbone selection, quickmerge, polish, or refinement.
+        self.compare_fasta = getattr(args, 'compare', None)
+        # User-supplied final assembly to use in steps 13/14 in place of
+        # assemblies/final.merged.fasta.  Used by --final-fa.
+        self.final_fa_override = getattr(args, 'final_fa', None)
         self.steps = args.steps
         self.assembly_only = args.assembly_only
         self.benchmark = getattr(args, 'benchmark', False)
@@ -661,13 +667,56 @@ class PipelineRunner:
         return False
 
     def restore_resume_inputs_for_step(self, step):
-        """Restore inputs moved by older cleanup runs before a resumed step."""
-        if step in (12, 14):
+        """Restore inputs moved by older cleanup runs before a resumed step.
+
+        After step 14 cleanup, raw assembler dirs (e.g. ``hicanu``) move
+        into ``temp/assemblers/``, normalized FASTAs persist in
+        ``assemblies/``, stable CSVs are copied into ``final_results/``,
+        and the telomere pool products move into ``telomere_pool/``.
+        This helper restores whichever inputs the resumed step needs from
+        those structured locations so steps 8–14 can be re-run without
+        rebuilding the upstream stages.
+        """
+        # ---- Universal: assemblies/*.result.fasta should be available
+        # for any QC / refinement step.  Restore from temp/assemblers/ if
+        # cleanup has already moved the raw assembler directories.
+        if step in (8, 9, 10, 11, 12, 13, 14):
+            from taco.utils import ALL_ASSEMBLERS
+            assembler_paths = {
+                "canu": ["temp/assemblers/hicanu/canu.contigs.fasta",
+                         "hicanu/canu.contigs.fasta"],
+                "nextDenovo": ["temp/assemblers/NextDenovo/03.ctg_graph/nd.asm.fasta",
+                               "NextDenovo/03.ctg_graph/nd.asm.fasta"],
+                "peregrine": ["temp/assemblers/peregrine-2021/asm_ctgs_m_p.fa",
+                              "peregrine-2021/asm_ctgs_m_p.fa"],
+                "ipa": ["temp/assemblers/ipa/assembly-results/final.p_ctg.fasta",
+                        "ipa/assembly-results/final.p_ctg.fasta"],
+                "flye": ["temp/assemblers/flye/assembly.fasta",
+                         "flye/assembly.fasta"],
+                "hifiasm": ["temp/assemblers/hifiasm/hifiasm.fasta",
+                            "hifiasm/hifiasm.fasta"],
+                "lja": ["temp/assemblers/lja_out/assembly.fasta",
+                        "lja_out/assembly.fasta"],
+                "mbg": ["temp/assemblers/mbg_out/mbg.fasta",
+                        "mbg_out/mbg.fasta"],
+                "raven": ["temp/assemblers/raven_out/raven.fasta",
+                          "raven_out/raven.fasta"],
+            }
+            for name, candidates in assembler_paths.items():
+                dst = os.path.join("assemblies", f"{name}.result.fasta")
+                # Don't overwrite a normalized result file if it's already
+                # there; only restore when missing.
+                self._copy_resume_input(dst, candidates)
+
+        # ---- assembly_info.csv (used in steps 11/12/13/14)
+        if step in (11, 12, 13, 14):
             self._copy_resume_input(
                 "assemblies/assembly_info.csv",
                 ["final_results/assembly_info.csv",
                  "final_results/assembly_only_result.csv"],
             )
+
+        # ---- per-assembly metric CSVs needed for assembly-only summary
         if step == 14 and self.assembly_only:
             for metric_csv in [
                 "assembly.busco.csv",
@@ -679,6 +728,8 @@ class PipelineRunner:
                     os.path.join("assemblies", metric_csv),
                     [os.path.join("final_results", metric_csv)],
                 )
+
+        # ---- merged metric CSVs needed for the full final report
         if step == 14 and not self.assembly_only:
             for metric_csv in [
                 "merged.busco.csv",
@@ -690,6 +741,19 @@ class PipelineRunner:
                     os.path.join("assemblies", metric_csv),
                     [os.path.join("final_results", metric_csv)],
                 )
+
+        # ---- selection / decision artefacts (step 12 reads these)
+        if step in (11, 12, 13, 14):
+            self._copy_resume_input(
+                "assemblies/selection_decision.txt",
+                ["final_results/selection_decision.txt"],
+            )
+            self._copy_resume_input(
+                "assemblies/selection_debug.tsv",
+                ["final_results/selection_debug.tsv"],
+            )
+
+        # ---- telomere-pool products (step 12 input)
         if step == 12:
             self._copy_resume_input(
                 "pool_contig_provenance.tsv",
@@ -705,12 +769,44 @@ class PipelineRunner:
                 ["telomere_pool/protected_telomere_mode.txt",
                  "final_results/protected_telomere_mode.txt"],
             )
+            for fname in ["t2t.fasta", "single_tel.fasta",
+                          "telomere_supported.fasta",
+                          "allmerged_telo_sort.fasta",
+                          "t2t.list", "single_tel.list",
+                          "telomere_supported.list",
+                          "telomere_cluster_summary.tsv",
+                          "t2t_cluster_summary.tsv",
+                          "telomere_support_summary.csv"]:
+                self._copy_resume_input(
+                    fname,
+                    [os.path.join("telomere_pool", fname),
+                     os.path.join("final_results", fname)],
+                )
+
+        # ---- final.merged.fasta (steps 13/14)
         if step == 13 or (step == 14 and not self.assembly_only):
-            self._copy_resume_input(
-                "assemblies/final.merged.fasta",
-                ["final_results/final.merged.fasta",
-                 "final_results/final_assembly.fasta"],
-            )
+            override = getattr(self, "final_fa_override", None)
+            dst = "assemblies/final.merged.fasta"
+            if override:
+                # --final-fa is authoritative: copy it in even if a stale
+                # final.merged.fasta exists in this working directory.
+                if os.path.isfile(override):
+                    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+                    if os.path.realpath(override) != os.path.realpath(dst) \
+                            if os.path.exists(dst) else True:
+                        shutil.copy2(override, dst)
+                        self.log_warn(
+                            f"--final-fa: copied {override} -> {dst}")
+                else:
+                    self.log_error(
+                        f"--final-fa points to a missing file: {override}")
+                    sys.exit(1)
+            else:
+                self._copy_resume_input(
+                    dst,
+                    ["final_results/final.merged.fasta",
+                     "final_results/final_assembly.fasta"],
+                )
 
     def warn_missing_step_inputs(self, step):
         """Warn clearly when a selected/resumed step lacks upstream files."""
@@ -910,6 +1006,39 @@ class PipelineRunner:
             self.log_error(f"Reference FASTA not found or empty: {src}")
             sys.exit(1)
         self.reference_fasta = src
+
+    def resolve_compare_fasta(self):
+        """Download / decompress --compare if needed; update self.compare_fasta.
+
+        Mirrors resolve_reference_fasta but for --compare.  Compare-only
+        assemblies receive QC and a contig-to-contig comparison report
+        against TACO's final.merged.fasta but never participate in
+        backbone selection or refinement.
+        """
+        if not self.compare_fasta:
+            return
+        src = self.compare_fasta
+        if src.startswith("http://") or src.startswith("https://") or src.startswith("ftp://"):
+            self.log_info(f"Downloading compare FASTA: {src}")
+            local = os.path.join(self.working_dir, "compare_input.fasta")
+            if shutil.which("curl"):
+                self.run_cmd(f'curl -L "{src}" -o "{local}"')
+            elif shutil.which("wget"):
+                self.run_cmd(f'wget -O "{local}" "{src}"')
+            else:
+                self.log_error("Neither curl nor wget found for downloading")
+                sys.exit(1)
+            src = local
+        if src.endswith(".gz"):
+            self.log_info(f"Decompressing: {src}")
+            out = src[:-3]
+            with gzip.open(src, "rb") as fi, open(out, "wb") as fo:
+                shutil.copyfileobj(fi, fo)
+            src = out
+        if not os.path.isfile(src) or os.path.getsize(src) == 0:
+            self.log_error(f"Compare FASTA not found or empty: {src}")
+            sys.exit(1)
+        self.compare_fasta = src
 
     # ------------------------------------------------------------------ #
     # NextDenovo configuration
@@ -1438,6 +1567,7 @@ nextgraph_options = -a 1
 
         self.check_requirements()
         self.resolve_reference_fasta()
+        self.resolve_compare_fasta()
         self.write_versions()
         self.write_run_metadata()
         self.write_benchmark_tool_versions()
