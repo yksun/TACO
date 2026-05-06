@@ -268,6 +268,8 @@ TACO exposes 15 public steps by number: **0-14**. Step 14 has two internal repor
 | 14 / 14A | Final comparison report + cleanup into `final_results/` (full mode) | Report |
 | 14 / 14B | Assembly-only comparison summary + cleanup (only with `--assembly-only`) | Report |
 
+<img align="center" src="/docs/steps.png">
+
 ### Step 0 — Input QC
 
 Step 0 runs automatically before assembly. It validates that the FASTQ file exists and is non-empty, parses the genome size, estimates total read bases and coverage by sampling the first 100K reads, and warns if coverage is below recommended thresholds (HiFi: 25×, ONT: 40×, CLR: 50×). It also logs which assemblers are compatible with the selected platform and confirms the BUSCO lineage setting. Step 0 runs in both full and assembly-only modes.
