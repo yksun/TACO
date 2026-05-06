@@ -37,6 +37,30 @@ EXCLUDED_FROM_REFINEMENT = frozenset({"compare"})
 # "reference" is no longer filtered out.
 EXCLUDED_FROM_BACKBONE = EXCLUDED_FROM_REFINEMENT
 
+
+def active_assemblers(assemblies_dir="assemblies"):
+    """Return the canonical assembler order, filtered to only those that
+    have a non-empty ``<assemblies_dir>/<name>.result.fasta``.
+
+    This is what every CSV builder should use for its column header so
+    that empty rows for absent inputs (e.g. ``reference`` when ``--reference``
+    was not passed, ``compare`` when ``--compare`` was not passed,
+    ``ipa`` / ``peregrine`` on incompatible platforms) are simply omitted
+    instead of appearing as columns of zeros and blanks.
+    """
+    out = []
+    for name in ALL_ASSEMBLERS:
+        p = os.path.join(assemblies_dir, f"{name}.result.fasta")
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                out.append(name)
+        except OSError:
+            continue
+    # If nothing matched (very early steps, before normalize), fall back to
+    # the canonical order so callers building zero/empty CSVs still produce
+    # a valid header.
+    return out or list(ALL_ASSEMBLERS)
+
 ASSEMBLER_PLATFORMS = {
     "canu": {"pacbio-hifi": "-pacbio-hifi", "nanopore": "-nanopore", "pacbio": "-pacbio"},
     "nextDenovo": {"pacbio-hifi": "hifi", "nanopore": "ont", "pacbio": "clr"},

@@ -23,7 +23,7 @@ from collections import defaultdict
 
 from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
-from taco.utils import ALL_ASSEMBLERS, EXCLUDED_FROM_BACKBONE
+from taco.utils import ALL_ASSEMBLERS, EXCLUDED_FROM_BACKBONE, active_assemblers
 
 
 def _parse_genome_size(size_str):
@@ -282,7 +282,10 @@ def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None
 def _build_busco_csv(runner):
     """Build assembly.busco.csv from BUSCO results."""
     out_csv = os.path.join("assemblies", "assembly.busco.csv")
-    desired = ALL_ASSEMBLERS
+    # Only include columns for assemblers / user inputs that actually
+    # produced an assembly file; this drops the empty 'reference' /
+    # 'compare' / incompatible-assembler rows from the CSV header.
+    desired = active_assemblers()
 
     def newest(paths):
         return max(paths, key=os.path.getmtime) if paths else None
@@ -400,7 +403,7 @@ def _build_busco_csv(runner):
 def _write_zero_busco_csv(out_csv=os.path.join("assemblies", "assembly.busco.csv")):
     """Write a BUSCO metric matrix with zeros when BUSCO is intentionally skipped."""
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    desired = ALL_ASSEMBLERS
+    desired = active_assemblers()
     rows = [
         ["Metric"] + desired,
         ["BUSCO C (%)"] + ["0"] * len(desired),
@@ -420,7 +423,7 @@ def _build_quast_csv(runner):
     out = os.path.join("assemblies", "assembly.quast.csv")
     treport = os.path.join("quast_out", "transposed_report.tsv")
     report = os.path.join("quast_out", "report.tsv")
-    desired = ALL_ASSEMBLERS
+    desired = active_assemblers()
 
     def norm(s):
         return (s or "").lower().replace("-", "").replace("_", "").replace(".result", "").replace(".fasta", "").strip()
@@ -521,7 +524,7 @@ def _build_assembly_info(runner):
     """Build assembly_info.csv from BUSCO, QUAST, telomere, and Merqury metrics."""
     os.makedirs("assemblies", exist_ok=True)
     info_csv = "assemblies/assembly_info.csv"
-    desired_header = "Metric," + ",".join(ALL_ASSEMBLERS)
+    desired_header = "Metric," + ",".join(active_assemblers())
 
     with open(info_csv, "w") as f:
         f.write(desired_header + "\n")
@@ -1529,7 +1532,10 @@ def step_09_telomere(runner):
         runner.log_error("No assemblies found in ./assemblies. Run step 10 first or supply --reference.")
         raise RuntimeError("No assemblies found")
 
-    cols = ALL_ASSEMBLERS
+    # Only include assemblers / user inputs that actually have a result
+    # FASTA in this run (drops the empty 'reference' column when no
+    # --reference was given, etc.).
+    cols = active_assemblers()
     tdouble = {}
     tsingle = {}
     tsupported = {}
@@ -7233,6 +7239,95 @@ def _compare_vs_final_report(runner):
         runner.log(f"Wrote {quast_dir}/report.tsv")
     else:
         runner.log_info("Compare report: QUAST not found; skipping reference-based metrics.")
+
+    # ---- Per-contig telomere details for the compare assembly ----
+    # Step 9 already wrote per-contig telomere classifications to
+    # assemblies/compare.telomere_end_scores.tsv (and the FASTA-of-telomere-
+    # bearing contigs to assemblies/compare.telo.fasta).  Surface those in
+    # the compare report so users can see *why* particular contigs ended up
+    # in each tier — including when "strict_t2t = 0" is real biology
+    # (telomeres trimmed during assembly) versus a parameter issue.
+    telo_src = os.path.join("assemblies", "compare.telomere_end_scores.tsv")
+    if os.path.isfile(telo_src):
+        telo_dst = os.path.join(out_dir, "compare_telomere_end_scores.tsv")
+        try:
+            shutil.copy2(telo_src, telo_dst)
+            runner.log(f"Wrote {telo_dst}")
+        except Exception as e:
+            runner.log_warn(f"Could not copy {telo_src} -> {telo_dst}: {e}")
+
+        # Sanity-check the per-contig table and emit a small README that
+        # explains the thresholds and how to widen them if the user
+        # suspects telomeres slightly inside the contig ends.
+        n_total = 0
+        n_strict = 0
+        n_single = 0
+        n_supported = 0
+        n_none = 0
+        try:
+            with open(telo_src) as f:
+                rdr = csv.DictReader(f, delimiter="\t")
+                for row in rdr:
+                    n_total += 1
+                    tier = (row.get("tier") or "").strip()
+                    if tier == "strict_t2t":
+                        n_strict += 1
+                    elif tier == "single_tel_strong":
+                        n_single += 1
+                    elif tier == "telomere_supported":
+                        n_supported += 1
+                    else:
+                        n_none += 1
+        except Exception as e:
+            runner.log_warn(f"Could not parse {telo_src}: {e}")
+
+        readme = os.path.join(out_dir, "TELOMERE_NOTES.txt")
+        try:
+            sw = getattr(runner, "telo_score_window", 500)
+            ew = getattr(runner, "telo_end_window", 5000)
+            with open(readme, "w") as f:
+                f.write(
+                    "Compare-assembly telomere classification summary\n"
+                    "================================================\n\n"
+                    f"Contigs total       : {n_total}\n"
+                    f"  strict_t2t        : {n_strict}\n"
+                    f"  single_tel_strong : {n_single}\n"
+                    f"  telomere_supported: {n_supported}\n"
+                    f"  none              : {n_none}\n\n"
+                    "Detection settings used for this run\n"
+                    "------------------------------------\n"
+                    f"  score_window     : {sw} bp  (the leading/trailing window\n"
+                    "                     scored against the telomere motifs;\n"
+                    "                     fungal default is 300 bp).\n"
+                    f"  end_window       : {ew} bp  (used for de novo motif\n"
+                    "                     discovery only).\n"
+                    "  strong_threshold : 0.25  (raw_score for strict_t2t /\n"
+                    "                     single_tel_strong).\n"
+                    "  weak_threshold   : 0.08  (raw_score for telomere_supported).\n\n"
+                    "Why might strict_t2t be 0 for this assembly?\n"
+                    "--------------------------------------------\n"
+                    " - The published assembly may have trimmed or re-oriented\n"
+                    "   contig ends so telomere repeats sit further than\n"
+                    "   `score_window` bp from the very end. Re-run the\n"
+                    "   pipeline with `--telo-score-window 1000` (or larger)\n"
+                    "   to widen the scoring window.\n"
+                    " - The strict_t2t threshold requires *both* ends to score\n"
+                    "   >= 0.25. Inspect `compare_telomere_end_scores.tsv` for\n"
+                    "   per-contig left_score and right_score values and check\n"
+                    "   whether one end falls just below 0.25.\n"
+                    " - Some assembler+polish combinations (e.g. NextDenovo +\n"
+                    "   NextPolish) preserve telomere repeats but leave a\n"
+                    "   short subtelomeric padding before them; the canonical\n"
+                    "   density-based score then under-counts strict_t2t even\n"
+                    "   though the chromosomes are biologically T2T.\n"
+                )
+            runner.log(f"Wrote {readme}")
+        except Exception as e:
+            runner.log_warn(f"Could not write {readme}: {e}")
+    else:
+        runner.log_info(
+            "Compare report: per-contig telomere TSV not found "
+            f"({telo_src}); skipping telomere detail copy.")
 
     # ---- Optional dnadiff (MUMmer) for SNP/indel summary ----
     if shutil.which("dnadiff"):
