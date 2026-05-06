@@ -7059,6 +7059,57 @@ def _final_merqury_qc(runner):
                               "final assembly")
 
 
+def _read_telomere_status(tsv_path, weak_thr=0.08, strong_thr=0.25):
+    """Parse a ``*.telomere_end_scores.tsv`` file written by step 9 / 13.
+
+    Returns a dict keyed by contig name with per-contig telomere flags::
+
+        {
+          "contig_1": {
+            "length": 3501334, "left_score": 0.4847, "right_score": 0.0,
+            "tier": "single_tel_strong",
+            "left_telo": True, "right_telo": False,
+            "left_strong": True, "right_strong": False,
+          },
+          ...
+        }
+
+    ``left_telo``/``right_telo`` use the weak threshold (0.08) to flag any
+    detectable telomere signal; ``left_strong``/``right_strong`` use the
+    strong threshold (0.25) used by the strict_t2t classifier.  Missing or
+    unreadable files return an empty dict — callers should treat that as
+    "no information" and skip telomere annotation gracefully.
+    """
+    out = {}
+    if not tsv_path or not os.path.isfile(tsv_path):
+        return out
+    try:
+        with open(tsv_path) as f:
+            rdr = csv.DictReader(f, delimiter="\t")
+            for row in rdr:
+                try:
+                    name = row.get("contig") or row.get("Contig")
+                    if not name:
+                        continue
+                    ls = float(row.get("left_score", 0) or 0)
+                    rs = float(row.get("right_score", 0) or 0)
+                    out[name] = {
+                        "length": int(float(row.get("length", 0) or 0)),
+                        "left_score": ls,
+                        "right_score": rs,
+                        "tier": (row.get("tier") or "none").strip(),
+                        "left_telo": ls >= weak_thr,
+                        "right_telo": rs >= weak_thr,
+                        "left_strong": ls >= strong_thr,
+                        "right_strong": rs >= strong_thr,
+                    }
+                except (KeyError, ValueError):
+                    continue
+    except OSError:
+        return {}
+    return out
+
+
 def _compare_vs_final_report(runner):
     """Build a contig-to-contig comparison report between --compare and final.
 
@@ -7100,6 +7151,29 @@ def _compare_vs_final_report(runner):
     os.makedirs(out_dir, exist_ok=True)
     runner.log("Final QC - Compare-vs-final contig-to-contig report")
 
+    # Telomere status for both assemblies (step 9 wrote the per-contig TSVs
+    # as part of step 10's QC pass).  We try several known names so the
+    # report works whether step 9 ran on the merged assembly directly
+    # (final.telomere_end_scores.tsv) or only on the per-assembler outputs.
+    final_telo = {}
+    for cand in ("assemblies/final.telomere_end_scores.tsv",
+                 "assemblies/final.merged.telomere_end_scores.tsv",
+                 "final_results/final.telomere_end_scores.tsv"):
+        m = _read_telomere_status(cand)
+        if m:
+            final_telo = m
+            break
+    compare_telo = _read_telomere_status(
+        "assemblies/compare.telomere_end_scores.tsv")
+    if final_telo:
+        runner.log_info(
+            f"Compare report: loaded telomere status for {len(final_telo)} "
+            "final contigs")
+    if compare_telo:
+        runner.log_info(
+            f"Compare report: loaded telomere status for {len(compare_telo)} "
+            "compare contigs")
+
     paf_path = os.path.join(out_dir, "compare_vs_final.paf")
     cmd = (f"minimap2 -cx asm5 -t {runner.threads} --secondary=no "
            f"{final_fa} {compare_fa} > {paf_path}")
@@ -7110,17 +7184,34 @@ def _compare_vs_final_report(runner):
             "Compare report: minimap2 produced no alignments.")
         return
 
-    # ---- Parse PAF and aggregate per-query best hit ----
+    # ---- Parse PAF and aggregate per-query, per-(query, target) ----
     # PAF columns:
     #   0  qname    1  qlen    2  qstart  3  qend   4  strand
     #   5  tname    6  tlen    7  tstart  8  tend   9  matches
     #  10  alen    11  mapq   ...        + tags (NM:i:, dv:f:, cg:Z:, ...)
+    #
+    # We aggregate at TWO levels:
+    #   per_query[qname]                — overall stats for the compare contig
+    #   per_pair[(qname, tname)]        — stats for ONE compare→final mapping
+    # The per-pair table is what surfaces split mappings (e.g. a single
+    # compare contig that covers two final contigs because the published
+    # assembly chimerically joined two real chromosomes).
     per_query = defaultdict(lambda: {
-        "qlen": 0, "tname": None, "tlen": 0,
-        "alen_sum": 0, "match_sum": 0,
-        "qcov_starts": [], "tcov_starts": [],
+        "qlen": 0,
+        "qcov_starts": [],     # all query-coord intervals for total coverage
+        "alen_sum": 0,
+        "match_sum": 0,
+        "targets": defaultdict(lambda: {
+            "alen_sum": 0,
+            "match_sum": 0,
+            "tlen": 0,
+            "qcov_starts": [],  # query-coord intervals that go to THIS target
+            "tcov_starts": [],  # target-coord intervals
+            "strand_pos": 0,    # alen on '+' strand
+            "strand_neg": 0,    # alen on '-' strand
+        }),
     })
-    target_intervals = defaultdict(list)  # tname -> [(tstart, tend)]
+    target_intervals = defaultdict(list)  # tname -> [(tstart, tend)] (any query)
     target_lengths = {}
     with open(paf_path) as f:
         for line in f:
@@ -7133,19 +7224,23 @@ def _compare_vs_final_report(runner):
                 int(cols[8]), int(cols[9]), int(cols[10]))
             target_lengths[tname] = tlen
             target_intervals[tname].append((ts, te))
+
             slot = per_query[qname]
             slot["qlen"] = qlen
             slot["alen_sum"] += alen
             slot["match_sum"] += matches
             slot["qcov_starts"].append((qs, qe))
-            # Pick the target with the largest aligned span as the 1-to-1 partner
-            best_for_t = slot.setdefault("_best", {})
-            cur = best_for_t.get(tname, 0)
-            best_for_t[tname] = cur + alen
-            slot["tlen"] = max(slot["tlen"], tlen)
-            if (slot["tname"] is None
-                    or best_for_t[tname] > best_for_t.get(slot["tname"], 0)):
-                slot["tname"] = tname
+
+            tslot = slot["targets"][tname]
+            tslot["alen_sum"] += alen
+            tslot["match_sum"] += matches
+            tslot["tlen"] = tlen
+            tslot["qcov_starts"].append((qs, qe))
+            tslot["tcov_starts"].append((ts, te))
+            if strand == "-":
+                tslot["strand_neg"] += alen
+            else:
+                tslot["strand_pos"] += alen
 
     def _merge_intervals(intervals):
         if not intervals:
@@ -7162,35 +7257,350 @@ def _compare_vs_final_report(runner):
     def _covered_length(intervals):
         return sum(e - s for s, e in _merge_intervals(intervals))
 
+    # A target is considered a "significant" partner of a compare contig
+    # when its aligned bases exceed the smaller of:
+    #   (a) SECONDARY_FRAC * compare_len  (default 20 %)
+    #   (b) SECONDARY_BP   (default 100 kb)
+    # so that on small genomes a single 50 kb partial hit doesn't surface
+    # as a "split" but on a 6 Mb compare contig two partners that each
+    # consume ~3 Mb both surface.
+    SECONDARY_FRAC = 0.20
+    SECONDARY_BP = 100_000
+
+    # Distance (bp) within which an alignment block is considered to
+    # "touch" a contig boundary.  Matches the default telomere end window
+    # so the boundary call lines up with where telomere repeats are
+    # detected.
+    BOUNDARY_TOL = 5000
+
+    def _telo_str(present):
+        if present is None:
+            return "?"
+        return "yes" if present else "no"
+
     contig_rows = []
+    pair_rows = []
+    split_rows = []   # only compare contigs with > 1 significant target
     for qname, info in sorted(per_query.items()):
+        qlen = info["qlen"]
         merged_q = _merge_intervals(info["qcov_starts"])
-        qcov = _covered_length(merged_q) / info["qlen"] if info["qlen"] else 0.0
+        qcov = _covered_length(merged_q) / qlen if qlen else 0.0
         identity = (info["match_sum"] / info["alen_sum"]) if info["alen_sum"] else 0.0
-        tname = info["tname"]
-        tlen = target_lengths.get(tname, 0)
+
+        # Per-target ranking + significance test
+        ranked = []
+        for tname, t in info["targets"].items():
+            t_qcov = _covered_length(t["qcov_starts"]) / qlen if qlen else 0.0
+            t_ident = (t["match_sum"] / t["alen_sum"]) if t["alen_sum"] else 0.0
+            # Boundary touches — does any alignment block of this pair
+            # land within BOUNDARY_TOL of a contig start/end?
+            min_qs = min((qs for qs, _qe in t["qcov_starts"]), default=qlen)
+            max_qe = max((qe for _qs, qe in t["qcov_starts"]), default=0)
+            min_ts = min((ts for ts, _te in t["tcov_starts"]), default=t["tlen"])
+            max_te = max((te for _ts, te in t["tcov_starts"]), default=0)
+            touches_q_left  = min_qs <= BOUNDARY_TOL
+            touches_q_right = (qlen - max_qe) <= BOUNDARY_TOL
+            touches_t_left  = min_ts <= BOUNDARY_TOL
+            touches_t_right = (t["tlen"] - max_te) <= BOUNDARY_TOL
+            ranked.append({
+                "tname": tname,
+                "tlen": t["tlen"],
+                "alen": t["alen_sum"],
+                "matches": t["match_sum"],
+                "q_cov_frac": t_qcov,
+                "identity": t_ident,
+                "strand_pos": t["strand_pos"],
+                "strand_neg": t["strand_neg"],
+                "qcov_starts": t["qcov_starts"],
+                "tcov_starts": t["tcov_starts"],
+                "touches_q_left": touches_q_left,
+                "touches_q_right": touches_q_right,
+                "touches_t_left": touches_t_left,
+                "touches_t_right": touches_t_right,
+            })
+        ranked.sort(key=lambda r: -r["alen"])
+
+        # Significance gate
+        thresh = max(1, min(SECONDARY_BP, int(SECONDARY_FRAC * qlen) or 1))
+        significant = [r for r in ranked if r["alen"] >= thresh]
+        # If nothing passed (very small alignments only), keep the single
+        # best target so the row is still useful.
+        if not significant and ranked:
+            significant = ranked[:1]
+
+        best = significant[0] if significant else None
+        secondary = significant[1:]
+        relationship = "1-to-1" if len(significant) <= 1 else f"1-to-{len(significant)} (split)"
+
+        secondary_targets_str = ";".join(
+            f"{r['tname']}:{r['alen']}bp:{round(100.0*r['q_cov_frac'],2)}%"
+            for r in secondary
+        )
+
+        # Telomere status for this compare contig (overall, both ends)
+        c_telo = compare_telo.get(qname, {})
+        c_left_telo  = c_telo.get("left_telo")  if c_telo else None
+        c_right_telo = c_telo.get("right_telo") if c_telo else None
+        c_tier = c_telo.get("tier", "") if c_telo else ""
+
+        # Telomere status for the best target (per-end)
+        bt = best["tname"] if best else ""
+        bt_telo = final_telo.get(bt, {}) if bt else {}
+        bt_left_telo  = bt_telo.get("left_telo")  if bt_telo else None
+        bt_right_telo = bt_telo.get("right_telo") if bt_telo else None
+
         contig_rows.append({
             "compare_contig": qname,
-            "compare_len": info["qlen"],
-            "best_target": tname or "",
-            "target_len": tlen,
+            "compare_len": qlen,
+            "best_target": best["tname"] if best else "",
+            "target_len": best["tlen"] if best else 0,
             "aligned_bases": info["alen_sum"],
             "matched_bases": info["match_sum"],
             "identity_pct": round(100.0 * identity, 3),
             "compare_coverage_pct": round(100.0 * qcov, 3),
+            "secondary_targets": secondary_targets_str,
+            "n_significant_targets": len(significant),
+            "relationship": relationship,
+            "compare_left_telo": _telo_str(c_left_telo),
+            "compare_right_telo": _telo_str(c_right_telo),
+            "compare_telo_tier": c_tier,
+            "best_target_left_telo": _telo_str(bt_left_telo),
+            "best_target_right_telo": _telo_str(bt_right_telo),
         })
+
+        # Per-pair rows — one per (compare_contig, final_contig) above the
+        # significance threshold.  Each row also reports which contig
+        # boundaries the pair touches and the telomere status at every
+        # touched end.  This makes split-mapping diagnosis evidence-based:
+        # for the JALGOQ010000001.1 → contig_1 + contig_2 example, the
+        # pair rows show telomere status at all four touched boundaries
+        # so you can read the chimera signature directly.
+        for r in significant:
+            if r["strand_pos"] >= r["strand_neg"]:
+                strand_label = "+"
+            else:
+                strand_label = "-"
+            merged_qpair = _merge_intervals(r["qcov_starts"])
+            merged_tpair = _merge_intervals(r["tcov_starts"])
+            q_cov_bp = _covered_length(merged_qpair)
+            t_cov_bp = _covered_length(merged_tpair)
+
+            ttelo = final_telo.get(r["tname"], {}) if final_telo else {}
+            f_left_telo  = ttelo.get("left_telo")  if ttelo else None
+            f_right_telo = ttelo.get("right_telo") if ttelo else None
+
+            # Map boundary touches to telomere presence.  "touched_*_telo"
+            # = telomere status at a boundary that this pair actually
+            # touched (within BOUNDARY_TOL).  When the pair doesn't reach
+            # a boundary we report "n/a" so users don't conflate "no
+            # telomere" with "not tested at this boundary".
+            def _bt_str(touches, telo_present):
+                if not touches:
+                    return "n/a"
+                return _telo_str(telo_present)
+
+            pair_rows.append({
+                "compare_contig": qname,
+                "compare_len": qlen,
+                "final_contig": r["tname"],
+                "final_len": r["tlen"],
+                "aligned_bases": r["alen"],
+                "identity_pct": round(100.0 * r["identity"], 3),
+                "compare_covered_bp": q_cov_bp,
+                "compare_coverage_pct": round(100.0 * r["q_cov_frac"], 3),
+                "final_covered_bp": t_cov_bp,
+                "final_coverage_pct": round(
+                    100.0 * t_cov_bp / r["tlen"] if r["tlen"] else 0.0, 3),
+                "strand": strand_label,
+                "touches_compare_left":  "yes" if r["touches_q_left"]  else "no",
+                "touches_compare_right": "yes" if r["touches_q_right"] else "no",
+                "touches_final_left":    "yes" if r["touches_t_left"]  else "no",
+                "touches_final_right":   "yes" if r["touches_t_right"] else "no",
+                "compare_left_telo_at_pair":  _bt_str(r["touches_q_left"],  c_left_telo),
+                "compare_right_telo_at_pair": _bt_str(r["touches_q_right"], c_right_telo),
+                "final_left_telo_at_pair":    _bt_str(r["touches_t_left"],  f_left_telo),
+                "final_right_telo_at_pair":   _bt_str(r["touches_t_right"], f_right_telo),
+            })
+
+        if len(significant) > 1:
+            # ---- Chimera-evidence summary --------------------------------
+            # We have telomere flags at the four "boundary points":
+            #   - compare's two outer ends (qname's left + right)
+            #   - each pair's "inner" end (the final-contig boundary that
+            #     is INSIDE the compare contig — i.e. NOT touching a
+            #     compare outer end)
+            # A real chromosome has telomeres at both outer ends.  A
+            # legitimate join of two complete chromosomes would have
+            # telomeres at all four boundary points.  A common chimera
+            # signature is "outer ends both telomeric, exactly one inner
+            # end telomeric" — chrA fully present, chrB joined as a
+            # fragment.
+            outer_left_present  = bool(c_left_telo)
+            outer_right_present = bool(c_right_telo)
+            inner_telo_per_pair = []
+            for r in significant:
+                tt = final_telo.get(r["tname"], {})
+                fl = tt.get("left_telo")
+                fr = tt.get("right_telo")
+
+                # Skip pairs that span the full compare contig (rare in
+                # 1-to-many splits, but possible for very small final
+                # contigs aligning across the whole compare).
+                if r["touches_q_left"] and r["touches_q_right"]:
+                    continue
+                # Skip pairs that don't touch either compare outer end —
+                # they sit purely in the middle, with no clear "inner"
+                # vs "outer" mapping.
+                if not (r["touches_q_left"] or r["touches_q_right"]):
+                    continue
+
+                on_compare_left = r["touches_q_left"]
+                pair_strand_pos = r["strand_pos"] >= r["strand_neg"]
+                # Strand convention for PAF:
+                #   strand=+: compare-left → final-left, compare-right → final-right
+                #   strand=-: compare-left → final-right, compare-right → final-left
+                # So the final-LEFT boundary is the "outer" end iff
+                # the pair sits on compare's LEFT and is + strand, OR
+                # the pair sits on compare's RIGHT and is - strand.
+                final_left_is_outer = (on_compare_left == pair_strand_pos)
+                # The "inner" end is whichever boundary is NOT the outer.
+                # We look up the contig-end telomere status directly from
+                # the telomere TSV — the pair doesn't have to physically
+                # reach the inner end (e.g. when the final contig has
+                # unique sequence past where compare ends, that gap is
+                # informative *and* the contig still has a known
+                # telomere status at that boundary).
+                if final_left_is_outer:
+                    inner_telo_per_pair.append((r["tname"], "right", fr))
+                else:
+                    inner_telo_per_pair.append((r["tname"], "left",  fl))
+            n_inner_with_telo = sum(
+                1 for _name, _side, telo in inner_telo_per_pair if telo)
+            n_inner_total = len(inner_telo_per_pair)
+
+            if outer_left_present and outer_right_present:
+                if n_inner_total == 0:
+                    chimera_evidence = (
+                        "compare has telomeres at both outer ends; "
+                        "no inner-end telomeres scored — full-coverage split"
+                    )
+                elif n_inner_with_telo == n_inner_total:
+                    chimera_evidence = (
+                        "compare has telomeres at both outer ends AND at "
+                        f"all {n_inner_total} inner-end boundaries — strong "
+                        "chimera signal: looks like full chromosomes joined "
+                        "via shared telomeric repeats"
+                    )
+                elif n_inner_with_telo > 0:
+                    chimera_evidence = (
+                        "compare has telomeres at both outer ends and at "
+                        f"{n_inner_with_telo}/{n_inner_total} inner-end "
+                        "boundaries — chimeric extension into a fragment "
+                        "(one joined chromosome is incomplete in compare)"
+                    )
+                else:
+                    chimera_evidence = (
+                        "compare has telomeres at both outer ends but no "
+                        "inner-end telomeres — final assembly likely split "
+                        "this region; consider whether the join is "
+                        "biologically real"
+                    )
+            elif outer_left_present or outer_right_present:
+                chimera_evidence = (
+                    "compare has telomere on only one outer end — split is "
+                    "likely real (compare is incomplete on the side without "
+                    "a telomere)"
+                )
+            else:
+                chimera_evidence = (
+                    "compare has no telomeres at outer ends — split "
+                    "interpretation requires manual inspection (could be "
+                    "internal contig fragment in compare)"
+                )
+
+            split_rows.append({
+                "compare_contig": qname,
+                "compare_len": qlen,
+                "n_targets": len(significant),
+                "targets": ", ".join(
+                    f"{r['tname']} ({r['alen']:,} bp / "
+                    f"{round(100.0*r['q_cov_frac'],1)}%)"
+                    for r in significant),
+                "compare_left_telo":  _telo_str(c_left_telo),
+                "compare_right_telo": _telo_str(c_right_telo),
+                "n_inner_boundaries_with_telo": f"{n_inner_with_telo}/{n_inner_total}",
+                "chimera_evidence": chimera_evidence,
+            })
 
     c2c_path = os.path.join(out_dir, "contig_to_contig.tsv")
     with open(c2c_path, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(["compare_contig", "compare_len", "best_target_contig",
                     "target_len", "aligned_bases", "matched_bases",
-                    "identity_pct", "compare_coverage_pct"])
+                    "identity_pct", "compare_coverage_pct",
+                    "n_significant_targets", "relationship",
+                    "secondary_targets",
+                    "compare_left_telo", "compare_right_telo",
+                    "compare_telo_tier",
+                    "best_target_left_telo", "best_target_right_telo"])
         for r in contig_rows:
             w.writerow([r["compare_contig"], r["compare_len"], r["best_target"],
                         r["target_len"], r["aligned_bases"], r["matched_bases"],
-                        r["identity_pct"], r["compare_coverage_pct"]])
+                        r["identity_pct"], r["compare_coverage_pct"],
+                        r["n_significant_targets"], r["relationship"],
+                        r["secondary_targets"],
+                        r["compare_left_telo"], r["compare_right_telo"],
+                        r["compare_telo_tier"],
+                        r["best_target_left_telo"], r["best_target_right_telo"]])
     runner.log(f"Wrote {c2c_path} ({len(contig_rows)} compare contigs)")
+
+    # Per-pair table — exposes EVERY significant compare→final mapping,
+    # including splits.  This is the file to inspect when one row in
+    # contig_to_contig.tsv shows aligned_bases > target_len, which is the
+    # tell-tale sign of a 1-to-many mapping.
+    pair_path = os.path.join(out_dir, "contig_to_contig_pairs.tsv")
+    with open(pair_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["compare_contig", "compare_len", "final_contig",
+                    "final_len", "aligned_bases", "identity_pct",
+                    "compare_covered_bp", "compare_coverage_pct",
+                    "final_covered_bp", "final_coverage_pct", "strand",
+                    "touches_compare_left", "touches_compare_right",
+                    "touches_final_left",   "touches_final_right",
+                    "compare_left_telo_at_pair",
+                    "compare_right_telo_at_pair",
+                    "final_left_telo_at_pair",
+                    "final_right_telo_at_pair"])
+        for r in pair_rows:
+            w.writerow([r["compare_contig"], r["compare_len"], r["final_contig"],
+                        r["final_len"], r["aligned_bases"], r["identity_pct"],
+                        r["compare_covered_bp"], r["compare_coverage_pct"],
+                        r["final_covered_bp"], r["final_coverage_pct"],
+                        r["strand"],
+                        r["touches_compare_left"], r["touches_compare_right"],
+                        r["touches_final_left"],   r["touches_final_right"],
+                        r["compare_left_telo_at_pair"],
+                        r["compare_right_telo_at_pair"],
+                        r["final_left_telo_at_pair"],
+                        r["final_right_telo_at_pair"]])
+    runner.log(f"Wrote {pair_path} ({len(pair_rows)} compare→final pairs)")
+
+    # Split mappings — compare contigs that map to >1 significant target.
+    # Each row here is strong evidence of a chimeric join in the compare
+    # assembly (or, less commonly, of a missed join in TACO's final).
+    split_path = os.path.join(out_dir, "split_mappings.tsv")
+    with open(split_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["compare_contig", "compare_len", "n_significant_targets",
+                    "targets", "compare_left_telo", "compare_right_telo",
+                    "n_inner_boundaries_with_telo", "chimera_evidence"])
+        for r in split_rows:
+            w.writerow([r["compare_contig"], r["compare_len"],
+                        r["n_targets"], r["targets"],
+                        r["compare_left_telo"], r["compare_right_telo"],
+                        r["n_inner_boundaries_with_telo"],
+                        r["chimera_evidence"]])
+    runner.log(f"Wrote {split_path} ({len(split_rows)} split mappings)")
 
     # ---- Unique contigs ------------------------------------------------
     # Read both FASTAs once so we know every contig that exists, not just
@@ -7257,32 +7667,47 @@ def _compare_vs_final_report(runner):
                 n_uniq_f += 1
     runner.log(f"Wrote {uniq_final_path} ({n_uniq_f} unique final contigs)")
 
-    # ---- Synteny blocks: aggregated 1-to-1 best mappings ---------------
-    # Useful as an at-a-glance synteny summary (which compare contig
-    # corresponds to which final contig).  Filtered to mappings with
-    # coverage >= 50 % so noise contigs don't pollute the table.
+    # ---- Synteny blocks: per-pair 1-to-1 / 1-to-many / many-to-1 ------
+    # Built from the per-pair table so a compare contig that splits across
+    # multiple final contigs (or vice versa) appears as multiple rows with
+    # the appropriate relationship label.
     synteny_path = os.path.join(out_dir, "synteny_blocks.tsv")
-    SYNTENY_MIN_COV = 50.0
+    SYNTENY_MIN_COV_PCT = 30.0  # per-pair compare coverage threshold
+
+    # How many significant targets does each compare contig have?
+    n_targets_per_query = {r["compare_contig"]: r["n_significant_targets"]
+                           for r in contig_rows}
+    # How many significant compare partners does each final contig have?
+    queries_per_target = defaultdict(set)
+    for r in pair_rows:
+        if r["compare_coverage_pct"] >= SYNTENY_MIN_COV_PCT:
+            queries_per_target[r["final_contig"]].add(r["compare_contig"])
+
     with open(synteny_path, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(["compare_contig", "final_contig",
                     "compare_len", "final_len",
                     "aligned_bases", "identity_pct",
-                    "compare_coverage_pct", "relationship"])
-        # Group compare contigs by their best target to detect splits/joins.
-        by_target = defaultdict(list)
-        for r in contig_rows:
-            if r["best_target"] and r["compare_coverage_pct"] >= SYNTENY_MIN_COV:
-                by_target[r["best_target"]].append(r)
-        for tname, rows in sorted(by_target.items()):
-            for r in rows:
-                if len(rows) == 1:
-                    rel = "1-to-1"
-                else:
-                    rel = f"many-to-1 (1 of {len(rows)} compare→{tname})"
-                w.writerow([r["compare_contig"], tname, r["compare_len"],
-                            r["target_len"], r["aligned_bases"],
-                            r["identity_pct"], r["compare_coverage_pct"], rel])
+                    "compare_coverage_pct", "final_coverage_pct",
+                    "strand", "relationship"])
+        for r in pair_rows:
+            if r["compare_coverage_pct"] < SYNTENY_MIN_COV_PCT:
+                continue
+            n_q = n_targets_per_query.get(r["compare_contig"], 1)
+            n_t = len(queries_per_target.get(r["final_contig"], {1}))
+            if n_q > 1 and n_t > 1:
+                rel = f"many-to-many ({n_q} targets / {n_t} queries)"
+            elif n_q > 1:
+                rel = f"1-to-many (compare splits across {n_q} final contigs)"
+            elif n_t > 1:
+                rel = f"many-to-1 ({n_t} compare contigs → 1 final)"
+            else:
+                rel = "1-to-1"
+            w.writerow([r["compare_contig"], r["final_contig"],
+                        r["compare_len"], r["final_len"],
+                        r["aligned_bases"], r["identity_pct"],
+                        r["compare_coverage_pct"], r["final_coverage_pct"],
+                        r["strand"], rel])
     runner.log(f"Wrote {synteny_path}")
 
     # ---- Circos config bundle ------------------------------------------

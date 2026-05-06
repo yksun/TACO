@@ -7,6 +7,71 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [1.3.4] — 2026-05-06
 
+### Step 14C compare report — telomere-aware chimera diagnosis
+
+- **Telomere status now flows into every layer of the compare report.**
+  Step 14C reads both `assemblies/final.telomere_end_scores.tsv` and
+  `assemblies/compare.telomere_end_scores.tsv` and propagates per-end
+  telomere flags (`yes` / `no` / `n/a` for "not tested at this
+  boundary") into:
+  * `contig_to_contig.tsv` gains `compare_left_telo`,
+    `compare_right_telo`, `compare_telo_tier`, `best_target_left_telo`,
+    `best_target_right_telo`.
+  * `contig_to_contig_pairs.tsv` gains four boundary-touch flags
+    (`touches_compare_left/right`, `touches_final_left/right`) plus
+    four pair-localized telomere flags
+    (`compare_left_telo_at_pair`, `compare_right_telo_at_pair`,
+    `final_left_telo_at_pair`, `final_right_telo_at_pair`). A flag of
+    `n/a` means "the alignment block doesn't reach this boundary so
+    the telomere status of that boundary is not relevant for *this*
+    pair" — distinct from "no telomere".
+  * `split_mappings.tsv` gains a `chimera_evidence` text column that
+    summarizes the telomere pattern at the four boundary points and
+    classifies the split as one of: full-coverage split, strong
+    chimera signal (full chromosomes joined via shared telomeres),
+    chimeric extension into a fragment, or split-likely-real
+    (compare is incomplete on the side without a telomere).
+- **Verified on the user's KMAF11 run** — `JALGOQ010000001.1` (6.51 Mb)
+  is now correctly diagnosed as a chimeric extension: compare has
+  telomeres at both outer ends, contig_2 (TACO's strict-T2T half)
+  contributes a telomere at its inner end, contig_1 (TACO's
+  single_tel_strong half) does not — exactly the "chrA fully joined
+  to chrB-fragment" signature.
+
+### Step 14C compare report — split-mapping detection (chimera-aware)
+
+- **Bug fix: `contig_to_contig.tsv` previously hid 1-to-many mappings.**
+  When a single `--compare` contig spanned more than one final contig
+  (i.e. the published assembly chimerically joined two real chromosomes,
+  or TACO split one chromosome where the published assembly didn't), the
+  per-query reducer kept only the highest-coverage target. The row read
+  as a clean `1-to-1` even though `aligned_bases` exceeded `target_len` —
+  the tell-tale arithmetic of a hidden split. Reproduced on a real
+  Venturiaceae run: `JALGOQ010000001.1` (6.51 Mb) silently mapped to
+  `contig_1` (3.50 Mb), hiding its 3.05 Mb second half on `contig_2`.
+- **Per-pair aggregation surfaces every significant compare→final
+  partner.** Each row in the new `contig_to_contig_pairs.tsv` is one
+  (compare_contig, final_contig) pair above the significance bar
+  (max of 20 % of the compare contig OR 100 kb absolute), with
+  per-pair compare coverage, final coverage, identity, and dominant
+  strand. `JALGOQ010000001.1` now writes two rows: `contig_1` (53.1 %,
+  strand `-`) and `contig_2` (46.9 %, strand `+`) — opposite strands
+  is a strong inversion/chimera signal.
+- **`contig_to_contig.tsv` gains three columns**: `n_significant_targets`,
+  `relationship` (`1-to-1` / `1-to-N (split)`), and `secondary_targets`
+  (semicolon-separated `name:bp:cov%` list of partners besides the
+  best one).
+- **`split_mappings.tsv` new file**: only compare contigs that map to
+  more than one significant final contig. Inspect this first to triage
+  candidate chimeric joins. On the Venturiaceae paper assembly, two
+  rows appear: the 6.5 Mb chimera and a smaller 1.9 Mb split into
+  contig_18 + contig_20.
+- **`synteny_blocks.tsv` now reports four relationship classes**:
+  `1-to-1`, `1-to-many (compare splits across N final contigs)`,
+  `many-to-1 (M compare contigs → 1 final)`, and `many-to-many` —
+  derived from the per-pair table so splits in either direction are
+  visible.
+
 ### Step 14C compare report — unique-contig listings, synteny blocks, Circos config
 
 - **`final_results/compare_report/unique_compare_contigs.tsv`** lists every
