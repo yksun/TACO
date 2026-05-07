@@ -7336,6 +7336,22 @@ def _compare_vs_final_report(runner):
             f"{r['tname']}:{r['alen']}bp:{round(100.0*r['q_cov_frac'],2)}%"
             for r in secondary
         )
+        # All-targets breakdown — like secondary_targets but INCLUDES the
+        # best target as the first entry, so a user reading
+        # contig_to_contig.tsv can see every significant target's
+        # individual contribution without cross-referencing the per-pair
+        # table.  For 1-to-1 mappings this is just one entry; for
+        # 1-to-many splits it spells out exactly how the compare contig
+        # divides across the final assembly.
+        all_targets_str = ";".join(
+            f"{r['tname']}:{r['alen']}bp:{round(100.0*r['q_cov_frac'],2)}%"
+            for r in significant
+        )
+        # Best target's own coverage of the compare contig (vs. the
+        # row's `aligned_bases` which is the *sum* across all targets and
+        # can therefore exceed `target_len` for split mappings).
+        best_q_cov = (best["q_cov_frac"] if best else 0.0)
+        best_alen = (best["alen"] if best else 0)
 
         # Telomere status for this compare contig (overall, both ends)
         c_telo = compare_telo.get(qname, {})
@@ -7354,10 +7370,13 @@ def _compare_vs_final_report(runner):
             "compare_len": qlen,
             "best_target": best["tname"] if best else "",
             "target_len": best["tlen"] if best else 0,
+            "best_target_aligned_bases": best_alen,
+            "best_target_coverage_pct": round(100.0 * best_q_cov, 3),
             "aligned_bases": info["alen_sum"],
             "matched_bases": info["match_sum"],
             "identity_pct": round(100.0 * identity, 3),
             "compare_coverage_pct": round(100.0 * qcov, 3),
+            "all_targets_breakdown": all_targets_str,
             "secondary_targets": secondary_targets_str,
             "n_significant_targets": len(significant),
             "relationship": relationship,
@@ -7536,19 +7555,23 @@ def _compare_vs_final_report(runner):
     with open(c2c_path, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(["compare_contig", "compare_len", "best_target_contig",
-                    "target_len", "aligned_bases", "matched_bases",
+                    "target_len",
+                    "best_target_aligned_bases", "best_target_coverage_pct",
+                    "aligned_bases", "matched_bases",
                     "identity_pct", "compare_coverage_pct",
                     "n_significant_targets", "relationship",
-                    "secondary_targets",
+                    "all_targets_breakdown", "secondary_targets",
                     "compare_left_telo", "compare_right_telo",
                     "compare_telo_tier",
                     "best_target_left_telo", "best_target_right_telo"])
         for r in contig_rows:
             w.writerow([r["compare_contig"], r["compare_len"], r["best_target"],
-                        r["target_len"], r["aligned_bases"], r["matched_bases"],
+                        r["target_len"],
+                        r["best_target_aligned_bases"], r["best_target_coverage_pct"],
+                        r["aligned_bases"], r["matched_bases"],
                         r["identity_pct"], r["compare_coverage_pct"],
                         r["n_significant_targets"], r["relationship"],
-                        r["secondary_targets"],
+                        r["all_targets_breakdown"], r["secondary_targets"],
                         r["compare_left_telo"], r["compare_right_telo"],
                         r["compare_telo_tier"],
                         r["best_target_left_telo"], r["best_target_right_telo"]])
@@ -7870,40 +7893,102 @@ def _compare_vs_final_report(runner):
             "Compare report: mash not on PATH; skipping scalar distance "
             "(install via 'mamba install -c bioconda mash' to enable).")
 
-    # ---- weak_regions: 10 kb windows of final.merged.fasta with < 50% coverage
-    # from any compare alignment.  Reports per-target coordinates.
-    win = 10000
-    threshold = 0.5
-    weak_path = os.path.join(out_dir, "weak_regions.tsv")
-    n_weak = 0
-    with open(weak_path, "w", newline="") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow(["target_contig", "target_len", "win_start", "win_end",
-                    "covered_bp", "covered_frac"])
-        for tname, intervals in sorted(target_intervals.items()):
-            tlen = target_lengths.get(tname, 0)
-            if tlen <= 0:
-                continue
-            merged = _merge_intervals(intervals)
-            ptr = 0
-            for ws in range(0, tlen, win):
-                we = min(ws + win, tlen)
-                covered = 0
-                # Walk merged intervals overlapping this window
-                while ptr < len(merged) and merged[ptr][1] <= ws:
-                    ptr += 1
-                k = ptr
-                while k < len(merged) and merged[k][0] < we:
-                    a = max(ws, merged[k][0])
-                    b = min(we, merged[k][1])
-                    if b > a:
-                        covered += b - a
-                    k += 1
-                frac = covered / max(1, we - ws)
-                if frac < threshold:
-                    w.writerow([tname, tlen, ws, we, covered, round(frac, 4)])
-                    n_weak += 1
-    runner.log(f"Wrote {weak_path} ({n_weak} windows below {threshold:.0%} compare coverage)")
+    # ---- weak_regions: low-coverage windows on BOTH sides ---------------
+    # We compute weak regions in TWO directions so users can spot:
+    #   - regions of final.merged.fasta where compare has no/low support
+    #     (assembly errors? extra sequence? sample variation?)
+    #   - regions of compare.fa not represented in final.merged.fasta
+    #     (compare-only sequence; e.g. inserts the published assembly has
+    #      that TACO doesn't)
+    # We also write GFF3 versions of both so they can be loaded as IGV /
+    # JBrowse tracks alongside the FASTAs.
+    WIN = 10000
+    LOW_COV_THRESHOLD = 0.5
+
+    def _emit_weak_regions(intervals_by_seq, lengths, side_label, tsv_path,
+                           gff_path):
+        """Compute and write weak windows for one direction."""
+        n_weak = 0
+        gff_lines = ["##gff-version 3"]
+        with open(tsv_path, "w", newline="") as ftsv:
+            w = csv.writer(ftsv, delimiter="\t")
+            w.writerow([f"{side_label}_contig", f"{side_label}_len",
+                        "win_start", "win_end", "covered_bp", "covered_frac"])
+            weak_idx = 0
+            for sname, intervals in sorted(intervals_by_seq.items()):
+                slen = lengths.get(sname, 0)
+                if slen <= 0:
+                    continue
+                merged = _merge_intervals(intervals)
+                ptr = 0
+                for ws in range(0, slen, WIN):
+                    we = min(ws + WIN, slen)
+                    covered = 0
+                    while ptr < len(merged) and merged[ptr][1] <= ws:
+                        ptr += 1
+                    k = ptr
+                    while k < len(merged) and merged[k][0] < we:
+                        a = max(ws, merged[k][0])
+                        b = min(we, merged[k][1])
+                        if b > a:
+                            covered += b - a
+                        k += 1
+                    frac = covered / max(1, we - ws)
+                    if frac < LOW_COV_THRESHOLD:
+                        w.writerow([sname, slen, ws, we, covered, round(frac, 4)])
+                        weak_idx += 1
+                        # GFF3 is 1-based, inclusive end.  Window ws..we in
+                        # 0-based half-open becomes (ws+1)..we.
+                        gff_lines.append(
+                            f"{sname}\tTACO\tweak_region\t{ws+1}\t{we}\t."
+                            f"\t+\t.\t"
+                            f"ID=weak_{side_label}_{weak_idx};"
+                            f"covered_bp={covered};"
+                            f"covered_frac={frac:.4f};"
+                            f"threshold={LOW_COV_THRESHOLD}")
+                        n_weak += 1
+        with open(gff_path, "w") as fgff:
+            fgff.write("\n".join(gff_lines) + "\n")
+        return n_weak
+
+    # 1. Final-side weak regions (compare's view of final.merged.fasta) ----
+    weak_final_tsv = os.path.join(out_dir, "weak_regions_final.tsv")
+    weak_final_gff = os.path.join(out_dir, "weak_regions_final.gff3")
+    n_weak_final = _emit_weak_regions(
+        target_intervals, target_lengths, "final",
+        weak_final_tsv, weak_final_gff)
+    runner.log(
+        f"Wrote {weak_final_tsv} ({n_weak_final} windows of final.merged.fasta "
+        f"< {LOW_COV_THRESHOLD:.0%} compare coverage)")
+    runner.log(f"Wrote {weak_final_gff}")
+
+    # Backwards-compat: keep the old filename as a stable alias.  Existing
+    # downstream tooling that points at weak_regions.tsv keeps working.
+    legacy_weak = os.path.join(out_dir, "weak_regions.tsv")
+    try:
+        if os.path.realpath(weak_final_tsv) != os.path.realpath(legacy_weak):
+            shutil.copy2(weak_final_tsv, legacy_weak)
+    except Exception:
+        pass
+
+    # 2. Compare-side weak regions (final's view of compare.fa) -----------
+    # We need per-compare-contig intervals on the COMPARE coordinate system.
+    # info["qcov_starts"] already has every (qs, qe) PAF block per query.
+    compare_intervals = defaultdict(list)
+    for qname, info in per_query.items():
+        compare_intervals[qname] = list(info["qcov_starts"])
+    compare_lengths_for_weak = {q: info["qlen"]
+                                for q, info in per_query.items()}
+    weak_cmp_tsv = os.path.join(out_dir, "weak_regions_compare.tsv")
+    weak_cmp_gff = os.path.join(out_dir, "weak_regions_compare.gff3")
+    n_weak_cmp = _emit_weak_regions(
+        compare_intervals, compare_lengths_for_weak, "compare",
+        weak_cmp_tsv, weak_cmp_gff)
+    runner.log(
+        f"Wrote {weak_cmp_tsv} ({n_weak_cmp} windows of compare.fa "
+        f"< {LOW_COV_THRESHOLD:.0%} final coverage — flags compare-only "
+        "sequence and chimera-junction regions)")
+    runner.log(f"Wrote {weak_cmp_gff}")
 
     # ---- QUAST -R compare_fa for reference-based metrics on the final ----
     quast_bin = shutil.which("quast.py") or shutil.which("quast")
