@@ -7990,6 +7990,94 @@ def _compare_vs_final_report(runner):
         "sequence and chimera-junction regions)")
     runner.log(f"Wrote {weak_cmp_gff}")
 
+    # 3. Exact alignment gaps on BOTH sides ------------------------------
+    # Window-based weak_regions misses small (<10 kb) but biologically
+    # informative uncovered intervals — most importantly the small
+    # un-aligned bridge that sits at the chimera junction inside a
+    # 1-to-many compare contig.  This pass walks the merged interval list
+    # for each contig and emits every gap >= MIN_GAP_BP as an explicit
+    # interval (TSV + GFF3).  Default 100 bp catches chimera-junction
+    # bridges, missing telomere arrays, and small unique inserts.
+    MIN_GAP_BP = 100
+
+    def _emit_alignment_gaps(intervals_by_seq, lengths, side_label,
+                             tsv_path, gff_path):
+        n_gaps = 0
+        gff_lines = ["##gff-version 3"]
+        gap_idx = 0
+        with open(tsv_path, "w", newline="") as ftsv:
+            w = csv.writer(ftsv, delimiter="\t")
+            w.writerow([f"{side_label}_contig", f"{side_label}_len",
+                        "gap_start", "gap_end", "gap_len", "kind"])
+            for sname, intervals in sorted(intervals_by_seq.items()):
+                slen = lengths.get(sname, 0)
+                if slen <= 0:
+                    continue
+                merged = _merge_intervals(intervals)
+                # Build the list of gaps: regions of [0, slen) NOT covered
+                # by any merged interval.  Includes leading and trailing
+                # gaps so a missing-telomere tip surfaces too.
+                gaps = []
+                cursor = 0
+                for s, e in merged:
+                    if s > cursor:
+                        gaps.append((cursor, s, "internal" if cursor > 0 else "leading"))
+                    cursor = max(cursor, e)
+                if cursor < slen:
+                    gaps.append((cursor, slen, "trailing"))
+                # If there were no alignments at all, treat the whole
+                # contig as one gap (kind=full_contig_unaligned).
+                if not merged:
+                    gaps = [(0, slen, "full_contig_unaligned")]
+                # Re-tag internal gaps that are clearly chimera-junction
+                # candidates (sit between two aligned blocks AND have
+                # length in the typical bridge range 100 bp – 5 kb).
+                for gs, ge, kind in gaps:
+                    glen = ge - gs
+                    if glen < MIN_GAP_BP:
+                        continue
+                    tag = kind
+                    if kind == "internal" and 100 <= glen <= 5000:
+                        tag = "internal_junction_candidate"
+                    elif kind in ("leading", "trailing") and glen < 200:
+                        # Tiny terminal gap — usually just minimap2 not
+                        # extending into telomere repeats; informative
+                        # for telomere-arm completeness.
+                        tag = f"{kind}_tip"
+                    w.writerow([sname, slen, gs, ge, glen, tag])
+                    gap_idx += 1
+                    gff_lines.append(
+                        f"{sname}\tTACO\talignment_gap\t{gs+1}\t{ge}\t."
+                        f"\t+\t.\t"
+                        f"ID=gap_{side_label}_{gap_idx};"
+                        f"gap_len={glen};"
+                        f"kind={tag}")
+                    n_gaps += 1
+        with open(gff_path, "w") as fgff:
+            fgff.write("\n".join(gff_lines) + "\n")
+        return n_gaps
+
+    cmp_gaps_tsv = os.path.join(out_dir, "compare_alignment_gaps.tsv")
+    cmp_gaps_gff = os.path.join(out_dir, "compare_alignment_gaps.gff3")
+    n_cmp_gaps = _emit_alignment_gaps(
+        compare_intervals, compare_lengths_for_weak, "compare",
+        cmp_gaps_tsv, cmp_gaps_gff)
+    runner.log(
+        f"Wrote {cmp_gaps_tsv} ({n_cmp_gaps} gaps >= {MIN_GAP_BP} bp on "
+        "compare.fa — chimera-junction candidates land here even when "
+        "weak_regions_compare is empty)")
+    runner.log(f"Wrote {cmp_gaps_gff}")
+
+    final_gaps_tsv = os.path.join(out_dir, "final_alignment_gaps.tsv")
+    final_gaps_gff = os.path.join(out_dir, "final_alignment_gaps.gff3")
+    n_final_gaps = _emit_alignment_gaps(
+        target_intervals, target_lengths, "final",
+        final_gaps_tsv, final_gaps_gff)
+    runner.log(
+        f"Wrote {final_gaps_tsv} ({n_final_gaps} gaps >= {MIN_GAP_BP} bp "
+        "on final.merged.fasta — flags TACO-only sequence)")
+    runner.log(f"Wrote {final_gaps_gff}")
+
     # ---- QUAST -R compare_fa for reference-based metrics on the final ----
     quast_bin = shutil.which("quast.py") or shutil.which("quast")
     if quast_bin:
