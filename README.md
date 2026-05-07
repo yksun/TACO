@@ -31,6 +31,7 @@ TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natu
 - [Command-Line Reference](#command-line-reference)
 - [Sequencing Platform Support](#sequencing-platform-support)
 - [Pipeline Steps](#pipeline-steps)
+- [Compare Mode (`--compare`)](#compare-mode---compare)
 - [Telomere Detection](#telomere-detection)
 - [Assembly Selection Strategy](#assembly-selection-strategy)
 - [Outputs And Reports](#outputs-and-reports)
@@ -56,8 +57,9 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 | Resume final QC and reporting after refinement | `-s 13-14` | 13, then 14A | refreshed final QC metrics and final report |
 | Rebuild only the full final report/cleanup | `-s 14` | 14A | `final_results/final_result.csv` |
 | Rebuild only assembly-only summary/cleanup | `--assembly-only -s 14` | 14B | `final_results/assembly_only_result.csv` |
+| Add a comparison against an external assembly | add `--compare <fasta>` to any of the above | adds 14C | `final_results/compare_report/` (per-contig synteny, weak regions, alignment gaps, Circos input, optional QUAST `-R`/dnadiff/paftools/mash) |
 
-TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mode-adaptive: **14A** runs in full mode for final reporting and cleanup, while **14B** runs only when `--assembly-only` is set.
+TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mode-adaptive: **14A** runs in full mode for final reporting and cleanup, while **14B** runs only when `--assembly-only` is set. **14C** runs in addition to 14A whenever `--compare` is supplied — it produces a passive contig-to-contig comparison report against `final.merged.fasta` without touching the assembly itself.
 
 ## Key Features
 
@@ -267,6 +269,7 @@ TACO exposes 15 public steps by number: **0-14**. Step 14 has two internal repor
 | 13 | Final QC only: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
 | 14 / 14A | Final comparison report + cleanup into `final_results/` (full mode) | Report |
 | 14 / 14B | Assembly-only comparison summary + cleanup (only with `--assembly-only`) | Report |
+| 14 / 14C | Compare-vs-final contig-to-contig report (only with `--compare`) | Report |
 
 <img align="center" src="/docs/steps.png">
 
@@ -292,6 +295,90 @@ Steps 0-14: runs all assemblers (1-9), normalizes and QC-compares all assemblies
 ### Assembly-Only Mode (`--assembly-only`)
 
 Steps 0-10, 14: runs all assemblers (1-9), normalizes and QC-compares all assemblies (10), then produces the assembly-only comparison table at `final_results/assembly_only_result.csv` (14B). Skips telomere pool (11), refinement (12), and final QC (13). This mode is designed for benchmarking and decision-making without modifying any assembly.
+
+## Compare Mode (`--compare`)
+
+`--compare <fasta>` adds a passive comparison against any externally produced assembly (e.g. an NCBI GenBank genome of the same or a closely related strain). The compare FASTA is **never** used for backbone selection, telomere-pool quickmerge, polishing, or `purge_dups`. It is treated as a read-only reference whose only effect on TACO's run is to land in the QC tables and trigger an extra reporting sub-step.
+
+`--compare` works in two invocation modes and produces identical outputs in both:
+
+- **Full pipeline:** `taco ... --compare X.fa` runs steps 0–14 normally; the comparison report is generated as part of step 14.
+- **Resume on an existing run:** `taco ... --compare X.fa -s 10,13,14` after a prior full run reuses the existing assemblies and merged FASTA and only adds the comparison artefacts.
+
+### What runs where
+
+| Stage | Effect of `--compare` |
+|---|---|
+| Step 10 (Normalize + QC) | Compare FASTA is normalized to `assemblies/compare.result.fasta` and gets BUSCO, telomere, QUAST, and Merqury rows in `assembly_info.csv` and (later) `final_result.csv`. |
+| Steps 11 / 12 | **Skipped for compare** — it is excluded from the telomere pool, the all-vs-all quickmerge candidate set, polish, and purge_dups. |
+| Step 13 (Final QC) | Unchanged — runs on `final.merged.fasta` only. |
+| **Step 14C** (new) | Builds the contig-to-contig report at `final_results/compare_report/` against `final.merged.fasta`, then proceeds to standard 14A cleanup. |
+
+### Outputs in `final_results/compare_report/`
+
+Step 14C aligns the compare FASTA to `final.merged.fasta` with `minimap2 -cx asm5 --secondary=no` and writes the following layered diagnostics:
+
+| File | Contents |
+|---|---|
+| `compare_vs_final.paf` | Raw minimap2 alignment (one row per alignment block). All downstream files are derived from this. |
+| `contig_to_contig.tsv` | One row per compare contig: `best_target_contig`, `best_target_aligned_bases`, `best_target_coverage_pct`, total `aligned_bases`, average `identity_pct`, `n_significant_targets`, `relationship` (`1-to-1` / `1-to-N (split)`), `all_targets_breakdown` (every significant target with its bp and coverage), and per-end telomere flags for both the compare contig and its best target. |
+| `contig_to_contig_pairs.tsv` | One row per (compare_contig, final_contig) pair above the significance threshold (max of 20 % of the compare contig OR 100 kb absolute). Per-pair compare coverage, final coverage, identity, dominant strand, four boundary-touch flags, and four pair-localized telomere flags. This is what makes 1-to-N splits readable. |
+| `synteny_blocks.tsv` | At-a-glance synteny summary derived from the per-pair table — labels each block as `1-to-1`, `1-to-many (compare splits across N final contigs)`, `many-to-1 (M compare contigs → 1 final)`, or `many-to-many`. |
+| `split_mappings.tsv` | Only compare contigs that map to >1 significant final contig. Includes a `chimera_evidence` text column that classifies the split using the telomere pattern at outer + inner boundaries: full-coverage split, strong chimera signal, chimeric extension into a fragment, or split-likely-real. |
+| `unique_compare_contigs.tsv` | Compare contigs with < 5 % coverage in `final.merged.fasta` (or no alignment). |
+| `unique_final_contigs.tsv` | Mirror file: `final.merged.fasta` contigs with < 5 % coverage from `--compare`. |
+| `weak_regions_final.tsv` / `.gff3` | 10 kb windows of `final.merged.fasta` < 50 % covered by compare. (`weak_regions.tsv` is kept as a stable alias for back-compat.) |
+| `weak_regions_compare.tsv` / `.gff3` | 10 kb windows of `--compare` < 50 % covered by `final.merged.fasta`. Empty for high-coverage runs — see the next file for fine-grained gap detection. |
+| `final_alignment_gaps.tsv` / `.gff3` | Every uncovered interval ≥ 100 bp on `final.merged.fasta`, with `kind` ∈ {`leading`, `trailing`, `internal`, `internal_junction_candidate`, `*_tip`, `full_contig_unaligned`}. Surfaces telomere-padding tips, chimera-broken tails, and TACO-unique sequence at sub-window resolution. |
+| `compare_alignment_gaps.tsv` / `.gff3` | Mirror file on the compare side. The chimera-junction bridge inside a 1-to-many compare contig appears here as a small `internal_junction_candidate` (typically 100–500 bp). |
+| `compare_telomere_end_scores.tsv` | Copy of `assemblies/compare.telomere_end_scores.tsv` from step 9, surfaced inside the report for convenience. |
+| `TELOMERE_NOTES.txt` | Plain-text summary of compare telomere classifications + thresholds + notes on widening `--telo-score-window` if telomere repeats are detected just inside the contig ends. |
+| `circos/` | Self-contained Circos input bundle: `karyotype.txt` (compare = `C_<name>`, final = `F_<name>`, distinct palettes), `links.txt` (one ribbon per minimap2 block ≥ 5 kb), `circos.conf`, and `README.txt` with run instructions. Render with `cd circos && circos -conf circos.conf`. |
+| `compare_quast/` | *Optional* — QUAST run with `-R compare.fa` against `final.merged.fasta` for genome fraction, NA50, and reference-based misassembly counts. Skipped silently when QUAST is not on PATH. |
+| `compare_dnadiff/` | *Optional* — MUMmer `dnadiff` SNP/indel summary. Skipped silently when `dnadiff` is not on PATH (install MUMmer4 to enable). |
+| `compare_paftools_variants.vcf` | *Optional* — `paftools.js call -L 10000` over the sorted PAF for assembly-vs-assembly SNVs and SVs. Ships with `minimap2`; skipped silently when `paftools.js` / `k8` aren't on PATH. |
+| `compare_mash_distance.tsv` | *Optional* — `mash dist compare.fa final.fa` scalar distance. Skipped silently when `mash` is not on PATH. |
+
+### How to read the report
+
+The report is layered so that each file answers a more specific question than the one before it:
+
+1. Start with **`split_mappings.tsv`**. If it has any rows, those are the chimera or split candidates worth investigating. The `chimera_evidence` column tells you which kind.
+2. For each split, open **`contig_to_contig_pairs.tsv`** and filter on the compare contig name. The four boundary-touch flags + four telomere-at-pair flags reveal whether each pair sits on compare's outer end or near the join, and whether the corresponding final-contig boundary carries a telomere.
+3. **`final_alignment_gaps.tsv`** explains every region of TACO's assembly that the compare doesn't cover — telomere arrays the compare lost, chimera-broken chromosome ends, and minor alignment-edge artifacts. **`compare_alignment_gaps.tsv`** does the mirror, and crucially surfaces the small (100–500 bp) chimera-junction bridges that the window-based `weak_regions_compare.tsv` misses.
+4. For visual inspection, render `circos/` with Circos, or load `weak_regions_*.gff3` and `*_alignment_gaps.gff3` as IGV / JBrowse tracks alongside the FASTA. A chimera looks like two ribbons from the same `C_<name>` ideogram converging on different `F_<name>` ideograms with opposing strands.
+
+### `--final-fa` companion flag
+
+If you want to run step 14C against an externally-produced final assembly without rebuilding from step 12, pass `--final-fa <path>`. TACO copies that FASTA into `assemblies/final.merged.fasta` (overriding any cached copy) and runs steps 13/14 against it. Combined with `--compare`, this lets you compare any two assemblies head-to-head without re-running the full pipeline:
+
+```bash
+taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
+  --final-fa /path/to/your_final.fasta \
+  --compare  /path/to/external.fasta \
+  -s 13,14
+```
+
+### Recommended invocations
+
+```bash
+# Full pipeline + comparison against an NCBI reference
+taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
+  --busco-download-path /shared/busco_downloads --busco-offline-only \
+  --compare /path/to/GCA_xxxxx.fna
+
+# Add a comparison after a previous full run (no reassembly)
+cd <previous_run_dir>
+taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
+  --compare /path/to/GCA_xxxxx.fna \
+  -s 10,13,14
+
+# Compare two existing assemblies without rerunning
+taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
+  --final-fa /path/to/your.fasta \
+  --compare  /path/to/other.fasta \
+  -s 13,14
+```
 
 ## Telomere Detection
 
