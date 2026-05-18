@@ -7,6 +7,34 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [1.3.4] — 2026-05-06
 
+### Two major QC-reuse bugs (`--busco` override + Merqury cross-contamination)
+
+- **`--busco <lineage>` was silently ignored on re-runs.**
+  ``step_08_busco`` checked "is there ANY BUSCO output for this
+  assembler?" but not whether the existing output was produced by the
+  lineage the current run asks for.  Concrete symptom: a first run with
+  ``--taxon fungal`` writes ``busco/canu/run_fungi_odb10/``; a second
+  run with ``--busco ascomycota_odb10`` finds the stale dir, logs
+  "Found existing BUSCO metrics for canu → using busco/canu", and
+  reports fungi_odb10 numbers under the ascomycota_odb10 lineage row.
+  Fixed by lineage-aware reuse detection: TACO now requires the
+  on-disk output to come from the requested lineage (matched against
+  ``run_<lineage>/`` and ``short_summary.*.<lineage>.<base>.{txt,json}``
+  with content-based fallback for older BUSCO versions).  When the
+  lineage doesn't match, the existing dir is wiped and BUSCO re-runs.
+- **Merqury rows were all reusing canu's QV/completeness.**  In
+  ``_merqury_metric_candidates`` an over-broad ``merqury/**/*.qv``
+  recursive glob fired whenever the prefix's ``out_dir`` resolved to
+  the merqury root (the legacy flat-prefix case), so every label
+  beyond canu silently matched ``merqury/canu/canu.qv``.  Symptom in
+  ``final_result.csv``: every assembler row (compare, flye,
+  nextDenovo, raven, ...) reported the same 50.2131 / 98.6575 from
+  canu's files.  Fixed in two ways: (a) the recursive ``**`` glob is
+  now scoped to the per-assembler subdir (``out_prefix/`` only, never
+  the merqury root); (b) a belt-and-suspenders filter rejects any
+  candidate whose basename doesn't contain the label token, so
+  ``canu.qv`` cannot match label "compare" / "flye" / "raven".
+
 ### Step 14C compare report — telomere-aware chimera diagnosis
 
 - **Telomere status now flows into every layer of the compare report.**

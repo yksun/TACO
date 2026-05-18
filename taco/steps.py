@@ -1453,12 +1453,43 @@ def step_08_busco(runner):
 
     lineage = runner.busco_lineage
 
-    def has_busco_metrics(base):
+    def has_busco_metrics_for_lineage(base, lineage):
+        """Return True only when existing BUSCO output was produced with
+        the SAME lineage we're about to use.
+
+        BUSCO 5 writes its outputs with the lineage embedded in both the
+        ``run_<lineage>/`` subdirectory and the
+        ``short_summary.specific.<lineage>.<base>.{txt,json}`` filenames,
+        so we can match against either.  Previously this helper checked
+        only "does ANY short_summary exist?" — which meant a re-run with
+        ``--busco ascomycota_odb10`` would silently keep stale
+        ``fungi_odb10`` results from an earlier run.
+        """
         for d in [f"busco/{base}", f"busco/run_{base}"]:
-            if os.path.isdir(d):
-                files = glob.glob(f"{d}/**/short_summary*.txt", recursive=True) + \
-                        glob.glob(f"{d}/**/full_table*.tsv", recursive=True)
-                if files:
+            if not os.path.isdir(d):
+                continue
+            # 1. Match the lineage-named run directory directly.
+            if os.path.isdir(os.path.join(d, f"run_{lineage}")):
+                return True
+            # 2. Match BUSCO 5's lineage-tagged summary filenames.
+            tagged = glob.glob(os.path.join(
+                d, f"short_summary.*.{lineage}.*.txt"))
+            tagged += glob.glob(os.path.join(
+                d, f"short_summary.*.{lineage}.*.json"))
+            if tagged:
+                return True
+            # 3. As a last resort, parse the lineage out of any
+            #    short_summary*.txt that doesn't carry the lineage in
+            #    its filename (older BUSCO versions).
+            for s in glob.glob(os.path.join(d, "**", "short_summary*.txt"),
+                                recursive=True):
+                try:
+                    head = open(s, errors="ignore").read(4096)
+                except OSError:
+                    continue
+                if (f"/{lineage}" in head or
+                        f"lineage_dataset: {lineage}" in head or
+                        f"({lineage})" in head):
                     return True
         return False
 
@@ -1466,17 +1497,21 @@ def step_08_busco(runner):
 
     for fasta_path in assemblies:
         base = os.path.basename(fasta_path).replace(".result.fasta", "").replace(".fasta", "")
-        if has_busco_metrics(base):
-            runner.log(f"Found existing BUSCO metrics for {base} → using busco/{base} (or legacy path)")
+        if has_busco_metrics_for_lineage(base, lineage):
+            runner.log(
+                f"Found existing BUSCO metrics for {base} matching lineage "
+                f"'{lineage}' → reusing busco/{base}")
             continue
 
         if not busco_available:
             runner.log_error(f"Missing BUSCO metrics for '{base}' and 'busco' binary not available; cannot run.")
             raise RuntimeError("BUSCO not available")
 
-        # Drop any incomplete BUSCO directory so we get a clean run.
+        # Stale or mismatched-lineage BUSCO directory? Wipe it before re-running.
         if os.path.isdir(f"busco/{base}"):
-            runner.log_info(f"Incomplete BUSCO dir detected for {base} → re-running")
+            runner.log_info(
+                f"Existing BUSCO dir for {base} does not match requested "
+                f"lineage '{lineage}' → wiping and re-running")
             shutil.rmtree(f"busco/{base}")
 
         runner.log_info(f"BUSCO on {base} (lineage={lineage}, threads={runner.threads})")
@@ -2719,17 +2754,41 @@ def _merqury_prefixes_for_label(label, preferred=None):
 
 
 def _merqury_metric_candidates(out_prefix, suffix):
-    """Return possible Merqury metric files for an output prefix and suffix."""
+    """Return possible Merqury metric files for an output prefix and suffix.
+
+    **Bug fix (2026-05-08).**  An earlier version included a broad
+    ``merqury/**/*<suffix>`` recursive glob that fired when ``out_dir``
+    resolved to the merqury root (legacy flat prefix ``merqury/<label>``).
+    That pattern matched every other assembler's metric files, so a label
+    like ``compare`` would silently reuse ``merqury/canu/canu.canu.result.qv``.
+    Symptom in ``final_result.csv``: every assembler row showed an
+    identical Merqury QV/completeness from canu.
+
+    The new implementation:
+      * Drops the merqury-wide ``**`` glob.
+      * Still recursively searches the assembler's *own* subdir
+        ``out_prefix/...`` (modern layout: ``merqury/<label>/<label>``).
+      * Filters every result so its basename contains ``base`` (the label
+        token), guaranteeing canu files can't be picked up for compare,
+        flye, etc.
+    """
     out_dir = os.path.dirname(out_prefix) or "."
     base = os.path.basename(out_prefix)
+
     patterns = [
         f"{out_prefix}{suffix}",
         f"{out_prefix}*{suffix}",
         os.path.join(out_prefix, f"*{suffix}"),
         os.path.join(out_prefix, f"{base}*{suffix}"),
         os.path.join(out_dir, f"{base}*{suffix}"),
-        os.path.join(out_dir, "**", f"*{suffix}"),
     ]
+    # If the modern subdir layout exists (merqury/<label>/<label>...),
+    # search recursively *inside that subdir only* — never across the
+    # merqury root.  This keeps `.canu.result.qv` style names findable
+    # for label "canu" without cross-contamination across assemblers.
+    if os.path.isdir(out_prefix):
+        patterns.append(os.path.join(out_prefix, "**", f"{base}*{suffix}"))
+        patterns.append(os.path.join(out_prefix, "**", f"*{base}*{suffix}"))
 
     seen = set()
     exact = f"{out_prefix}{suffix}"
@@ -2737,6 +2796,13 @@ def _merqury_metric_candidates(out_prefix, suffix):
     for pattern in patterns:
         for path in glob.glob(pattern, recursive="**" in pattern):
             if path in seen or not os.path.isfile(path) or os.path.getsize(path) == 0:
+                continue
+            # Belt-and-suspenders: the basename must mention the label
+            # token.  Without this guard the legacy flat-prefix case
+            # (``merqury/<label>``) could still hit files in sibling
+            # subdirs via ``out_dir/<base>*<suffix>`` when ``base`` is
+            # the bare label and out_dir is the merqury root.
+            if base and base not in os.path.basename(path):
                 continue
             seen.add(path)
             candidates.append(path)
