@@ -59,7 +59,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.4 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.5 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -128,7 +128,7 @@ def parse_args():
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.3.4')
+    parser.add_argument('--version', action='version', version='TACO v1.3.5')
     
     args = parser.parse_args()
 
@@ -162,7 +162,7 @@ def parse_args():
     for s in args.steps:
         if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.3.4 uses steps 0-14. "
+                f"Invalid step: {s}. TACO v1.3.5 uses steps 0-14. "
                 f"Full mode: 0-14. Assembly-only: 0-10, 14. "
                 f"Resume from refinement: -s 12-14.")
     return args

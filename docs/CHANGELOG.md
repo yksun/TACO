@@ -5,6 +5,55 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.5] — 2026-07-08
+
+### Telomere-aware rescue: short terminal telomere caps are no longer discarded
+
+- **`step_12` single-end rescue rejected donors that only add a short telomere
+  cap.** `_screen_rescue_candidates` dropped any donor whose extension beyond
+  the backbone was `< RESCUE_MIN_EXT` (1000 bp; `ext = max(qs, qlen-qe)`),
+  regardless of whether that overhang was a telomere. Telomere repeat arrays are
+  frequently only a few hundred bp (especially fungal), so a donor whose sole
+  new contribution was the terminal telomere the backbone lacked was thrown out
+  for being "too short." Symptom: single-end backbone contigs stayed uncapped
+  even though a telomere-bearing contig from another assembler aligned cleanly to
+  the terminus and extended it by ~100–575 bp (one run rejected 15 such donors
+  solely for `ext<1000`).
+  - `_parse_paf_rescue_hits` now computes, per hit, the strand-aware donor
+    overhang at the touched backbone terminus and whether it carries a telomere
+    (`term_ext`, `overhang_has_telomere`, `overhang_telo_score`), reusing TACO's
+    own `score_end` scorer with the taxon's motif families (new
+    `_overhang_is_telomeric` helper).
+  - `_screen_rescue_candidates` exempts a short extension from the
+    minimum-extension rejection when the overhang adds a telomere the backbone
+    lacks, and ranks telomere-adding donors highest. All chimera guards
+    (identity, aligned_bp, backbone/donor coverage, terminal touch) and the
+    downstream BUSCO trial (12F) are unchanged, so accepted caps still cannot
+    reduce completeness.
+  - `single_tel.replaced.debug.tsv` and `single_tel.candidates.tsv` gained the
+    telomere-overhang columns, so each rejected/accepted end is auditable.
+
+### purge_dups over-purge guard (do-no-harm on genome size)
+
+- **`step_12` purge_dups could shrink a well-sized assembly and still pass QC.**
+  `_purge_dups_safety_check` was size-only, rejecting only on an absolute floor
+  (`min_expected_ratio × genome size`) and a `max_bp_drop` fraction. A
+  low-duplication backbone (BUSCO D ≈ 0) could therefore lose ~9 Mb / dozens of
+  single-copy BUSCOs and be accepted (drop within the 25% limit, above the 85%
+  floor). Added an **overshoot guard**: if purge pushes the assembly *further
+  below* the expected genome size than it already deviated while dropping > 5%,
+  the purge is rejected and the unpurged assembly is kept
+  (`reason = overshoot_below_expected_size`). Legitimate purges that move an
+  inflated assembly *toward* the expected size are unaffected. Override with
+  `PURGE_DUPS_ALLOW_OVERSHOOT=1`.
+
+### Notes
+
+- Version bumped to 1.3.5 across `__init__`, `cli`, `pipeline`, `setup.py`, and
+  step logs/reports. No change to public step numbering (0–14) or CLI flags.
+
+---
+
 ## [1.3.4] — 2026-05-06
 
 ### Two major QC-reuse bugs (`--busco` override + Merqury cross-contamination)
