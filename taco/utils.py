@@ -195,7 +195,12 @@ def rename_and_sort_fasta(input_path, output_path, prefix):
 
 
 def revcomp(seq):
-    """Return reverse complement of DNA sequence.
+    """Return reverse complement of a DNA sequence.
+
+    Complements the full IUPAC nucleotide alphabet (R<->Y, K<->M, B<->V,
+    D<->H, S/W/N self-complementary), upper- and lower-case, so ambiguity
+    codes are complemented rather than destroyed.  Characters outside the
+    IUPAC alphabet (e.g. gap '-') are left unchanged.
 
     Args:
         seq: DNA sequence string
@@ -203,10 +208,10 @@ def revcomp(seq):
     Returns:
         str: Reverse complement
     """
-    complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
-                  'a': 't', 't': 'a', 'g': 'c', 'c': 'g',
-                  'N': 'N', 'n': 'n'}
-    return ''.join(complement.get(base, 'N') for base in reversed(seq))
+    table = str.maketrans(
+        "ACGTRYSWKMBDHVNacgtryswkmbdhvn",
+        "TGCAYRSWMKVHDBNtgcayrswmkvhdbn")
+    return seq.translate(table)[::-1]
 
 
 def read_tsv_column(path, col_name):

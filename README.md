@@ -71,7 +71,7 @@ TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mod
 - Three-tier telomere classification: strict T2T, single-end strong, and telomere-supported
 - Benchmarks all assembler outputs and the final refined assembly with BUSCO, QUAST, telomere metrics, and Merqury QV/completeness when available
 - Taxon-aware scoring: BUSCO S rewarded, BUSCO D penalized, Merqury QV/completeness, telomere metrics, N50, contig count, and genome size deviation — with per-taxon weights for fungal, plant, vertebrate, insect, and other genomes
-- Taxon-aware BUSCO lineage defaults: `--taxon fungal` → ascomycota, `--taxon plant` → embryophyta, etc.
+- Taxon-aware BUSCO lineage defaults: `--taxon fungal` → fungi_odb10 (broad fungal; pass `--busco ascomycota_odb10` for a sub-lineage), `--taxon plant` → embryophyta, etc.
 - Assembly-only mode (`--assembly-only`) for publication-ready assembler benchmarking without refinement
 - Conservative telomere-aware backbone refinement: D-aware duplicate filter, read-coverage diagnostic for partial overlaps, BUSCO trial validation, and "do no harm" safety comparison
 - Structural quickmerge validation with parent alignment checks
@@ -200,7 +200,7 @@ When running selected steps with `-s`/`--steps`, TACO checks only the tools need
 
 Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs. Step 12 and later check for the Step 10/11 outputs they need. Step 13 runs only final QC on the refined assembly. Step 14 does not rerun final QC; it builds the report and organizes outputs. In full mode, `-s 14` always runs 14A. In assembly-only mode, `--assembly-only -s 14` runs 14B.
 
-For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.4, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.4 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.6, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.6 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -244,7 +244,7 @@ Incompatible assemblers are automatically skipped with a warning.
 
 | Component | Fungal | Plant | Vertebrate/Animal | Insect/Other |
 |---|---|---|---|---|
-| **Default BUSCO lineage** | ascomycota_odb10 | embryophyta_odb10 | vertebrata_odb10 / metazoa_odb10 | insecta_odb10 / requires `--busco` |
+| **Default BUSCO lineage** | fungi_odb10 | embryophyta_odb10 | vertebrata_odb10 / metazoa_odb10 | insecta_odb10 / requires `--busco` |
 | **Merqury** | auto (all platforms) | auto (all platforms) | auto (all platforms) | auto (all platforms) |
 | **Telomere motifs** | TTAGGG + TG1-3 + Candida | TTTAGGG | TTAGGG | TTAGG (insect) / all (other) |
 | **Score window** | 300 bp | 1000 bp | 1000 bp | 500 bp |
@@ -382,7 +382,7 @@ taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
 
 ## Telomere Detection
 
-TACO v1.3.4 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.6 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -643,7 +643,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.4)
+│   ├── __init__.py         # Package metadata (v1.3.6)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking

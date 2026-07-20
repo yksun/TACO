@@ -35,7 +35,7 @@ The conda environment provides all external bioinformatics tools. The `pip insta
 
 **HiCanu:** The conda environment includes `canu` and `openjdk>=11` to provide a working Java runtime and avoid the `undefined symbol: JLI_StringDup` error. If you still get Java errors (e.g. from a bioconda dev build), download a stable binary from https://github.com/marbl/canu/releases and place it on PATH. If canu is missing or fails, Step 1 is skipped and all other assemblers continue normally.
 
-**Analysis tools (via conda):** BUSCO, QUAST, Minimap2, Seqtk, BWA, Samtools, purge_dups
+**Analysis tools (via conda):** BUSCO, QUAST, Minimap2, Samtools, seqkit, purge_dups
 
 **Polishing tools (via conda):** NextPolish2, yak, Racon, Medaka
 
@@ -61,9 +61,10 @@ TACO automatically selects appropriate BUSCO lineage, scoring weights, and telom
 
 | Taxon | Default BUSCO | Telomere Motifs |
 |-------|--------------|-----------------|
-| `--taxon fungal` | ascomycota_odb10 | TTAGGG + TG1-3 + Candida |
+| `--taxon fungal` | fungi_odb10 | TTAGGG + TG1-3 + Candida |
 | `--taxon plant` | embryophyta_odb10 | TTTAGGG |
 | `--taxon vertebrate` | vertebrata_odb10 | TTAGGG |
+| `--taxon animal` | metazoa_odb10 | TTAGGG |
 | `--taxon insect` | insecta_odb10 | TTAGG |
 | `--taxon other` | requires `--busco` | all known motif families |
 

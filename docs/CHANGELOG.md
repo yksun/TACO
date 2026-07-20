@@ -5,6 +5,66 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.6] — 2026-07-20 — correctness & robustness review
+
+Fixes from a full-pipeline correctness / scientific-validity / robustness
+audit. No CLI or output-schema changes; behavior is more correct.
+
+### Scientific validity
+
+- **Telomere end scoring is now 5'/3' symmetric.** `score_end` measured the
+  distance-to-terminus from the window's left edge for *both* ends, so a
+  telomere array shorter than the score window scored lower at the 3' end than
+  the identical array at the 5' end. This systematically under-called
+  right-terminal (and therefore T2T) contigs — worst for fungi (short arrays,
+  300 bp window). The right end now measures distance from the right edge.
+- **BUSCO metrics are gene-based again.** The `full_table.tsv` parser counted
+  one line per *copy*, inflating Duplicated and the denominator `n` so all
+  percentages diverged from BUSCO's own `short_summary`. Counts are now
+  de-duplicated per BUSCO id. This feeds backbone selection (heavily weighted),
+  so it could previously flip the chosen assembler.
+- **Quickmerge chimera gate uses the two actual parent contigs**, not the
+  largest contig in the whole file, so an inter-chromosomal chimera of two
+  mid-sized contigs can no longer slip into the protected T2T pool. A validated
+  merge now also requires *both* parents to contribute substantial coverage
+  (was: either one), matching the documented "genuine two-parent join" rule.
+- **Dedup no longer deletes both copies of an equal-length duplicate.**
+  `_fasta_clean_contained` and `_self_dedup_non_telomeric` broke length ties
+  such that both members of an equal-length pair were dropped; they now keep
+  one representative and `_fasta_clean_contained` gained an identity gate and
+  cross-block coverage aggregation so a shared repeat can't delete a distinct
+  contig.
+
+### Correctness / robustness
+
+- **Protected Tier 1 contigs can no longer be silently overwritten** during
+  step-12 rescue/upgrade: a donor whose name collides with a *different*
+  backbone contig is inserted under a unique key instead of clobbering it.
+- **Gzipped `--reference` / `--compare` downloads are decompressed** by gzip
+  magic-byte detection (a `.fa.gz` URL was saved as `.fasta` and read as raw
+  gzip). Download commands now use argv (no shell) so tokened URLs are safe.
+- **purge_dups read alignment detects minimap2 failure** instead of masking it
+  behind a `gzip` pipe (a truncated PAF previously biased the coverage cutoffs).
+- **Merqury reuses only a database built at the resolved k**, never a stale
+  db at a different k-mer size.
+- **Polishers stream to disk** instead of buffering the whole genome in memory.
+- **Compare-report variant calling** passes `--cs` so `paftools.js call`
+  produces a real VCF instead of an always-empty one.
+- **CLI:** an explicit `--telo-score-window 500` is honored (was overridden by
+  the taxon default); `--assembly-only` combined with `--steps` now intersects
+  and warns instead of silently discarding the selection; the standalone
+  `telomere_detect` / `telomere_pool` CLIs apply their `--taxon` and
+  threshold flags.
+- **Docs/env:** `seqkit` (used by Step 0) added to `taco-env.yml`; unused
+  `seqtk`/`bwa` removed from version logging and install docs; README version
+  strings and the fungal BUSCO default (`fungi_odb10`) corrected; `setup.py`
+  reads README as UTF-8; `utils.revcomp` complements the full IUPAC alphabet.
+- Version bumped to 1.3.6 across `__init__`, `cli`, `pipeline`, `steps`,
+  `setup.py`, and the README. New regression tests in
+  `tests/test_review_fixes.py` lock in the fixes above.
+
+---
+
 ## [1.3.5] — 2026-07-08
 
 ### Telomere-aware rescue: short terminal telomere caps are no longer discarded

@@ -18,7 +18,8 @@ except ImportError:
 
 
 def classify_pool(fasta_path, mode="hybrid", motif=None, out_prefix="pool",
-                  end_window=5000, score_window=500, kmer_min=4, kmer_max=30, threads=1):
+                  end_window=5000, score_window=500, kmer_min=4, kmer_max=30,
+                  threads=1, taxon="other"):
     """Run telomere detection on pooled contigs and write classified outputs.
 
     Args:
@@ -45,6 +46,7 @@ def classify_pool(fasta_path, mode="hybrid", motif=None, out_prefix="pool",
         kmer_min=kmer_min,
         kmer_max=kmer_max,
         threads=threads,
+        taxon=taxon,
     )
 
     # Read sequences
@@ -110,6 +112,10 @@ def main():
     parser.add_argument("--kmer-min", type=int, default=4, help="Minimum k-mer size")
     parser.add_argument("--kmer-max", type=int, default=30, help="Maximum k-mer size")
     parser.add_argument("--threads", type=int, default=1, help="Number of threads")
+    parser.add_argument("--taxon", default="other",
+                        choices=["vertebrate", "animal", "plant", "insect",
+                                 "fungal", "other"],
+                        help="Taxon preset for motif-family selection")
 
     args = parser.parse_args()
 
@@ -123,6 +129,7 @@ def main():
         kmer_min=args.kmer_min,
         kmer_max=args.kmer_max,
         threads=args.threads,
+        taxon=args.taxon,
     )
 
 

@@ -42,7 +42,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.3.5"
+    PIPELINE_NAME = "TACO-1.3.6"
 
     def __init__(self, args):
         # Core parameters
@@ -71,9 +71,12 @@ class PipelineRunner:
         self.telo_kmer_min = getattr(args, 'telo_kmer_min', 4)
         self.telo_kmer_max = getattr(args, 'telo_kmer_max', 30)
 
-        # Score window: user override takes precedence; otherwise taxon-aware
+        # Score window: an explicit user value (including 500) takes
+        # precedence; otherwise fall back to the taxon-aware default.  The CLI
+        # default is None precisely so a deliberate --telo-score-window 500 is
+        # not mistaken for "unset".
         user_score_window = getattr(args, 'telo_score_window', None)
-        if user_score_window is not None and user_score_window != 500:
+        if user_score_window is not None:
             self.telo_score_window = user_score_window
         elif self.taxon == "fungal":
             self.telo_score_window = 300   # fungal telomere arrays are short
@@ -289,8 +292,7 @@ class PipelineRunner:
         ("quast",          "quast",            ["--version"]),
         ("minimap2",       "minimap2",         ["--version"]),
         ("samtools",       "samtools",         ["--version"]),
-        ("seqtk",          "seqtk",            []),  # seqtk prints version on bare call
-        ("bwa",            "bwa",              []),   # bwa prints version on bare call
+        ("seqkit",         "seqkit",           ["version"]),  # Step 0 read/base counting
         # Merging / dedup / polishing
         ("merge_wrapper",  "merge_wrapper.py", ["--version"]),
         ("purge_dups",     "purge_dups",       []),   # prints version on bare call
@@ -978,30 +980,55 @@ class PipelineRunner:
     # ------------------------------------------------------------------ #
     # Reference FASTA resolution
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _download_local_name(url, stem):
+        """Local filename for a downloaded FASTA, preserving a .gz suffix."""
+        url_path = url.split("?", 1)[0].rstrip("/")
+        return f"{stem}.fasta.gz" if url_path.endswith(".gz") else f"{stem}.fasta"
+
+    def _maybe_gunzip(self, src):
+        """Decompress *src* when it is gzip-compressed, detected by magic
+        bytes rather than filename.  Remote servers routinely serve gzip
+        regardless of the URL suffix, so a name-only check misses them and
+        leaves raw gzip bytes to be mis-read as text downstream.  Returns the
+        path to the plain-text FASTA (unchanged if not gzip)."""
+        try:
+            with open(src, "rb") as fh:
+                is_gz = fh.read(2) == b"\x1f\x8b"
+        except OSError:
+            return src
+        if not is_gz:
+            return src
+        out = src[:-3] if src.endswith(".gz") else src + ".decompressed.fasta"
+        self.log_info(f"Decompressing gzip FASTA: {src} -> {out}")
+        with gzip.open(src, "rb") as fi, open(out, "wb") as fo:
+            shutil.copyfileobj(fi, fo)
+        return out
+
+    def _download_file(self, url, local):
+        """Download *url* to *local* using curl/wget via argv (no shell)."""
+        if shutil.which("curl"):
+            self.run_cmd(["curl", "-L", url, "-o", local])
+        elif shutil.which("wget"):
+            self.run_cmd(["wget", "-O", local, url])
+        else:
+            self.log_error("Neither curl nor wget found for downloading")
+            sys.exit(1)
+
     def resolve_reference_fasta(self):
         """Download / decompress --reference if needed; update self.reference_fasta."""
         if not self.reference_fasta:
             return
         src = self.reference_fasta
-        # URL download
+        # URL download (argv form so shell metacharacters in the URL are safe)
         if src.startswith("http://") or src.startswith("https://") or src.startswith("ftp://"):
             self.log_info(f"Downloading reference FASTA: {src}")
-            local = os.path.join(self.working_dir, "reference_input.fasta")
-            if shutil.which("curl"):
-                self.run_cmd(f'curl -L "{src}" -o "{local}"')
-            elif shutil.which("wget"):
-                self.run_cmd(f'wget -O "{local}" "{src}"')
-            else:
-                self.log_error("Neither curl nor wget found for downloading")
-                sys.exit(1)
+            local = os.path.join(self.working_dir,
+                                 self._download_local_name(src, "reference_input"))
+            self._download_file(src, local)
             src = local
-        # Decompress gzip
-        if src.endswith(".gz"):
-            self.log_info(f"Decompressing: {src}")
-            out = src[:-3]
-            with gzip.open(src, "rb") as fi, open(out, "wb") as fo:
-                shutil.copyfileobj(fi, fo)
-            src = out
+        # Decompress by content (gzip magic bytes), not filename
+        src = self._maybe_gunzip(src)
         if not os.path.isfile(src) or os.path.getsize(src) == 0:
             self.log_error(f"Reference FASTA not found or empty: {src}")
             sys.exit(1)
@@ -1020,21 +1047,11 @@ class PipelineRunner:
         src = self.compare_fasta
         if src.startswith("http://") or src.startswith("https://") or src.startswith("ftp://"):
             self.log_info(f"Downloading compare FASTA: {src}")
-            local = os.path.join(self.working_dir, "compare_input.fasta")
-            if shutil.which("curl"):
-                self.run_cmd(f'curl -L "{src}" -o "{local}"')
-            elif shutil.which("wget"):
-                self.run_cmd(f'wget -O "{local}" "{src}"')
-            else:
-                self.log_error("Neither curl nor wget found for downloading")
-                sys.exit(1)
+            local = os.path.join(self.working_dir,
+                                 self._download_local_name(src, "compare_input"))
+            self._download_file(src, local)
             src = local
-        if src.endswith(".gz"):
-            self.log_info(f"Decompressing: {src}")
-            out = src[:-3]
-            with gzip.open(src, "rb") as fi, open(out, "wb") as fo:
-                shutil.copyfileobj(fi, fo)
-            src = out
+        src = self._maybe_gunzip(src)
         if not os.path.isfile(src) or os.path.getsize(src) == 0:
             self.log_error(f"Compare FASTA not found or empty: {src}")
             sys.exit(1)

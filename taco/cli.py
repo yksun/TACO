@@ -59,7 +59,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.5 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.6 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -92,7 +92,10 @@ def parse_args():
     parser.add_argument('--assembly-only', action='store_true')
     parser.add_argument('--telomere-mode', choices=['known', 'auto', 'hybrid'], default='hybrid')
     parser.add_argument('--telo-end-window', type=int, default=5000)
-    parser.add_argument('--telo-score-window', type=int, default=500)
+    parser.add_argument('--telo-score-window', type=int, default=None,
+                        help='Telomere scoring window (bp). Default: taxon-aware '
+                             '(fungal 300; plant/vertebrate/animal 1000; other 500). '
+                             'An explicit value here is always honored.')
     parser.add_argument('--telo-kmer-min', type=int, default=4)
     parser.add_argument('--telo-kmer-max', type=int, default=30)
     parser.add_argument('--auto-mode', choices=['smart', 'n50'], default='smart')
@@ -128,7 +131,7 @@ def parse_args():
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.3.5')
+    parser.add_argument('--version', action='version', version='TACO v1.3.6')
     
     args = parser.parse_args()
 
@@ -146,10 +149,30 @@ def parse_args():
     elif args.merqury or args.merqury_db:
         args.merqury = True
     
+    # Steps 0-10, 14: assemblers + normalize/QC + report (14B assembly-only)
+    # Skips 11 (telomere pool), 12 (refinement), 13 (final QC)
+    assembly_only_steps = list(range(0, 11)) + [14]
     if args.assembly_only:
-        # Steps 0-10, 14: assemblers + normalize/QC + report (14B assembly-only)
-        # Skips 11 (telomere pool), 12 (refinement), 13 (final QC)
-        args.steps = list(range(0, 11)) + [14]
+        if args.steps:
+            # Honor an explicit --steps subset instead of silently discarding
+            # it, but keep it within the assembly-only step set.
+            try:
+                requested = expand_steps(args.steps)
+            except ValueError as e:
+                parser.error(str(e))
+            allowed = set(assembly_only_steps)
+            args.steps = [s for s in requested if s in allowed]
+            dropped = [s for s in requested if s not in allowed]
+            if dropped:
+                print(f"[warn] --assembly-only ignores step(s) {dropped}: "
+                      f"assembly-only mode covers steps 0-10 and 14 only.",
+                      file=sys.stderr)
+            if not args.steps:
+                parser.error(
+                    "--assembly-only combined with --steps left no runnable "
+                    "steps; assembly-only mode covers steps 0-10 and 14.")
+        else:
+            args.steps = assembly_only_steps
     elif args.steps:
         try:
             args.steps = expand_steps(args.steps)
@@ -162,7 +185,7 @@ def parse_args():
     for s in args.steps:
         if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.3.5 uses steps 0-14. "
+                f"Invalid step: {s}. TACO v1.3.6 uses steps 0-14. "
                 f"Full mode: 0-14. Assembly-only: 0-10, 14. "
                 f"Resume from refinement: -s 12-14.")
     return args

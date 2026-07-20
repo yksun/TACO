@@ -185,7 +185,8 @@ def _fasta_sort_minlen_with_map(infa, outfa, prefix="contig", minlen=0):
     return len(renamed), name_map
 
 
-def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None):
+def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None,
+                           id_thr=0.90):
     """
     Remove contigs that are mostly contained within larger contigs, using
     minimap2 self-alignment.  Keeps the longer contig when two overlap.
@@ -194,10 +195,19 @@ def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None
 
     Algorithm:
       1. Self-align with minimap2 -x asm5 -DP
-      2. For each alignment, if the smaller query is covered >= pct_cov%
-         by the larger target, mark the query for removal.
+      2. Aggregate all alignment blocks per (query, target) pair, computing a
+         merged query-coverage fraction and a pooled matches/aln-length
+         identity.  Mark the query for removal only when it is (a) covered
+         >= pct_cov% AND (b) >= id_thr identical to the target AND (c) strictly
+         shorter than the target (ties broken deterministically by name so
+         exactly one of an equal-length duplicate pair is kept, never both).
       3. Write surviving contigs to outfa.
       4. If exhaustive, repeat until no more removals.
+
+    Aggregating blocks and requiring high identity prevents a single shared
+    repeat / segmental-duplication block from deleting an otherwise distinct
+    contig, and the strict-shorter+tiebreak rule prevents total loss of both
+    copies of an equal-length duplicate.
     """
     if not os.path.isfile(infa) or os.path.getsize(infa) == 0:
         with open(outfa, 'w') as f:
@@ -232,24 +242,51 @@ def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None
         except Exception:
             break
 
-        # Parse PAF to find contained contigs
-        remove = set()
+        # Parse PAF, aggregating all blocks per (query, target) pair so a
+        # single repeat block cannot by itself trigger removal.
+        pair_stats = defaultdict(
+            lambda: {"qlen": 0, "tlen": 0, "ivals": [], "m": 0, "a": 0})
         for line in open(paf_path):
-            parts = line.strip().split('\t')
+            parts = line.rstrip("\n").split('\t')
             if len(parts) < 12:
                 continue
             qname, qlen, qstart, qend = parts[0], int(parts[1]), int(parts[2]), int(parts[3])
             tname, tlen = parts[5], int(parts[6])
-            if qname == tname:
-                continue  # skip self-hits
-
-            q_cov = (qend - qstart) * 100.0 / qlen if qlen > 0 else 0
-
-            # If the query is shorter/equal and sufficiently covered, mark for removal
-            if qlen <= tlen and q_cov >= pct_cov:
-                remove.add(qname)
+            matches, alnlen = int(parts[9]), int(parts[10])
+            if qname == tname or qlen <= 0 or alnlen <= 0:
+                continue  # skip self-hits / degenerate lines
+            d = pair_stats[(qname, tname)]
+            d["qlen"] = qlen
+            d["tlen"] = tlen
+            d["ivals"].append((qstart, qend))
+            d["m"] += matches
+            d["a"] += alnlen
 
         os.unlink(paf_path)
+
+        def _merged_len(ivals):
+            if not ivals:
+                return 0
+            ivals = sorted(ivals)
+            total = 0
+            cs, ce = ivals[0]
+            for s, e in ivals[1:]:
+                if s <= ce:
+                    ce = max(ce, e)
+                else:
+                    total += ce - cs
+                    cs, ce = s, e
+            return total + (ce - cs)
+
+        # Decide removals: shorter/contained, high-identity queries only.
+        remove = set()
+        for (qname, tname), d in pair_stats.items():
+            qlen, tlen = d["qlen"], d["tlen"]
+            q_cov = _merged_len(d["ivals"]) * 100.0 / qlen if qlen > 0 else 0
+            ident = d["m"] / max(1, d["a"])
+            if q_cov >= pct_cov and ident >= id_thr and (
+                    qlen < tlen or (qlen == tlen and qname < tname)):
+                remove.add(qname)
 
         if not remove:
             break
@@ -319,14 +356,28 @@ def _build_busco_csv(runner):
                         if h.strip().lower() == "status":
                             status_idx = i
                     break
-            S = D = F = M = 0
-            n = 0
+            # BUSCO full_table.tsv lists each *copy* of a Duplicated gene on
+            # its own line, so a per-line tally would over-count Duplicated and
+            # inflate the denominator n.  De-duplicate on the BUSCO id (column
+            # 0) so counts are gene-based and match short_summary percentages:
+            # a gene with any Duplicated line is Duplicated; otherwise it keeps
+            # its single Complete/Fragmented/Missing status.
+            status_by_id = {}
+            id_idx = 0 if (status_idx is None or status_idx != 0) else 1
             for ln in lines:
                 if not ln or ln.startswith("#"):
                     continue
                 parts = ln.split("\t")
                 st = parts[1].strip() if status_idx is None else (parts[status_idx].strip() if len(parts) > status_idx else "")
-                n += 1
+                bid = parts[id_idx].strip() if len(parts) > id_idx else ""
+                if not bid:
+                    continue
+                if st == "Duplicated" or status_by_id.get(bid) == "Duplicated":
+                    status_by_id[bid] = "Duplicated"
+                else:
+                    status_by_id.setdefault(bid, st)
+            S = D = F = M = 0
+            for st in status_by_id.values():
                 if st == "Complete":
                     S += 1
                 elif st == "Duplicated":
@@ -335,6 +386,7 @@ def _build_busco_csv(runner):
                     F += 1
                 elif st == "Missing":
                     M += 1
+            n = len(status_by_id)
             if n == 0:
                 return None
             return {"S": S, "D": D, "F": F, "M": M, "n": n}
@@ -1729,7 +1781,7 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
                 if tname not in parent_alignments:
                     parent_alignments[tname] = []
                 parent_alignments[tname].append(
-                    (pidx, qname, qcov, tcov, ident, ts, te))
+                    (pidx, qname, qlen, qcov, tcov, ident, ts, te))
 
     # Validate each merged contig
     validated = []
@@ -1771,17 +1823,17 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
 
         # Check 3-6: parent alignment structure
         alns = parent_alignments.get(mname, [])
-        p0_best_qcov = 0; p0_best_id = 0
-        p1_best_qcov = 0; p1_best_id = 0
+        p0_best_qcov = 0; p0_best_id = 0; p0_best_plen = 0
+        p1_best_qcov = 0; p1_best_id = 0; p1_best_plen = 0
         covered_intervals = []  # half-open intervals on merged contig
 
-        for pidx, qname, qcov, tcov, ident, ts, te in alns:
+        for pidx, qname, qlen, qcov, tcov, ident, ts, te in alns:
             if te > ts:
                 covered_intervals.append((ts, te))
             if pidx == 0 and qcov > p0_best_qcov:
-                p0_best_qcov = qcov; p0_best_id = ident
+                p0_best_qcov = qcov; p0_best_id = ident; p0_best_plen = qlen
             elif pidx == 1 and qcov > p1_best_qcov:
-                p1_best_qcov = qcov; p1_best_id = ident
+                p1_best_qcov = qcov; p1_best_id = ident; p1_best_plen = qlen
 
         covered_bp = 0
         if covered_intervals:
@@ -1805,6 +1857,28 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
         rec["merged_union_cov"] = round(union_cov, 3)
         rec["unexplained_bp"] = unexplained
 
+        # Per-merge chimera length gate: a legitimate overlap-merge is roughly
+        # the length of the LONGER of the two contigs that actually formed
+        # THIS merged contig (they overlap in the middle), whereas an inter-
+        # chromosomal chimera is roughly their SUM.  The global-max gate above
+        # (Check 2) uses the largest contig in the whole file, so a chimera of
+        # two mid-sized contigs slips through it; bounding against the two
+        # actual parent contigs restores the intended discrimination.  When
+        # minimap2 was unavailable (no parent alignments) we fall back to the
+        # global gate already applied above.
+        per_merge_parents = [pl for pl in (p0_best_plen, p1_best_plen) if pl > 0]
+        if per_merge_parents:
+            per_merge_thresh = int(max(per_merge_parents) * max_length_ratio)
+            if mlen > per_merge_thresh:
+                rec["reason"] = (f"length_exceeds_{max_length_ratio}x_parents "
+                                 f"({mlen}>{per_merge_thresh})")
+                validation_records.append(rec)
+                runner.log_warn(
+                    f"Rejected merged T2T '{mname}' ({mlen:,} bp) — exceeds "
+                    f"{per_merge_thresh:,} bp ({max_length_ratio}x the larger "
+                    f"parent contig), likely inter-chromosomal chimera")
+                continue
+
         # Identity check
         if p0_best_id < min_parent_id and p0_best_qcov > 0.1:
             rec["reason"] = f"parent1_low_identity ({p0_best_id:.3f}<{min_parent_id})"
@@ -1815,10 +1889,17 @@ def _validate_quickmerge_t2t(merged_fasta, input_fastas, runner,
             validation_records.append(rec)
             continue
 
-        # Parent coverage check
-        if p0_best_qcov < min_parent_qcov and p1_best_qcov < min_parent_qcov:
-            rec["reason"] = (f"both_parents_low_qcov "
-                             f"({p0_best_qcov:.2f},{p1_best_qcov:.2f}<{min_parent_qcov})")
+        # Parent coverage check: a validated quickmerge T2T must be a genuine
+        # two-parent join, so BOTH parent contigs must be substantially
+        # incorporated (each >= min_parent_qcov).  Requiring only one (the old
+        # AND-of-lows test) admitted pass-throughs where quickmerge kept one
+        # parent whole and the other contributed nothing, and one-sided
+        # chimeras.  This matches the documented "each parent contributes
+        # substantial query coverage" criterion.
+        if p0_best_qcov < min_parent_qcov or p1_best_qcov < min_parent_qcov:
+            rec["reason"] = (f"parent_qcov_below_threshold "
+                             f"(p1={p0_best_qcov:.2f}, p2={p1_best_qcov:.2f}; "
+                             f"both must be >={min_parent_qcov})")
             validation_records.append(rec)
             continue
 
@@ -1934,9 +2015,17 @@ def step_10_telomere_pool(runner):
                             f"Validated {len(new_t2t)} T2T contigs from "
                             f"quickmerge({base1} × {base2})"
                         )
+                        # Namespace merged contig names by their originating
+                        # pair.  The same .telo.fasta participates in several
+                        # pairs, and quickmerge can emit identically-named
+                        # contigs across pairs; without this, qm_pair_map and
+                        # the pool concatenation would collide (overwritten
+                        # provenance, duplicate FASTA headers for different
+                        # sequences).
                         for tname, tseq in new_t2t:
-                            qm_pair_map[tname] = (base1, base2)
-                        validated_t2t_from_merge.extend(new_t2t)
+                            uniq = f"{base1}_{base2}_{tname}"
+                            qm_pair_map[uniq] = (base1, base2)
+                            validated_t2t_from_merge.append((uniq, tseq))
                     else:
                         runner.log_info(
                             f"No validated T2T from quickmerge({base1} × {base2}) — "
@@ -2582,26 +2671,45 @@ def _merqury_best_k_from_tool(genome_size):
 
 
 def _ensure_merqury_db(runner):
-    """Find or build the read .meryl database used by Merqury."""
-    db = _find_existing_merqury_db(runner)
-    if db:
-        return db
-    if getattr(runner, 'merqury_db', None):
+    """Find or build the read .meryl database used by Merqury.
+
+    A database built at a DIFFERENT k-mer size must never be silently reused,
+    so the resolved k is checked first and a k-specific database is preferred
+    (and built when meryl is available) before falling back to any other
+    discoverable database.
+    """
+    # An explicitly supplied --merqury-db is authoritative regardless of k.
+    explicit = getattr(runner, 'merqury_db', None)
+    if explicit:
+        if os.path.isdir(explicit):
+            return explicit
+        runner.log_warn(f"Merqury database not found or not a directory: {explicit}")
         return None
 
     meryl_bin = shutil.which("meryl")
     fastq = getattr(runner, 'fastq', None)
-    if not meryl_bin or not fastq:
-        return None
-
     k = _resolve_merqury_k(runner)
-    os.makedirs("merqury", exist_ok=True)
+
+    # Prefer a database built at the resolved k so a stale db from a different
+    # k in the same working directory is not reused at the wrong k.
     db = f"merqury/reads.k{k}.meryl"
     if os.path.isdir(db):
         runner.log(f"Reusing existing {db}")
         runner.merqury_db = db
         return db
 
+    if not meryl_bin or not fastq:
+        # Cannot build; only now fall back to any discoverable db, warning
+        # that its k-mer size may not match the resolved k.
+        fallback = _find_existing_merqury_db(runner)
+        if fallback:
+            runner.log_warn(
+                f"Reusing discoverable Merqury db {fallback}; its k-mer size "
+                f"may differ from the resolved k={k} (meryl unavailable to "
+                f"rebuild at k={k})")
+        return fallback
+
+    os.makedirs("merqury", exist_ok=True)
     runner.log_info(f"Building Merqury k-mer database from reads (k={k})...")
     cmd = [
         meryl_bin, "count", f"k={k}", f"threads={runner.threads}",
@@ -3336,8 +3444,12 @@ def _self_dedup_non_telomeric(fasta_path, telo_ids, out_path, threads,
             cov_q = (qe - qs) / max(1, qlen)
 
             if cov_q >= cov_thr and ident >= id_thr:
-                # Shorter contig is the redundant one
-                if qlen <= tlen:
+                # Drop the shorter contig; break exact-length ties by name so
+                # exactly ONE of an equal-length redundant pair is dropped.
+                # minimap2 -D -P emits both A->B and B->A, so a plain "qlen <=
+                # tlen" test would drop both members of an equal pair and lose
+                # the sequence entirely.
+                if qlen < tlen or (qlen == tlen and qname < tname):
                     drop.add(qname)
                 else:
                     drop.add(tname)
@@ -3400,7 +3512,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
     lines = ["##gff-version 3"]
     lines.append(f"# TACO provenance annotation for {os.path.basename(final_fa)}")
     lines.append(f"# Backbone assembler: {backbone_assembler}")
-    lines.append(f"# Generated by TACO v1.3.5")
+    lines.append(f"# Generated by TACO v1.3.6")
     lines.append(f"# Columns: seqid source type start end score strand phase attributes")
     lines.append("#")
 
@@ -4415,16 +4527,31 @@ def _run_purge_dups(runner, input_fa, output_fa):
     elif runner.platform == "pacbio":
         mm2_preset = "map-pb"
 
-    paf = os.path.join(pd_dir, "reads_vs_asm.paf.gz")
-    cmd = (f"minimap2 -x {mm2_preset} -t {runner.threads} {input_fa} {runner.fastq} "
-           f"| gzip -c > {paf}")
+    # Run minimap2 to an uncompressed PAF first so its exit status is checked
+    # directly.  Piping straight into `gzip` masks a minimap2 crash/OOM (the
+    # pipe's status is gzip's, which succeeds), leaving a valid-but-truncated
+    # .gz that passes a size check and then biases the coverage cutoffs.
+    paf_raw = os.path.join(pd_dir, "reads_vs_asm.paf")
+    paf = paf_raw + ".gz"
+    cmd = (f"minimap2 -x {mm2_preset} -t {runner.threads} "
+           f"{input_fa} {runner.fastq} > {paf_raw}")
     result = _run_shell_capture(
         runner, cmd, "purge_dups: align reads to assembly",
         stderr_log=os.path.join(pd_dir, "01.read_alignment.stderr.log"))
-    if not os.path.isfile(paf) or os.path.getsize(paf) == 0:
-        runner.log_warn("purge_dups: read alignment produced no output; skipping")
+    if result.returncode != 0 or not os.path.isfile(paf_raw) \
+            or os.path.getsize(paf_raw) == 0:
+        runner.log_warn("purge_dups: read alignment failed or produced no "
+                        "output; skipping")
         _log_file_tail(runner, os.path.join(pd_dir, "01.read_alignment.stderr.log"),
                        "purge_dups read alignment stderr tail")
+        shutil.copy(input_fa, output_fa)
+        return False
+    gz_res = _run_shell_capture(
+        runner, f"gzip -f {shlex.quote(paf_raw)}",
+        "purge_dups: compress read-alignment PAF",
+        stderr_log=os.path.join(pd_dir, "01b.gzip.stderr.log"))
+    if gz_res.returncode != 0 or not os.path.isfile(paf):
+        runner.log_warn("purge_dups: failed to compress read-alignment PAF; skipping")
         shutil.copy(input_fa, output_fa)
         return False
     _log_file_status(runner, paf, "purge_dups read alignment PAF")
@@ -4703,19 +4830,23 @@ def _run_polishing(runner, input_fa, output_fa):
             runner.log("  Mapped and sorted HiFi reads")
 
             # Run NextPolish2: nextPolish2 -t N reads.bam genome.fa k21.yak k31.yak
+            # Redirect the polished FASTA straight to disk rather than
+            # capturing the whole genome in a Python string (peak memory ~2x
+            # genome size otherwise — significant for large plant/vertebrate
+            # assemblies).
+            abs_output = os.path.abspath(output_fa)
             cmd = (f"{np2_bin} -t {runner.threads} "
-                   f"{abs_bam} {abs_input} {abs_k21} {abs_k31}")
+                   f"{abs_bam} {abs_input} {abs_k21} {abs_k31} "
+                   f"> {shlex.quote(abs_output)}")
             result = _run_shell_capture(
                 runner, cmd, "Run NextPolish2",
                 stderr_log=os.path.join(polish_dir, "nextpolish2.stderr.log"))
 
-            if result.returncode == 0 and result.stdout.strip():
-                with open(output_fa, "w") as f:
-                    f.write(result.stdout)
-                if os.path.getsize(output_fa) > 0:
-                    runner.log("NextPolish2 polishing complete")
-                    _log_file_status(runner, output_fa, "NextPolish2 polished FASTA")
-                    return True
+            if result.returncode == 0 and os.path.isfile(output_fa) \
+                    and os.path.getsize(output_fa) > 0:
+                runner.log("NextPolish2 polishing complete")
+                _log_file_status(runner, output_fa, "NextPolish2 polished FASTA")
+                return True
 
             # If NextPolish2 failed, check if yak databases are stale/corrupt
             err_msg = (result.stderr or "").strip()[:300]
@@ -4803,18 +4934,19 @@ def _run_polishing(runner, input_fa, output_fa):
         stderr_log=os.path.join(polish_dir, "racon_mapping.stderr.log"))
     _log_file_status(runner, overlap_paf, "Racon overlap PAF")
 
-    # Racon outputs polished FASTA to stdout
-    cmd = f"racon -t {runner.threads} {runner.fastq} {overlap_paf} {input_fa}"
+    # Racon writes the polished FASTA to stdout; redirect straight to disk
+    # rather than buffering the whole genome in a Python string.
+    abs_output = os.path.abspath(output_fa)
+    cmd = (f"racon -t {runner.threads} {runner.fastq} {overlap_paf} {input_fa} "
+           f"> {shlex.quote(abs_output)}")
     result = _run_shell_capture(
         runner, cmd, "Run Racon",
         stderr_log=os.path.join(polish_dir, "racon.stderr.log"))
-    if result.stdout.strip():
-        with open(output_fa, "w") as f:
-            f.write(result.stdout)
-        if os.path.getsize(output_fa) > 0:
-            runner.log("Racon polishing complete")
-            _log_file_status(runner, output_fa, "Racon polished FASTA")
-            return True
+    if result.returncode == 0 and os.path.isfile(output_fa) \
+            and os.path.getsize(output_fa) > 0:
+        runner.log("Racon polishing complete")
+        _log_file_status(runner, output_fa, "Racon polished FASTA")
+        return True
 
     runner.log_warn("Racon produced no output; keeping unpolished assembly")
     _log_file_tail(runner, os.path.join(polish_dir, "racon.stderr.log"),
@@ -4823,10 +4955,31 @@ def _run_polishing(runner, input_fa, output_fa):
     return False
 
 
+def _collision_free_name(name, existing, exclude=None):
+    """Return *name*, or a unique ``name__dupN`` variant when *name* already
+    keys a DIFFERENT contig in *existing* (a name-keyed dict/set).
+
+    Donor contigs pulled from the Step-11 pool and backbone contigs from the
+    selected assembler can, in some configurations (e.g. a --reference chosen
+    as backbone whose native contig names overlap the pool namespace, or a
+    resume that skipped normalization), share a contig name.  Inserting a
+    donor under an already-used key would silently overwrite — and destroy —
+    an unrelated backbone contig, including a protected Tier 1 T2T contig.
+    ``exclude`` is the contig being intentionally replaced, which is allowed
+    to keep its name.
+    """
+    if name not in existing or name == exclude:
+        return name
+    i = 2
+    while f"{name}__dup{i}" in existing:
+        i += 1
+    return f"{name}__dup{i}"
+
+
 def step_12_refine(runner):
     """Step 12 - Backbone-first telomere-aware refinement with BUSCO trial validation.
 
-    v1.3.5 workflow — two-tier confidence model:
+    v1.3.6 workflow — two-tier confidence model:
 
     TIER 1 (immutable): protected strict-T2T contigs from the merged pool.
       These are NEVER replaced or displaced by rescue candidates unless the
@@ -4858,7 +5011,7 @@ def step_12_refine(runner):
       12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.5)")
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.6)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -5024,7 +5177,7 @@ def step_12_refine(runner):
                        f"cross-assembly mapping OK)")
 
     # ====================================================================
-    # BACKBONE-FIRST STRATEGY (v1.3.5)
+    # BACKBONE-FIRST STRATEGY (v1.3.6)
     #
     # The backbone assembler was selected for the highest composite quality
     # score (BUSCO S, T2T count, N50, contiguity).  Its contigs carry the
@@ -5537,11 +5690,17 @@ def step_12_refine(runner):
         if donor_name not in donor_seqs:
             continue
 
+        # Guard against a donor whose name collides with a DIFFERENT backbone
+        # contig (would overwrite it — possibly a protected Tier 1 — on
+        # insertion).  In the common case insert_name == donor_name.
+        insert_name = _collision_free_name(
+            donor_name, current_backbone, exclude=backbone_name)
+
         # Build trial assembly: replace backbone contig with donor
         trial_recs = []
         for n, s in current_backbone.items():
             if n == backbone_name:
-                trial_recs.append((donor_name, donor_seqs[donor_name]))
+                trial_recs.append((insert_name, donor_seqs[donor_name]))
             else:
                 trial_recs.append((n, s))
 
@@ -5627,7 +5786,13 @@ def step_12_refine(runner):
         if accepted:
             accepted_count += 1
             del current_backbone[backbone_name]
-            current_backbone[donor_name] = donor_seqs[donor_name]
+            current_backbone[insert_name] = donor_seqs[donor_name]
+            if insert_name != donor_name:
+                # Keep provenance/replaced_map consistent with the FASTA key.
+                trial_results[-1]["donor"] = insert_name
+                runner.log_warn(
+                    f"  Donor '{donor_name}' inserted as '{insert_name}' to "
+                    f"avoid overwriting a different backbone contig")
             if trial_busco:
                 baseline_busco = trial_busco
             baseline_bp = trial_bp
@@ -5778,11 +5943,13 @@ def step_12_refine(runner):
                             f"T2T replaces non-T2T "
                             f"(qcov={best_qcov:.0%}, tcov={best_tcov:.0%}, "
                             f"id={best_ident:.1%})")
+                        ins = _collision_free_name(
+                            pname, current_backbone, exclude=best_target)
                         del current_backbone[best_target]
-                        current_backbone[pname] = pseq
+                        current_backbone[ins] = pseq
                         novel_upgrades += 1
-                        replaced_map[pname] = (best_target,
-                                               "novel_t2t_upgrades_tier2")
+                        replaced_map[ins] = (best_target,
+                                             "novel_t2t_upgrades_tier2")
                         _write_fasta(list(current_backbone.items()), bb_check_fa)
                         continue
                     elif best_tcov >= partial_min_tcov and \
@@ -5837,10 +6004,12 @@ def step_12_refine(runner):
                                 f"{cov_check['uncovered_median']}× "
                                 f"(ratio {cov_check['ratio']:.2f}) → "
                                 f"backbone CHIMERIC. Replacing with T2T")
+                            ins = _collision_free_name(
+                                pname, current_backbone, exclude=best_target)
                             del current_backbone[best_target]
-                            current_backbone[pname] = pseq
+                            current_backbone[ins] = pseq
                             novel_upgrades += 1
-                            replaced_map[pname] = (
+                            replaced_map[ins] = (
                                 best_target,
                                 "chimeric_backbone_replaced_by_t2t")
                             _write_fasta(list(current_backbone.items()),
@@ -5922,7 +6091,8 @@ def step_12_refine(runner):
                             f"D delta {d_delta:+.1f}% (OK)")
 
                 # Passed all filters — add as genuinely novel
-                current_backbone[pname] = pseq
+                ins = _collision_free_name(pname, current_backbone)
+                current_backbone[ins] = pseq
                 novel_additions += 1
                 runner.log(f"  Added novel pool T2T '{pname}' "
                            f"({len(pseq):,} bp, genuinely novel region)")
@@ -5935,7 +6105,7 @@ def step_12_refine(runner):
                     os.remove(tmp)
         elif novel_candidates:
             for pname, pseq in novel_candidates:
-                current_backbone[pname] = pseq
+                current_backbone[_collision_free_name(pname, current_backbone)] = pseq
                 novel_additions += 1
                 runner.log(f"  Added novel pool T2T '{pname}' "
                            f"({len(pseq):,} bp) [minimap2 unavailable]")
@@ -6451,7 +6621,7 @@ def step_12_refine(runner):
         if warnings:
             warn_file = "final_results/refinement_warning.txt"
             with open(warn_file, "w") as f:
-                f.write(f"TACO v1.3.5 — Refinement quality warnings\n")
+                f.write(f"TACO v1.3.6 — Refinement quality warnings\n")
                 f.write(f"Backbone: {assembler} ({bb_bp:,} bp, "
                         f"{len(bb_recs)} contigs)\n")
                 f.write(f"Final:    refined ({fn_bp:,} bp, "
@@ -6567,7 +6737,6 @@ def _final_busco_qc(runner):
                               key=os.path.getmtime, reverse=True)
             for ft in ft_files:
                 try:
-                    S = D = F = M = n = 0
                     status_idx = None
                     with open(ft, errors="ignore") as f:
                         for ln in f:
@@ -6577,6 +6746,11 @@ def _final_busco_qc(runner):
                                     if h.strip().lower() == "status":
                                         status_idx = i
                                 break
+                    # De-duplicate on BUSCO id: a Duplicated gene spans several
+                    # copy lines in full_table.tsv, so tally per gene (not per
+                    # line) to match BUSCO's own gene-based short_summary.
+                    status_by_id = {}
+                    id_idx = 0 if (status_idx is None or status_idx != 0) else 1
                     with open(ft, errors="ignore") as f:
                         for ln in f:
                             if not ln or ln.startswith("#"):
@@ -6587,15 +6761,18 @@ def _final_busco_qc(runner):
                                 if status_idx is not None and len(parts) > status_idx
                                 else (parts[1].strip() if len(parts) > 1 else "")
                             )
-                            n += 1
-                            if st == "Complete":
-                                S += 1
-                            elif st == "Duplicated":
-                                D += 1
-                            elif st == "Fragmented":
-                                F += 1
-                            elif st == "Missing":
-                                M += 1
+                            bid = parts[id_idx].strip() if len(parts) > id_idx else ""
+                            if not bid:
+                                continue
+                            if st == "Duplicated" or status_by_id.get(bid) == "Duplicated":
+                                status_by_id[bid] = "Duplicated"
+                            else:
+                                status_by_id.setdefault(bid, st)
+                    S = sum(1 for v in status_by_id.values() if v == "Complete")
+                    D = sum(1 for v in status_by_id.values() if v == "Duplicated")
+                    F = sum(1 for v in status_by_id.values() if v == "Fragmented")
+                    M = sum(1 for v in status_by_id.values() if v == "Missing")
+                    n = len(status_by_id)
                     if n > 0:
                         return from_counts(S, D, F, M, n)
                 except Exception:
@@ -7333,7 +7510,11 @@ def _compare_vs_final_report(runner):
             "compare contigs")
 
     paf_path = os.path.join(out_dir, "compare_vs_final.paf")
-    cmd = (f"minimap2 -cx asm5 -t {runner.threads} --secondary=no "
+    # --cs emits the difference string that `paftools.js call` needs to derive
+    # SNVs/indels; without it the variant VCF is always empty regardless of
+    # actual divergence.  The tag is additive and inert for the other PAF
+    # consumers (per-pair aggregation, weak regions).
+    cmd = (f"minimap2 -cx asm5 --cs -t {runner.threads} --secondary=no "
            f"{final_fa} {compare_fa} > {paf_path}")
     runner.run_cmd(cmd, desc="Aligning compare FASTA to final.merged.fasta",
                    check=False)

@@ -252,19 +252,26 @@ def build_regex_for_motif(motif):
 
 # ── End-region scoring ───────────────────────────────────────────────────────
 
-def score_end(end_seq, score_window, user_motif_patterns, family_patterns):
+def score_end(end_seq, score_window, user_motif_patterns, family_patterns,
+              end="left"):
     """Score a terminal sequence for telomeric content.
 
-    Matches TACO.sh score_end() exactly:
-      - Tests all user motif patterns and all MOTIF_FAMILIES patterns
-      - Selects the pattern with highest covered_bp
-      - Computes composite score with proper normalization
+    Follows the TACO.sh score_end() design (density/longest_run/distance/
+    covered composite) with one correction: the ``distance_to_end`` term is
+    measured from the actual contig terminus.  The left window is ``seq[:w]``
+    so its terminus is the window's LEFT edge (offset 0); the right window is
+    ``seq[-w:]`` so its terminus is the window's RIGHT edge (offset w).  A
+    telomere shorter than the scoring window must not be penalised just for
+    sitting at the 3' end, so the right-end distance is measured as
+    ``w - max_match_end`` rather than ``min_match_start``.
 
     Args:
         end_seq: Terminal sequence to score (should be score_window-sized)
         score_window: Window size for scoring
         user_motif_patterns: list of (label, (fwd_regex_str, rev_regex_str)) tuples
         family_patterns: dict matching MOTIF_FAMILIES structure
+        end: "left" or "right" — which contig terminus this window represents,
+             used only to orient the distance-to-end term.
 
     Returns:
         dict with keys: covered_bp, longest_run, density, best_family,
@@ -298,19 +305,27 @@ def score_end(end_seq, score_window, user_motif_patterns, family_patterns):
             covered = 0
             longest = 0
             min_start = w
+            max_end = 0
             for m in re.finditer(pattern, ws, re.IGNORECASE):
                 span = m.end() - m.start()
                 covered += span
                 longest = max(longest, span)
                 min_start = min(min_start, m.start())
+                max_end = max(max_end, m.end())
             density = covered / max(w, 1)
             if covered > best["covered_bp"]:
+                # Distance of the telomere array from the actual contig
+                # terminus.  Left window: terminus is the left edge, so the
+                # earliest match offset (min_start).  Right window: terminus
+                # is the right edge, so the gap from the last match end
+                # (w - max_end).
+                dist = (w - max_end) if end == "right" else min_start
                 best.update(
                     covered_bp=covered,
                     longest_run=longest,
                     density=density,
                     best_family=label,
-                    distance_to_end=min_start,
+                    distance_to_end=dist,
                 )
         except re.error:
             continue
@@ -356,7 +371,7 @@ def classify_contig(left_score, right_score, strong_thr=0.25, weak_thr=0.08):
 
 def detect_telomeres(fasta_path, mode="hybrid", user_motif=None, end_window=5000,
                      score_window=500, kmer_min=4, kmer_max=30, threads=1,
-                     taxon="other"):
+                     taxon="other", strong_thr=0.25, weak_thr=0.08):
     """Main hybrid telomere detection matching TACO.sh logic.
 
     Steps:
@@ -469,10 +484,13 @@ def detect_telomeres(fasta_path, mode="hybrid", user_motif=None, end_window=5000
     for name, seq in contigs.items():
         left_end, right_end = contig_score_ends[name]
         left_result = score_end(left_end, score_window,
-                                user_motif_patterns, family_patterns)
+                                user_motif_patterns, family_patterns,
+                                end="left")
         right_result = score_end(right_end, score_window,
-                                 user_motif_patterns, family_patterns)
-        tier = classify_contig(left_result, right_result)
+                                 user_motif_patterns, family_patterns,
+                                 end="right")
+        tier = classify_contig(left_result, right_result,
+                               strong_thr=strong_thr, weak_thr=weak_thr)
         results.append({
             "contig": name,
             "length": contig_lengths[name],
@@ -564,6 +582,10 @@ def main():
     parser.add_argument("--mode", default="hybrid", choices=["known", "auto", "hybrid"])
     parser.add_argument("--out-prefix", required=True, help="Output file prefix")
     parser.add_argument("--motif", default="", help="User-provided motif")
+    parser.add_argument("--taxon", default="other",
+                        choices=["vertebrate", "animal", "plant", "insect",
+                                 "fungal", "other"],
+                        help="Taxon preset for motif-family selection")
     parser.add_argument("--end-window", type=int, default=5000)
     parser.add_argument("--score-window", type=int, default=500)
     parser.add_argument("--kmer-min", type=int, default=4)
@@ -589,6 +611,9 @@ def main():
         kmer_min=args.kmer_min,
         kmer_max=args.kmer_max,
         threads=args.threads,
+        taxon=args.taxon,
+        strong_thr=args.strong_threshold,
+        weak_thr=args.weak_threshold,
     )
 
     if not results:
