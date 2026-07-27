@@ -218,6 +218,30 @@ def test_screen_tolerates_missing_coverage():
     assert "contig_7" in {f["contig"] for f in flagged}
 
 
+def test_missing_coverage_record_is_not_treated_as_zero_depth():
+    """A contig absent from coverage_summary.tsv must not be flagged on depth.
+
+    median_cov=None means "no record", which is not the same as 0x. Reading it
+    as zero would flag a perfectly good contig as foreign on the strength of
+    absent data.
+    """
+    recs = [{"contig": "c1", "length": 5000000, "median_cov": 300, "gc": 47.0},
+            {"contig": "c2", "length": 4000000, "median_cov": 305, "gc": 47.5},
+            {"contig": "c3", "length": 3000000, "median_cov": None, "gc": 47.2}]
+    flagged, baseline = screen_contaminants(recs)
+    assert flagged == [], "a contig with no coverage record was flagged"
+    assert baseline["modal_depth"] > 0
+
+
+def test_foreign_gc_is_still_caught_without_any_depth_data():
+    """Losing the depth signal must not lose the GC signal."""
+    recs = [{"contig": "c1", "length": 5000000, "median_cov": None, "gc": 47.0},
+            {"contig": "c2", "length": 4000000, "median_cov": None, "gc": 47.5},
+            {"contig": "bact", "length": 4500000, "median_cov": None, "gc": 66.6}]
+    flagged, _ = screen_contaminants(recs)
+    assert [f["contig"] for f in flagged] == ["bact"]
+
+
 def test_length_weighted_median_resists_small_outliers():
     """Many tiny aberrant contigs must not move the baseline."""
     pairs = [(300.0, 5000000), (305.0, 4000000)] + [(15.0, 1000)] * 50

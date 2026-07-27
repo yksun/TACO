@@ -277,8 +277,13 @@ def screen_contaminants(contigs, depth_ratio_max=DEPTH_RATIO_MAX,
     if not recs:
         return [], {"modal_depth": 0.0, "modal_gc": 0.0, "n_contigs": 0}
 
+    # ``median_cov`` of None means "no coverage record for this contig", which
+    # is not the same as zero coverage.  Treating a missing record as 0x would
+    # flag it as a contaminant on the strength of absent data, so contigs
+    # without depth are excluded from the baseline and only screened on GC.
     modal_depth = length_weighted_median(
-        [(c.get("median_cov") or 0, c.get("length") or 0) for c in recs])
+        [(c.get("median_cov"), c.get("length") or 0) for c in recs
+         if c.get("median_cov") is not None])
     modal_gc = length_weighted_median(
         [(c.get("gc") or 0, c.get("length") or 0) for c in recs])
     baseline = {"modal_depth": modal_depth, "modal_gc": modal_gc,
@@ -289,13 +294,16 @@ def screen_contaminants(contigs, depth_ratio_max=DEPTH_RATIO_MAX,
         length = int(c["length"])
         if length < min_len:
             continue
-        depth = float(c.get("median_cov") or 0)
+        raw_depth = c.get("median_cov")
+        has_depth = raw_depth is not None
+        depth = float(raw_depth) if has_depth else 0.0
         gc = float(c.get("gc") or 0)
-        ratio = (depth / modal_depth) if modal_depth > 0 else 1.0
+        depth_informative = has_depth and modal_depth > 0
+        ratio = (depth / modal_depth) if depth_informative else 1.0
         gc_dev = abs(gc - modal_gc)
 
         signals = []
-        if modal_depth > 0 and ratio < depth_ratio_max:
+        if depth_informative and ratio < depth_ratio_max:
             signals.append(f"depth {depth:.0f}x is {ratio:.2f} of modal {modal_depth:.0f}x")
         if gc_dev > gc_dev_max:
             signals.append(f"GC {gc:.1f}% deviates {gc_dev:.1f} points from modal {modal_gc:.1f}%")
@@ -305,7 +313,7 @@ def screen_contaminants(contigs, depth_ratio_max=DEPTH_RATIO_MAX,
             signals.append(f"no BUSCO genes over {length:,} bp")
 
         # Depth or GC alone is enough to report; the other keys only corroborate.
-        primary = (modal_depth > 0 and ratio < depth_ratio_max) or (gc_dev > gc_dev_max)
+        primary = (depth_informative and ratio < depth_ratio_max) or (gc_dev > gc_dev_max)
         if primary:
             flagged.append({
                 "contig": c.get("contig"),
