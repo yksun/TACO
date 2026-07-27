@@ -42,7 +42,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.3.6"
+    PIPELINE_NAME = "TACO-1.3.7"
 
     def __init__(self, args):
         # Core parameters
@@ -89,6 +89,8 @@ class PipelineRunner:
         self.no_purge_dups = getattr(args, 'no_purge_dups', False)
         self.no_polish = getattr(args, 'no_polish', False)
         self.no_coverage_qc = getattr(args, 'no_coverage_qc', False)
+        self.concordance_mode = getattr(args, 'concordance_mode', 'exclude')
+        self.no_contam_screen = getattr(args, 'no_contam_screen', False)
         self.allow_t2t_replace = getattr(args, 'allow_t2t_replace', False)
 
         # Backbone selection

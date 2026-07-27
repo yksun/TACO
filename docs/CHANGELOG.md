@@ -5,6 +5,48 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.7] — 2026-07-27
+
+### Cross-assembler concordance: a single assembler's mis-join can no longer win backbone selection
+
+- **New `taco/concordance.py`.** A contig that one assembler presents as
+  telomere-to-telomere while every other assembler splits it in two is a chimera
+  candidate. This matters for backbone selection because fusing two *incomplete*
+  chromosome ends yields a contig with genuine telomeres at both outer ends and
+  nothing anomalous at the seam, so it satisfies the strict-T2T test and earns the
+  T2T score reward. The join is only visible as disagreement between assemblers —
+  evidence a single-assembly tool does not have.
+- **`_t2t_concordance_check` (step 10).** Aligns every strict-T2T contig against
+  the other assemblies and takes a majority vote, writing
+  `assemblies/t2t_concordance.tsv` and `assemblies/t2t_corroborated.tsv`.
+  `_auto_select_backbone` now scores on the *corroborated* T2T count. Requires no
+  reference genome. New `--concordance-mode {exclude,flag,off}` (default
+  `exclude`). Two split votes are required and uninformative voters are ignored,
+  so a single fragmented assembly cannot flag a real chromosome; if alignment
+  fails the verdict is `unresolved` and no contig is penalized.
+- **Mis-join detection in compare mode.** `contig_to_contig.tsv` recorded a contig
+  absorbing two compare chromosomes as two independent "1-to-1" rows, making the
+  fusion invisible. `mis_join_candidates.tsv` now reports it with the implied
+  junction coordinate.
+- **Contaminant screen.** Flags final-assembly contigs whose read depth and/or GC
+  mark them as foreign and writes `contamination_candidates.tsv` plus
+  `final.clean.fasta` **alongside** the unfiltered assembly. purge_dups removes
+  haplotypic duplication and will not remove a foreign genome. New
+  `--no-contam-screen`.
+- **Tests restored and extended.** `tests/` was deleted in 078f4ae; restored
+  `test_review_fixes.py` (8 tests) and added `test_concordance.py` (24 tests).
+  32 tests, no external tools required.
+
+Found in a real run: on *Fusarium tricinctum* MsR-QD66 (SRR33612568), Peregrine
+joined reference chromosomes 6 and 10 into one 6.5 Mb "T2T" contig that seven
+other assemblers and the published Hi-C assembly (GCA_050859235.1) keep separate.
+The concordance check flags it (4/4 voters split) and corrects the count 9 -> 8
+without changing which assembly is selected. The contaminant screen flags 4.64 Mb
+of probable bacterial sequence (66.6% GC, 19x against 312x modal depth, three 16S
+rRNA copies) that purge_dups had retained.
+
+---
+
 ## [1.3.6] — 2026-07-20 — correctness & robustness review
 
 Fixes from a full-pipeline correctness / scientific-validity / robustness

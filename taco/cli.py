@@ -59,7 +59,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.6 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.7 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -125,13 +125,26 @@ def parse_args():
     parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
     parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')
     parser.add_argument('--no-coverage-qc', action='store_true', help='Skip final coverage QC')
+    parser.add_argument('--concordance-mode', dest='concordance_mode',
+                        choices=['exclude', 'flag', 'off'], default='exclude',
+                        help='Cross-assembler validation of strict-T2T contigs. '
+                             '"exclude" (default) discounts contigs that most other '
+                             'assemblies split, so one assembler\'s mis-join cannot win '
+                             'backbone selection; "flag" reports them without changing '
+                             'the score; "off" disables the check.')
+    parser.add_argument('--no-contam-screen', dest='no_contam_screen',
+                        action='store_true',
+                        help='Skip the final coverage/GC contaminant screen. By default '
+                             'TACO flags anomalous contigs and writes '
+                             'final_results/final.clean.fasta alongside the unfiltered '
+                             'assembly without deleting anything.')
     parser.add_argument('--benchmark', action='store_true',
                         help='Write optional step timing/provenance files to benchmark_logs/')
     parser.add_argument('--allow-t2t-replace', action='store_true',
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.3.6')
+    parser.add_argument('--version', action='version', version='TACO v1.3.7')
     
     args = parser.parse_args()
 
@@ -185,7 +198,7 @@ def parse_args():
     for s in args.steps:
         if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.3.6 uses steps 0-14. "
+                f"Invalid step: {s}. TACO v1.3.7 uses steps 0-14. "
                 f"Full mode: 0-14. Assembly-only: 0-10, 14. "
                 f"Resume from refinement: -s 12-14.")
     return args

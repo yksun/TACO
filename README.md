@@ -75,6 +75,9 @@ TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mod
 - Assembly-only mode (`--assembly-only`) for publication-ready assembler benchmarking without refinement
 - Conservative telomere-aware backbone refinement: D-aware duplicate filter, read-coverage diagnostic for partial overlaps, BUSCO trial validation, and "do no harm" safety comparison
 - Structural quickmerge validation with parent alignment checks
+- Cross-assembler concordance checking: a contig that one assembler presents as telomere-to-telomere while the other assemblies split it is flagged as a possible mis-join and, by default, does not earn the T2T scoring reward — so a single assembler's chimera cannot win backbone selection. Needs no reference genome (`--concordance-mode`)
+- Mis-join detection against `--compare`: reports contigs that absorb two or more reference sequences, with the implied junction coordinate
+- Contaminant screen: flags final contigs whose read depth and/or GC mark them as foreign and writes `final.clean.fasta` alongside the unfiltered assembly, deleting nothing (`--no-contam-screen`)
 - Coverage QC: sliding-window read depth analysis with GFF3 output for genome browser visualization
 - Full provenance tracking: GFF3 annotation tracing every contig to its original assembler, with quickmerge region-level mapping
 - Mode-aware final reporting: Step 14A creates the full final comparison report; Step 14B creates the assembly-only summary
@@ -179,6 +182,8 @@ taco -g 12m -t 16 \
 | `--no-purge-dups` | Skip purge_dups after refinement |
 | `--no-polish` | Skip automatic polishing after refinement |
 | `--allow-t2t-replace` | Allow rescue donors to replace immutable Tier 1 (T2T) contigs. Disabled by default for safety |
+| `--concordance-mode` | Cross-assembler validation of strict-T2T contigs: `exclude` (default) discounts a contig that most other assemblies split, so one assembler's mis-join cannot win backbone selection; `flag` reports such contigs without changing the score; `off` disables the check. Costs one minimap2 alignment per (assembly, voter) pair — roughly 5 s each on a 45 Mb fungal genome. Needs no reference. |
+| `--no-contam-screen` | Skip the final coverage/GC contaminant screen. By default TACO flags final contigs whose read depth and/or GC mark them as foreign, writes `final_results/contamination_candidates.tsv`, and emits `final.clean.fasta` alongside the unfiltered assembly without deleting anything. |
 
 ### Assembly-Only Mode
 
@@ -200,7 +205,7 @@ When running selected steps with `-s`/`--steps`, TACO checks only the tools need
 
 Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs. Step 12 and later check for the Step 10/11 outputs they need. Step 13 runs only final QC on the refined assembly. Step 14 does not rerun final QC; it builds the report and organizes outputs. In full mode, `-s 14` always runs 14A. In assembly-only mode, `--assembly-only -s 14` runs 14B.
 
-For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.6, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.6 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.7, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.7 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -382,7 +387,7 @@ taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
 
 ## Telomere Detection
 
-TACO v1.3.6 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.7 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -643,7 +648,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.6)
+│   ├── __init__.py         # Package metadata (v1.3.7)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking

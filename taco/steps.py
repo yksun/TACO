@@ -24,6 +24,9 @@ from collections import defaultdict
 from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
 from taco.utils import ALL_ASSEMBLERS, EXCLUDED_FROM_BACKBONE, active_assemblers
+from taco.concordance import (split_vote, concordance_verdict,
+                              corroborated_t2t_count, detect_fusions,
+                              screen_contaminants)
 
 
 def _parse_genome_size(size_str):
@@ -3089,6 +3092,395 @@ def step_10_normalize_and_qc(runner):
     _write_merqury_csv()
     _build_assembly_info(runner)
     runner.log("Wrote assemblies/assembly_info.csv")
+    _t2t_concordance_check(runner)
+
+
+# ── v1.3.7: cross-assembler concordance, mis-join and contaminant screening ──
+
+def _read_strict_t2t(path):
+    """Return the strict_t2t contig names listed in a *.telomere_end_scores.tsv.
+
+    Parsed by header name rather than column position so the function survives
+    a change in column order.
+    """
+    names = []
+    if not os.path.isfile(path):
+        return names
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f, delimiter="\t"))
+    if not rows:
+        return names
+    hdr = [h.strip().lower() for h in rows[0]]
+    try:
+        ci = hdr.index("contig")
+    except ValueError:
+        ci = 0
+    ti = None
+    for cand in ("tier", "classification", "class"):
+        if cand in hdr:
+            ti = hdr.index(cand)
+            break
+    if ti is None:
+        return names
+    for r in rows[1:]:
+        if len(r) > max(ci, ti) and r[ti].strip() == "strict_t2t":
+            names.append(r[ci].strip())
+    return names
+
+
+def _subset_fasta(src_fa, names, out_fa):
+    """Write the named records of *src_fa* to *out_fa*; return how many."""
+    keep = set(names)
+    recs = [(n, s) for n, s in _read_fasta_records(src_fa) if n in keep]
+    _write_fasta(recs, out_fa)
+    return len(recs)
+
+
+def _paf_query_intervals(paf_path, min_block=2000):
+    """Parse a PAF into per-query target intervals measured on the query.
+
+    Returns ``({query: {target: [(qstart, qend), ...]}}, {query: qlen})``.
+    Alignment blocks shorter than *min_block* are ignored so that scattered
+    repeat hits cannot look like a structural split.
+    """
+    ivals = {}
+    qlens = {}
+    if not os.path.isfile(paf_path):
+        return ivals, qlens
+    with open(paf_path) as f:
+        for ln in f:
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 12:
+                continue
+            try:
+                q, qlen, qs, qe, t = p[0], int(p[1]), int(p[2]), int(p[3]), p[5]
+            except ValueError:
+                continue
+            if qe - qs < min_block:
+                continue
+            qlens[q] = qlen
+            ivals.setdefault(q, {}).setdefault(t, []).append((qs, qe))
+    return ivals, qlens
+
+
+def _t2t_concordance_check(runner):
+    """Corroborate every strict-T2T contig against the other assemblies.
+
+    A contig that one assembler presents as a single telomere-to-telomere
+    sequence, but that every other assembler breaks into two, is a chimera
+    candidate.  This matters because fusing two *incomplete* chromosome ends
+    yields a contig with genuine telomeres at both outer ends and nothing
+    anomalous at the seam, so it satisfies the strict-T2T test and is rewarded
+    by the backbone score.  The join is only visible as disagreement between
+    assemblers, which is evidence a single-assembly tool does not have.
+
+    Writes ``assemblies/t2t_concordance.tsv`` (one row per candidate contig)
+    and ``assemblies/t2t_corroborated.tsv`` (per-assembler counts, consumed by
+    :func:`_auto_select_backbone`).  Nothing is deleted and no assembly is
+    modified.
+    """
+    mode = getattr(runner, "concordance_mode", "exclude")
+    if mode == "off":
+        runner.log_info("Cross-assembler T2T concordance check disabled")
+        return {}
+    if not shutil.which("minimap2"):
+        runner.log_warn("minimap2 not found; skipping T2T concordance check")
+        return {}
+
+    work = "assemblies/concordance"
+    os.makedirs(work, exist_ok=True)
+
+    # Candidate assemblies: everything normalized in step 10 except the
+    # QC-only genomes and TACO's own outputs.
+    skip = set(EXCLUDED_FROM_BACKBONE) | {"final", "backbone", "merged", "assembly"}
+    asms = []
+    for fa in sorted(glob.glob("assemblies/*.result.fasta")):
+        name = os.path.basename(fa)[: -len(".result.fasta")]
+        if name.lower() in skip or os.path.getsize(fa) == 0:
+            continue
+        asms.append(name)
+    if len(asms) < 2:
+        runner.log_info("Fewer than two assemblies available; "
+                        "T2T concordance check needs at least two")
+        return {}
+
+    t2t_by_asm = {a: _read_strict_t2t(f"assemblies/{a}.telomere_end_scores.tsv")
+                  for a in asms}
+    contig_counts = {}
+    for a in asms:
+        # Count header lines rather than parsing records: this runs once per
+        # assembly and does not need the sequences.
+        try:
+            with open(f"assemblies/{a}.result.fasta") as fh:
+                contig_counts[a] = sum(1 for line in fh if line.startswith(">"))
+        except OSError:
+            contig_counts[a] = 0
+
+    # A hyper-fragmented assembly can never reproduce a multi-megabase contig
+    # intact, so it would only ever vote "uninformative".  Excluding it saves
+    # a great deal of alignment time without changing any verdict.
+    counts = sorted(c for c in contig_counts.values() if c > 0)
+    median_contigs = counts[len(counts) // 2] if counts else 0
+    frag_cap = max(200, 20 * median_contigs) if median_contigs else 0
+    voters = [a for a in asms if not (frag_cap and contig_counts[a] > frag_cap)]
+    dropped = [a for a in asms if a not in voters]
+    if dropped:
+        runner.log_info("Excluded from concordance voting as too fragmented "
+                        f"(> {frag_cap} contigs): {', '.join(dropped)}")
+
+    n_candidates = sum(len(v) for v in t2t_by_asm.values())
+    n_aln = sum(1 for a in asms if t2t_by_asm.get(a)
+                for b in voters if b != a)
+    runner.log(f"Cross-assembler T2T concordance: testing {n_candidates} "
+               f"strict-T2T contigs from {len(asms)} assemblies against "
+               f"{len(voters)} voters ({n_aln} pairwise alignments; "
+               f"disable with --concordance-mode off)")
+
+    rows = []
+    summary = {}
+    for a in asms:
+        names = t2t_by_asm.get(a) or []
+        if not names:
+            summary[a] = {"raw": 0, "corroborated": 0, "excluded": []}
+            continue
+        qfa = os.path.join(work, f"{a}.t2t.fa")
+        if _subset_fasta(f"assemblies/{a}.result.fasta", names, qfa) == 0:
+            summary[a] = {"raw": len(names), "corroborated": len(names), "excluded": []}
+            continue
+
+        votes_per_contig = {c: {} for c in names}
+        for b in voters:
+            if b == a:
+                continue
+            paf = os.path.join(work, f"{a}__vs__{b}.paf")
+            cmd = (f"minimap2 -cx asm5 -t {runner.threads} --secondary=no "
+                   f"assemblies/{b}.result.fasta {shlex.quote(qfa)} > {shlex.quote(paf)}")
+            res = _run_shell_capture(
+                runner, cmd, f"Concordance: {a} T2T contigs vs {b}",
+                stderr_log=os.path.join(work, f"{a}__vs__{b}.stderr.log"))
+            if res.returncode != 0:
+                continue
+            ivals, qlens = _paf_query_intervals(paf)
+            for c in names:
+                votes_per_contig[c][b] = split_vote(qlens.get(c, 0), ivals.get(c, {}))
+            if os.path.isfile(paf):
+                os.remove(paf)
+
+        verdicts = {}
+        for c in names:
+            v = concordance_verdict(votes_per_contig[c])
+            verdicts[c] = v
+            rows.append({
+                "assembler": a, "contig": c,
+                "n_intact": v["n_intact"], "n_split": v["n_split"],
+                "n_uninformative": v["n_uninformative"],
+                "verdict": v["verdict"], "reason": v["reason"],
+                "split_by": ",".join(sorted(k for k, val in votes_per_contig[c].items()
+                                            if val == "split")) or "-",
+            })
+            if v["verdict"] == "mis_join_candidate":
+                runner.log_warn(
+                    f"  Possible mis-join: {a} contig '{c}' is presented as one "
+                    f"telomere-to-telomere sequence but {v['n_split']} of "
+                    f"{v['n_informative']} other assemblies split it")
+
+        n_ok, excluded = corroborated_t2t_count(names, verdicts, mode=mode)
+        summary[a] = {"raw": len(names), "corroborated": n_ok, "excluded": excluded}
+
+    with open("assemblies/t2t_concordance.tsv", "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["assembler", "contig", "n_intact", "n_split",
+                    "n_uninformative", "verdict", "split_by", "reason"])
+        for r in rows:
+            w.writerow([r["assembler"], r["contig"], r["n_intact"], r["n_split"],
+                        r["n_uninformative"], r["verdict"], r["split_by"], r["reason"]])
+
+    with open("assemblies/t2t_corroborated.tsv", "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["assembler", "strict_t2t_raw", "strict_t2t_corroborated",
+                    "excluded_contigs", "mode"])
+        for a in asms:
+            s = summary.get(a, {"raw": 0, "corroborated": 0, "excluded": []})
+            w.writerow([a, s["raw"], s["corroborated"],
+                        ",".join(s["excluded"]) or "-", mode])
+
+    flagged = sum(1 for r in rows if r["verdict"] == "mis_join_candidate")
+    if flagged:
+        runner.log_warn(
+            f"T2T concordance: {flagged} contig(s) flagged as possible mis-joins; "
+            f"see assemblies/t2t_concordance.tsv"
+            + (" (excluded from the T2T scoring term)" if mode == "exclude"
+               else " (reported only; scoring unchanged)"))
+    else:
+        runner.log("T2T concordance: every strict-T2T contig is corroborated "
+                   "by the other assemblies")
+    return summary
+
+
+def _load_corroborated_t2t(mode="exclude"):
+    """Read ``assemblies/t2t_corroborated.tsv`` -> {assembler: corroborated}.
+
+    *mode* is the concordance mode of the **current** run.  A resumed run that
+    asks for ``flag`` or ``off`` must not silently inherit an ``exclude``
+    correction left behind by an earlier invocation, so the map is only
+    returned when the current run actually wants the counts adjusted.
+    """
+    path = "assemblies/t2t_corroborated.tsv"
+    out = {}
+    if mode != "exclude" or not os.path.isfile(path):
+        return out
+    try:
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f, delimiter="\t"):
+                a = (r.get("assembler") or "").strip()
+                if not a:
+                    continue
+                if (r.get("mode") or "").strip() != "exclude":
+                    continue
+                out[a] = float(r.get("strict_t2t_corroborated") or 0)
+    except Exception:
+        return {}
+    return out
+
+
+def _emit_mis_join_candidates(runner, out_dir):
+    """Flag contigs that absorb two or more sequences of the --compare genome.
+
+    ``contig_to_contig.tsv`` records each compare sequence's best target, so a
+    contig receiving two compare chromosomes appears as two independent
+    "1-to-1" rows and the fusion is invisible in that table.
+    """
+    c2c = os.path.join(out_dir, "contig_to_contig.tsv")
+    if not os.path.isfile(c2c):
+        return []
+    rows = []
+    try:
+        with open(c2c, newline="") as f:
+            for r in csv.DictReader(f, delimiter="\t"):
+                rows.append({
+                    "compare_contig": r.get("compare_contig"),
+                    "compare_len": r.get("compare_len") or 0,
+                    "target_contig": r.get("best_target_contig"),
+                    "target_len": r.get("target_len") or 0,
+                    "aligned_bp": r.get("best_target_aligned_bases") or 0,
+                })
+    except Exception as exc:
+        runner.log_warn(f"Could not parse {c2c} for mis-join detection: {exc}")
+        return []
+
+    fusions = detect_fusions(rows)
+    path = os.path.join(out_dir, "mis_join_candidates.tsv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["target_contig", "target_len", "n_compare_sequences",
+                    "compare_sequences", "compare_total_len",
+                    "length_excess_vs_sum", "implied_junctions", "reason"])
+        for x in fusions:
+            w.writerow([x["target_contig"], x["target_len"],
+                        x["n_compare_sequences"], x["compare_sequences"],
+                        x["compare_total_len"], x["length_excess_vs_sum"],
+                        x["implied_junctions"], x["reason"]])
+    if fusions:
+        for x in fusions:
+            runner.log_warn(
+                f"Possible mis-join: {x['target_contig']} absorbs "
+                f"{x['n_compare_sequences']} compare sequences "
+                f"({x['compare_sequences']}); implied junction near "
+                f"{x['implied_junctions']}")
+        runner.log_warn(f"Wrote {path}")
+    else:
+        runner.log_info("No compare-genome mis-join candidates detected")
+    return fusions
+
+
+def _screen_contamination(runner):
+    """Flag final-assembly contigs whose depth and/or GC mark them as foreign.
+
+    TACO already records per-contig read depth; this acts on it.  purge_dups
+    removes haplotypic duplication and will not remove a foreign genome, so a
+    low-coverage, compositionally divergent contig can survive to the final
+    assembly.  A filtered FASTA is written *alongside* the unfiltered one so
+    that no sequence is destroyed and the choice stays with the user.
+    """
+    if getattr(runner, "no_contam_screen", False):
+        runner.log_info("Contaminant screen disabled")
+        return []
+
+    final_fa = None
+    for cand in ("final_results/final.merged.fasta", "assemblies/final.merged.fasta"):
+        if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+            final_fa = cand
+            break
+    if not final_fa:
+        return []
+
+    cov_tsv = None
+    for cand in ("final_results/coverage_summary.tsv",
+                 "assemblies/coverage_qc/coverage_summary.tsv"):
+        if os.path.isfile(cand):
+            cov_tsv = cand
+            break
+
+    depth = {}
+    if cov_tsv:
+        try:
+            with open(cov_tsv, newline="") as f:
+                for r in csv.DictReader(f, delimiter="\t"):
+                    c = (r.get("contig") or "").strip()
+                    if c:
+                        depth[c] = float(r.get("median_cov") or 0)
+        except Exception:
+            depth = {}
+    else:
+        runner.log_info("No coverage summary available; contaminant screen will "
+                        "use GC composition only")
+
+    contigs = []
+    for name, seq in _read_fasta_records(final_fa):
+        u = seq.upper()
+        n = len(u)
+        if n == 0:
+            continue
+        gc = 100.0 * (u.count("G") + u.count("C")) / n
+        contigs.append({"contig": name, "length": n,
+                        "median_cov": depth.get(name), "gc": gc})
+    if not contigs:
+        return []
+
+    flagged, baseline = screen_contaminants(contigs)
+    out_dir = "final_results" if os.path.isdir("final_results") else "assemblies"
+    path = os.path.join(out_dir, "contamination_candidates.tsv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["contig", "length", "median_cov", "depth_ratio", "gc",
+                    "gc_deviation", "n_signals", "signals"])
+        for r in flagged:
+            w.writerow([r["contig"], r["length"], r["median_cov"],
+                        r["depth_ratio"], r["gc"], r["gc_deviation"],
+                        r["n_signals"], r["signals"]])
+
+    runner.log_info(f"Contaminant screen baseline: modal depth "
+                    f"{baseline['modal_depth']:.0f}x, modal GC "
+                    f"{baseline['modal_gc']:.2f}%")
+    if not flagged:
+        runner.log("Contaminant screen: no anomalous contigs detected")
+        return []
+
+    total = sum(r["length"] for r in flagged)
+    for r in flagged:
+        runner.log_warn(f"  Possible foreign sequence: {r['contig']} "
+                        f"({r['length']:,} bp) — {r['signals']}")
+    runner.log_warn(f"Contaminant screen: {len(flagged)} contig(s) totalling "
+                    f"{total:,} bp flagged; see {path}")
+
+    drop = {r["contig"] for r in flagged}
+    clean = [(n, s) for n, s in _read_fasta_records(final_fa) if n not in drop]
+    clean_path = os.path.join(out_dir, "final.clean.fasta")
+    _write_fasta(clean, clean_path)
+    runner.log_warn(f"Wrote {clean_path} with the flagged contigs removed "
+                    f"({len(clean)} contigs). The unfiltered assembly is "
+                    f"unchanged; review before using either.")
+    return flagged
 
 
 def _auto_select_backbone(runner):
@@ -3128,6 +3520,8 @@ def _auto_select_backbone(runner):
         except (IndexError, ValueError):
             return default
 
+    _corroborated_map = _load_corroborated_t2t(
+        getattr(runner, "concordance_mode", "exclude"))
     best_name = None
     best_score = None
     records = []
@@ -3168,6 +3562,13 @@ def _auto_select_backbone(runner):
         contigs = get_val("# contigs", idx)
         n50 = get_val("n50", idx)
         t2t = get_val("telomere strict t2t contigs", idx)
+        # v1.3.7: a strict-T2T contig that every other assembler splits is a
+        # chimera candidate and must not earn the T2T reward, or a single
+        # assembler's mis-join can win backbone selection outright.
+        t2t_raw = t2t
+        _corr = _corroborated_map.get(asm)
+        if _corr is not None and _corr != t2t:
+            t2t = _corr
         single = get_val("telomere single-end strong contigs", idx)
         merqury_qv = get_val("merqury qv", idx)
         merqury_comp = get_val("merqury completeness (%)", idx)
@@ -3202,7 +3603,7 @@ def _auto_select_backbone(runner):
 
         records.append({
             "assembler": asm, "busco_s": busco_s, "busco_d": busco_d,
-            "t2t": t2t, "single_tel": single, "merqury_qv": merqury_qv,
+            "t2t": t2t, "t2t_raw": t2t_raw, "single_tel": single, "merqury_qv": merqury_qv,
             "merqury_comp": merqury_comp, "contigs": contigs,
             "n50": n50, "score": score,
         })
@@ -3512,7 +3913,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
     lines = ["##gff-version 3"]
     lines.append(f"# TACO provenance annotation for {os.path.basename(final_fa)}")
     lines.append(f"# Backbone assembler: {backbone_assembler}")
-    lines.append(f"# Generated by TACO v1.3.6")
+    lines.append(f"# Generated by TACO v1.3.7")
     lines.append(f"# Columns: seqid source type start end score strand phase attributes")
     lines.append("#")
 
@@ -4979,7 +5380,7 @@ def _collision_free_name(name, existing, exclude=None):
 def step_12_refine(runner):
     """Step 12 - Backbone-first telomere-aware refinement with BUSCO trial validation.
 
-    v1.3.6 workflow — two-tier confidence model:
+    v1.3.7 workflow — two-tier confidence model:
 
     TIER 1 (immutable): protected strict-T2T contigs from the merged pool.
       These are NEVER replaced or displaced by rescue candidates unless the
@@ -5011,7 +5412,7 @@ def step_12_refine(runner):
       12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.6)")
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.7)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -5177,7 +5578,7 @@ def step_12_refine(runner):
                        f"cross-assembly mapping OK)")
 
     # ====================================================================
-    # BACKBONE-FIRST STRATEGY (v1.3.6)
+    # BACKBONE-FIRST STRATEGY (v1.3.7)
     #
     # The backbone assembler was selected for the highest composite quality
     # score (BUSCO S, T2T count, N50, contiguity).  Its contigs carry the
@@ -6621,7 +7022,7 @@ def step_12_refine(runner):
         if warnings:
             warn_file = "final_results/refinement_warning.txt"
             with open(warn_file, "w") as f:
-                f.write(f"TACO v1.3.6 — Refinement quality warnings\n")
+                f.write(f"TACO v1.3.7 — Refinement quality warnings\n")
                 f.write(f"Backbone: {assembler} ({bb_bp:,} bp, "
                         f"{len(bb_recs)} contigs)\n")
                 f.write(f"Final:    refined ({fn_bp:,} bp, "
@@ -8568,12 +8969,15 @@ def step_14_report(runner):
     else:
         runner.log("Step 14A - Final comparison report and cleanup")
         _final_comparison_report(runner)
+        _screen_contamination(runner)
         # 14C: compare-vs-final report — only when --compare was supplied
         # and final.merged.fasta exists (the helper itself short-circuits
         # if either condition is unmet).
         if getattr(runner, "compare_fasta", None):
             runner.log("Step 14C - Compare-vs-final contig-to-contig report")
             _compare_vs_final_report(runner)
+            _emit_mis_join_candidates(
+                runner, os.path.join("final_results", "compare_report"))
         _cleanup_outputs(runner)
 
 
