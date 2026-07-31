@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="taco-genome",
-    version="1.3.9",
+    version="1.4.0",
     description="Telomere-Aware Contig Optimization pipeline",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
