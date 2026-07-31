@@ -17,7 +17,7 @@ STEP_NAMES = {
     10: "Normalize + QC comparison (BUSCO + Telomere + QUAST + Merqury)",
     11: "Build telomere pool (quickmerge + validation)",
     12: "Backbone selection and refinement",
-    13: "Final QC (BUSCO + Telomere + QUAST + Merqury on final)",
+    13: "Purify + final QC (13A contaminant screen / 13B chimera resolution / 13C emit / 13D BUSCO + Telomere + QUAST + Merqury)",
     14: "Report + cleanup (14A: full comparison / 14B: assembly-only)",
 }
 
@@ -59,7 +59,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.7 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.3.9 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -134,17 +134,45 @@ def parse_args():
                              'the score; "off" disables the check.')
     parser.add_argument('--no-contam-screen', dest='no_contam_screen',
                         action='store_true',
-                        help='Skip the final coverage/GC contaminant screen. By default '
-                             'TACO flags anomalous contigs and writes '
-                             'final_results/final.clean.fasta alongside the unfiltered '
-                             'assembly without deleting anything.')
+                        help='Alias for --purify-mode off. Skips sub-steps 13A-13C '
+                             'entirely, so final QC measures the unfiltered merge.')
+    parser.add_argument('--purify-mode', dest='purify_mode',
+                        choices=['on', 'off'], default='on',
+                        help='Sub-step 13A-13C purification, ON by default: screen '
+                             'foreign sequence and resolve chimeras BEFORE final QC, so '
+                             'the reported metrics describe the assembly TACO delivers. '
+                             'final.merged.fasta always keeps the unfiltered merge and '
+                             'removed contigs are preserved in purify_excluded.fasta, so '
+                             'no sequence is destroyed either way.')
+    parser.add_argument('--metagenome', dest='metagenome', action='store_true',
+                        help='Treat the sample as a deliberate mixture. Anomalous contigs '
+                             'are still reported in purification_report.tsv but nothing '
+                             'is removed, because a metagenome has no single modal depth '
+                             'or composition for the screen to work against. Use this for '
+                             'co-cultures, holobionts, and lichen or symbiont assemblies '
+                             'where the "contaminant" is the point.')
+    parser.add_argument('--chimera-action', dest='chimera_action',
+                        choices=['split', 'replace', 'report', 'off'],
+                        default='split',
+                        help='What to do with a contig that other assemblies split and '
+                             'reads fail to span. "split" (default) cuts it at the '
+                             'consensus breakpoint, preserving the backbone sequence and '
+                             'its polish; "replace" substitutes the corroborating '
+                             'assembly\'s contigs; "report" only records it; "off" skips '
+                             'the cross-check. Nothing is broken without a cross-assembler '
+                             'majority, an agreed breakpoint, and read evidence against '
+                             'the join.')
+    parser.add_argument('--spanning-anchor', dest='spanning_anchor', type=int,
+                        default=1000, metavar='BP',
+                        help='Aligned anchor required on each side of a candidate junction '
+                             'for a read to count as spanning it (default 1000).')
     parser.add_argument('--benchmark', action='store_true',
                         help='Write optional step timing/provenance files to benchmark_logs/')
     parser.add_argument('--allow-t2t-replace', action='store_true',
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.3.7')
+    parser.add_argument('--version', action='version', version='TACO v1.3.9')
     
     args = parser.parse_args()
 
@@ -198,7 +226,7 @@ def parse_args():
     for s in args.steps:
         if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.3.7 uses steps 0-14. "
+                f"Invalid step: {s}. TACO v1.3.9 uses steps 0-14. "
                 f"Full mode: 0-14. Assembly-only: 0-10, 14. "
                 f"Resume from refinement: -s 12-14.")
     return args

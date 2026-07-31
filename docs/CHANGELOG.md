@@ -5,6 +5,164 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.9] — 2026-07-31
+
+### Purification now runs before measurement, and it acts
+
+v1.3.7 detected both of the problems below accurately and then changed nothing a
+user reads. The contaminant screen ran in step 14A, *after* step 13 had already
+measured BUSCO, telomere counts, QUAST and Merqury on the unfiltered merge, and
+`final_assembly.fasta` was copied from that same unfiltered merge. On the run
+that motivated it the delivered assembly was 50,873,779 bp at 49.34% GC when the
+truth was 46,238,257 bp at 47.62% — the screen had identified the 4.64 Mb
+responsible and written it to a side file nothing downstream consumed.
+
+- **Step 13 is now "Purify + final QC"**, with sub-steps 13A screen, 13B chimera
+  resolution, 13C emit, 13D measure. Purification and measurement are the same
+  step, so the reported metrics cannot describe a different assembly than the one
+  TACO delivers — the v1.3.7 defect is now structurally impossible rather than
+  merely fixed. **Step numbers are unchanged**: every existing `-s` recipe keeps
+  working and silently becomes correct.
+- **`final_assembly.fasta` is the purified assembly.** `final.merged.fasta`
+  remains the unfiltered merge and everything removed is preserved in
+  `purify_excluded.fasta`, so no sequence is destroyed.
+- New `taco/purify.py` holds the decision logic as pure functions, unit-tested
+  without minimap2, samtools, BUSCO, or a reference genome.
+
+### Contaminant screening rewritten to generalise beyond one genome
+
+The v1.3.7 rule — fixed `DEPTH_RATIO_MAX = 0.34` **or** `GC_DEV_MAX = 8.0` on a
+length-weighted median baseline — worked on the genome it was written for and is
+unsafe elsewhere. Three defects, each measured:
+
+- **The baseline inverted.** A length-weighted median is the assembly's midpoint
+  by length, so once foreign sequence passes half the assembly the "baseline"
+  becomes the contaminant and the host is measured against it. Iterative trimming
+  cannot rescue this — the initial centre sits on the wrong cluster and the sigma
+  is inflated by the very gap that should be resolved, so nothing is ever trimmed.
+  The baseline is now the **heaviest cluster** by sequence length, which is also
+  what "modal depth" means in a coverage histogram.
+- **A single signal could condemn a contig.** No established tool removes sequence
+  on GC or coverage alone; BlobToolKit's premise is that GC × coverage needs a
+  third axis because both are confounded. Removal now requires **two independent
+  primary signals**, or one plus corroboration.
+- **Fixed absolute thresholds do not travel.** 8 GC points is ~13 robust sigma on
+  this genome and under 1 sigma on a compositionally heterogeneous one. Rules are
+  now a robust z-score **and** an absolute effect size — both, because either
+  alone fails. A textbook Iglewicz–Hoaglin `|z| > 3.5` on GC flags a real 3.08 Mb
+  chromosome here at −3.71; the 5-point floor is what saves it. Robust sigmas are
+  floored, because the real contigs of a good assembly agree on depth to within
+  half a percent and the unfloored MAD collapses.
+
+Guards that protect real-but-atypical sequence, each of which was a live false
+positive on the motivating genome: telomere arrays at both ends veto a removal;
+depth ≥ 3× core marks an organelle or collapsed repeat rather than a contaminant;
+composition-only calls need ≥ 250 kb; and nothing is removed if it would discard
+more than 25% of the assembly or if no cluster holds a majority of the length.
+
+**BUSCO gene content is recorded and deliberately never used to remove anything.**
+On this genome a real 3.08 Mb chromosome carries zero ascomycota BUSCOs while the
+bacterial contig carries three, so gene content does not separate them. The
+v1.3.7 `busco_count == 0 and length >= 1 Mb` signal would have condemned a
+chromosome.
+
+- New `--metagenome`: report anomalies, never remove. A metagenome has no single
+  modal depth or composition for the screen to work against, so the premise does
+  not hold. For co-cultures, holobionts, lichens, and symbiont assemblies.
+- New `--purify-mode {on,off}`, default `on`. `--no-contam-screen` is kept as an
+  alias for `off` so a v1.3.7 command line does not silently gain a stage that
+  modifies the assembly.
+
+### Chimeras are now detected across every contig, and repaired
+
+v1.3.7 cross-checked only contigs already classified strict-T2T, purely to correct
+the backbone selection score, and deleted the alignment PAFs immediately after
+voting. So a chimera without telomeres at both ends was never examined, the
+coordinates needed to act were discarded, and the corrected count reached the
+*score* but never the *reported* metric — `final.telo_metrics.tsv` still claimed
+9 strict-T2T contigs when 8 was true.
+
+Step 12C's two chimera gates could not have caught it either, for structural
+reasons rather than threshold ones:
+
+- It screened only `protected_telomere_contigs.fasta`; the offending contig
+  arrived by the **backbone** path, which 12C never examines.
+- Its cross-assembly mapping gate treated the backbone's *own* assembly as a
+  voting target, so every backbone contig self-aligned at 100% coverage. The gate
+  could not fire on any assembler-sourced contig.
+- Its size gate derived the threshold from the largest contig across assemblies —
+  itself another assembler's mis-join here, inflating the threshold to 13.0 Mb.
+  The chimera was in any case *smaller* than the largest real chromosome, so no
+  length statistic can catch it.
+
+13B replaces all of that:
+
+- **Every** contig above 500 kb of the delivered assembly is cross-checked
+  against every other assembly, excluding the backbone's own.
+- Per-voter alignment intervals are **retained**, which is what makes a
+  reference-free breakpoint estimate possible: each voter that splits the contig
+  into two substantial, largely disjoint components contributes the midpoint of
+  its interior gap, and the consensus is the median of those.
+- **Read-spanning evidence decides.** Coverage continuity is not evidence of a
+  real join — Tigmint documents exactly this case — and at a repeat-mediated
+  mis-join the depth *spikes* rather than dips, so a coverage-dip test sees
+  nothing, while reads map inside the repeat rather than clipping at its edge, so
+  a clip-pileup test sees nothing either. The spanning count is judged as a
+  fraction of the local pileup, because depth varies by an order of magnitude
+  across such regions.
+- Nothing is broken without a cross-assembler majority, an agreed breakpoint,
+  **and** reads that fail to span it. If reads *do* span it, TACO keeps a join
+  every other assembler missed. Telomeres at both ends raise the bar to a read
+  refutation rather than exempting the contig, since a fused pair of incomplete
+  chromosome ends is precisely what produces that signature.
+- New `--chimera-action {split,replace,report,off}`, default `split` — cutting in
+  place preserves the backbone sequence and its polish. New `--spanning-anchor`.
+
+### Also fixed
+
+- `concordance_verdict` treated a tie as corroboration (`n_split > n_intact`), so
+  an even split silently protected a candidate. A tie now flags.
+- `split_vote` called "split" on two targets piled onto the *same* part of the
+  query, contradicting its own docstring. Overlapping components now read as a
+  repeat family, not a junction.
+- GC is computed over ACGT only. Counting N as non-GC dragged a gappy contig's GC
+  downward and could manufacture a composition outlier.
+- `taco/concordance.py` now keeps only the voting logic.
+- The 1.3.7 entry below undercounted its own tests (26 in `test_concordance.py`,
+  37 across the suite, and it omitted `test_v135_rescue.py`).
+
+### Verified against the reference rather than asserted
+
+Sub-steps 13A–13C were run against the real *Fusarium tricinctum* MsR-QD66
+assembly (HiFi SRR33612568) and checked against the published Hi-C assembly
+GCA_050859235.1, which purification never sees:
+
+| | v1.3.7 delivered | v1.3.9 delivered | Hi-C reference |
+|---|---|---|---|
+| contigs | 11 | 10 | 10 |
+| total length | 50,873,779 | 46,238,257 | 46,236,445 |
+| GC | 49.34% | 47.62% | 47.61% |
+| strict T2T reported | 9 | 8 | 6 |
+
+The two removed contigs are exactly the two QUAST reports as wholly unaligned to
+the reference (4,635,522 bp, matching to the base pair). The chimera was cut at
+1,593,380, inside the reference-derived seam at 1,577,246–1,598,296, on 7-of-7
+assembler agreement with 0 of 6,040 overlapping reads spanning it — while the same
+test *supported* the equivalent position on all eight other contigs, at 34 to 295
+spanning reads each. The honest telomere count of 8 still beats the published
+Hi-C assembly's 6.
+
+The mechanism, for the record: the seam is a collapsed tandem array of a ~7.9 kb
+unit at ~19× the assembly's modal depth, spanning roughly 62 kb as assembled and
+therefore ~1.2 Mb in reality. Peregrine joined two chromosomes through it. Both
+reference scaffolds terminate at that array, which is why each lacks exactly the
+telomere facing the other.
+
+Tests: `tests/test_purify.py` adds 58, including the three false-positive traps
+above as regressions, and `tests/run_all.py` runs the whole suite in one command for the first time. Suite total 87 across four files (eight contaminant tests moved out of `test_concordance.py` into the rewritten module's own file), no external tools required.
+
+---
+
 ## [1.3.7] — 2026-07-27
 
 ### Cross-assembler concordance: a single assembler's mis-join can no longer win backbone selection
