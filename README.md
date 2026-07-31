@@ -37,6 +37,7 @@ TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natu
 - [Outputs And Reports](#outputs-and-reports)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
+- [Use Of AI Assistance](#use-of-ai-assistance)
 - [Citation](#citation)
 - [License](#license)
 
@@ -209,7 +210,7 @@ When running selected steps with `-s`/`--steps`, TACO checks only the tools need
 
 Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs. Step 12 and later check for the Step 10/11 outputs they need. Step 13 runs only final QC on the refined assembly. Step 14 does not rerun final QC; it builds the report and organizes outputs. In full mode, `-s 14` always runs 14A. In assembly-only mode, `--assembly-only -s 14` runs 14B.
 
-For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.9, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.9 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.4.0, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.4.0 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -395,7 +396,7 @@ taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
 
 ## Telomere Detection
 
-TACO v1.3.9 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.4.0 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -660,7 +661,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.9)
+│   ├── __init__.py         # Package metadata (v1.4.0)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
@@ -702,6 +703,17 @@ TACO/
 **Merqury completeness exists but QV is `NA`:** This means Merqury produced a completeness file but no parseable `.qv` file for that assembly. TACO reports `NA` rather than leaving the final report blank. Check the corresponding `merqury/{label}/` directory and step log to confirm whether Merqury wrote a QV table under a non-standard name.
 
 **`-s 14` produced the full report instead of assembly-only output:** This is expected. Step 14A is the default full-mode report. Step 14B runs only with `--assembly-only`, for example `taco ... --assembly-only -s 14`.
+
+## Use Of AI Assistance
+
+An AI coding assistant (Anthropic Claude, via Claude Code) has been used during
+TACO's development, at the author's direction and reviewed before merging. It has
+assisted with bug fixing and with implementing features, including the chimera
+check and contaminant screening.
+
+No sequencing data, assembly, or reference genome was generated or modified by an
+AI tool. Results were verified by running the pipeline on real data and by the
+test suite in `tests/`.
 
 ## Citation
 
