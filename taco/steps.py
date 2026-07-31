@@ -25,8 +25,10 @@ from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
 from taco.utils import ALL_ASSEMBLERS, EXCLUDED_FROM_BACKBONE, active_assemblers
 from taco.concordance import (split_vote, concordance_verdict,
-                              corroborated_t2t_count, detect_fusions,
-                              screen_contaminants)
+                              corroborated_t2t_count, detect_fusions)
+from taco.purify import (screen_contaminants, contaminant_removal_set,
+                         consensus_breakpoint, spanning_read_verdict,
+                         chimera_decision, apply_split, SPANNING_ANCHOR_BP)
 
 
 def _parse_genome_size(size_str):
@@ -3393,94 +3395,11 @@ def _emit_mis_join_candidates(runner, out_dir):
     return fusions
 
 
-def _screen_contamination(runner):
-    """Flag final-assembly contigs whose depth and/or GC mark them as foreign.
-
-    TACO already records per-contig read depth; this acts on it.  purge_dups
-    removes haplotypic duplication and will not remove a foreign genome, so a
-    low-coverage, compositionally divergent contig can survive to the final
-    assembly.  A filtered FASTA is written *alongside* the unfiltered one so
-    that no sequence is destroyed and the choice stays with the user.
-    """
-    if getattr(runner, "no_contam_screen", False):
-        runner.log_info("Contaminant screen disabled")
-        return []
-
-    final_fa = None
-    for cand in ("final_results/final.merged.fasta", "assemblies/final.merged.fasta"):
-        if os.path.isfile(cand) and os.path.getsize(cand) > 0:
-            final_fa = cand
-            break
-    if not final_fa:
-        return []
-
-    cov_tsv = None
-    for cand in ("final_results/coverage_summary.tsv",
-                 "assemblies/coverage_qc/coverage_summary.tsv"):
-        if os.path.isfile(cand):
-            cov_tsv = cand
-            break
-
-    depth = {}
-    if cov_tsv:
-        try:
-            with open(cov_tsv, newline="") as f:
-                for r in csv.DictReader(f, delimiter="\t"):
-                    c = (r.get("contig") or "").strip()
-                    if c:
-                        depth[c] = float(r.get("median_cov") or 0)
-        except Exception:
-            depth = {}
-    else:
-        runner.log_info("No coverage summary available; contaminant screen will "
-                        "use GC composition only")
-
-    contigs = []
-    for name, seq in _read_fasta_records(final_fa):
-        u = seq.upper()
-        n = len(u)
-        if n == 0:
-            continue
-        gc = 100.0 * (u.count("G") + u.count("C")) / n
-        contigs.append({"contig": name, "length": n,
-                        "median_cov": depth.get(name), "gc": gc})
-    if not contigs:
-        return []
-
-    flagged, baseline = screen_contaminants(contigs)
-    out_dir = "final_results" if os.path.isdir("final_results") else "assemblies"
-    path = os.path.join(out_dir, "contamination_candidates.tsv")
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow(["contig", "length", "median_cov", "depth_ratio", "gc",
-                    "gc_deviation", "n_signals", "signals"])
-        for r in flagged:
-            w.writerow([r["contig"], r["length"], r["median_cov"],
-                        r["depth_ratio"], r["gc"], r["gc_deviation"],
-                        r["n_signals"], r["signals"]])
-
-    runner.log_info(f"Contaminant screen baseline: modal depth "
-                    f"{baseline['modal_depth']:.0f}x, modal GC "
-                    f"{baseline['modal_gc']:.2f}%")
-    if not flagged:
-        runner.log("Contaminant screen: no anomalous contigs detected")
-        return []
-
-    total = sum(r["length"] for r in flagged)
-    for r in flagged:
-        runner.log_warn(f"  Possible foreign sequence: {r['contig']} "
-                        f"({r['length']:,} bp) — {r['signals']}")
-    runner.log_warn(f"Contaminant screen: {len(flagged)} contig(s) totalling "
-                    f"{total:,} bp flagged; see {path}")
-
-    drop = {r["contig"] for r in flagged}
-    clean = [(n, s) for n, s in _read_fasta_records(final_fa) if n not in drop]
-    clean_path = os.path.join(out_dir, "final.clean.fasta")
-    _write_fasta(clean, clean_path)
-    runner.log_warn(f"Wrote {clean_path} with the flagged contigs removed "
-                    f"({len(clean)} contigs). The unfiltered assembly is "
-                    f"unchanged; review before using either.")
-    return flagged
+# The v1.3.7 ``_screen_contamination`` stood here.  It ran in step 14A, after
+# step 13 had already measured BUSCO, telomere, QUAST and Merqury on the
+# unfiltered merge, so an accurate screen changed no published number and the
+# delivered ``final_assembly.fasta`` stayed contaminated.  Screening is now
+# sub-step 13A in ``_purify_assembly``, ahead of the metrics.
 
 
 def _auto_select_backbone(runner):
@@ -3913,7 +3832,7 @@ def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
     lines = ["##gff-version 3"]
     lines.append(f"# TACO provenance annotation for {os.path.basename(final_fa)}")
     lines.append(f"# Backbone assembler: {backbone_assembler}")
-    lines.append(f"# Generated by TACO v1.3.7")
+    lines.append(f"# Generated by TACO v1.3.9")
     lines.append(f"# Columns: seqid source type start end score strand phase attributes")
     lines.append("#")
 
@@ -5380,7 +5299,7 @@ def _collision_free_name(name, existing, exclude=None):
 def step_12_refine(runner):
     """Step 12 - Backbone-first telomere-aware refinement with BUSCO trial validation.
 
-    v1.3.7 workflow — two-tier confidence model:
+    v1.3.9 workflow — two-tier confidence model:
 
     TIER 1 (immutable): protected strict-T2T contigs from the merged pool.
       These are NEVER replaced or displaced by rescue candidates unless the
@@ -5412,7 +5331,7 @@ def step_12_refine(runner):
       12I  Platform-aware polishing (Medaka/NextPolish2/Racon)
       12J  Genome-size-aware pruning (never prunes telomere-bearing contigs)
     """
-    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.7)")
+    runner.log("Step 12 - Telomere-aware backbone refinement (v1.3.9)")
     os.makedirs("merqury", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
@@ -5578,7 +5497,7 @@ def step_12_refine(runner):
                        f"cross-assembly mapping OK)")
 
     # ====================================================================
-    # BACKBONE-FIRST STRATEGY (v1.3.7)
+    # BACKBONE-FIRST STRATEGY (v1.3.9)
     #
     # The backbone assembler was selected for the highest composite quality
     # score (BUSCO S, T2T count, N50, contiguity).  Its contigs carry the
@@ -7022,7 +6941,7 @@ def step_12_refine(runner):
         if warnings:
             warn_file = "final_results/refinement_warning.txt"
             with open(warn_file, "w") as f:
-                f.write(f"TACO v1.3.7 — Refinement quality warnings\n")
+                f.write(f"TACO v1.3.9 — Refinement quality warnings\n")
                 f.write(f"Backbone: {assembler} ({bb_bp:,} bp, "
                         f"{len(bb_recs)} contigs)\n")
                 f.write(f"Final:    refined ({fn_bp:,} bp, "
@@ -7048,7 +6967,7 @@ def _final_busco_qc(runner):
     os.makedirs("busco", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
-    final_fa = "assemblies/final.merged.fasta"
+    final_fa = _final_assembly_path(runner)
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
         runner.log_error(f"Final merged FASTA '{final_fa}' not found.")
         raise RuntimeError("No final assembly")
@@ -7249,7 +7168,7 @@ def _final_telomere_qc(runner):
     runner.log("Final QC - Telomere analysis (final assembly, hybrid detection)")
     os.makedirs("assemblies", exist_ok=True)
 
-    final_fa = "assemblies/final.merged.fasta"
+    final_fa = _final_assembly_path(runner)
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
         runner.log_error(f"Final merged FASTA '{final_fa}' not found.")
         raise RuntimeError("No final assembly")
@@ -7302,7 +7221,7 @@ def _final_quast_qc(runner):
     os.makedirs("quast_final", exist_ok=True)
     os.makedirs("assemblies", exist_ok=True)
 
-    final_fa = "assemblies/final.merged.fasta"
+    final_fa = _final_assembly_path(runner)
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
         runner.log_error(f"Final merged FASTA '{final_fa}' not found.")
         raise RuntimeError("No final assembly")
@@ -7562,8 +7481,15 @@ def _cleanup_outputs(runner):
     # Copy stable final results first.  Keep originals in assemblies/root so a
     # user can rerun later steps without rebuilding earlier outputs.
     final_result_files = [
+        # final.merged.fasta stays the unfiltered merge, so no sequence is ever
+        # destroyed.  final_assembly.fasta — the file users actually take — is
+        # whatever purification produced, which is also exactly what sub-step 13D
+        # measured.  In v1.3.7 both names pointed at the unfiltered merge, so the
+        # deliverable stayed contaminated however accurate the screen had been.
         ("assemblies/final.merged.fasta", "final.merged.fasta"),
-        ("assemblies/final.merged.fasta", "final_assembly.fasta"),
+        (_final_assembly_path(runner), "final_assembly.fasta"),
+        (PURIFIED_FASTA, None),
+        (EXCLUDED_FASTA, None),
         ("assemblies/final.merged.provenance.gff3", None),
         ("pool_contig_provenance.tsv", None),
         ("assemblies/selection_debug.tsv", None),
@@ -7784,7 +7710,7 @@ def _final_merqury_qc(runner):
                         "skipping final Merqury")
         return
 
-    final_fa = "assemblies/final.merged.fasta"
+    final_fa = _final_assembly_path(runner)
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
         runner.log_warn("Merqury: final assembly FASTA missing; skipping final Merqury")
         return
@@ -7872,7 +7798,7 @@ def _compare_vs_final_report(runner):
     if not compare_fa or not os.path.isfile(compare_fa):
         return  # nothing to compare against
 
-    final_fa = "assemblies/final.merged.fasta"
+    final_fa = _final_assembly_path(runner)
     if not os.path.isfile(final_fa) or os.path.getsize(final_fa) == 0:
         runner.log_warn(
             "Compare report skipped: assemblies/final.merged.fasta is missing.")
@@ -8935,9 +8861,542 @@ def _compare_vs_final_report(runner):
             "(install MUMmer4 to enable).")
 
 
+# ── v1.3.9: purification before measurement ──────────────────────────────────
+#
+# Everything from here to step_13_final_qc implements sub-steps 13A-13C.  The
+# ordering is the point: purification runs *inside* step 13, ahead of the four QC
+# helpers, so it is structurally impossible for the reported metrics to describe
+# a different assembly than the one TACO delivers.  That was the whole of defect
+# 1 in v1.3.7 — an accurate contaminant screen running in step 14A, after every
+# published number had already been computed on the unfiltered merge.
+
+#: Purified assembly.  Written alongside the unfiltered merge, never over it.
+PURIFIED_FASTA = "assemblies/final.purified.fasta"
+MERGED_FASTA = "assemblies/final.merged.fasta"
+#: Sequence removed by purification, kept so that nothing is destroyed.
+EXCLUDED_FASTA = "assemblies/purify_excluded.fasta"
+
+#: Contigs below this length are not cross-checked for mis-joins; a chimera needs
+#: two substantial components to be one.
+PURIFY_MIN_CHIMERA_LEN = 500000
+
+
+def _final_assembly_path(runner=None):
+    """The FASTA that final QC measures and that TACO delivers.
+
+    Falls back to the unfiltered merge whenever purification did not run or
+    produced nothing, so every caller works unchanged on a resumed run and with
+    ``--purify-mode off``.
+    """
+    if os.path.isfile(PURIFIED_FASTA) and os.path.getsize(PURIFIED_FASTA) > 0:
+        return PURIFIED_FASTA
+    return MERGED_FASTA
+
+
+def _purify_provenance_map():
+    """``{final_contig: {original_name, assembler_contig, source_assembler}}``.
+
+    ``final.merged.provenance.gff3`` already records, per delivered contig, the
+    per-assembler name it came from.  That is exactly the key the concordance
+    tables are written under, so no new bookkeeping is needed to join a mis-join
+    verdict onto a final contig name.
+    """
+    out = {}
+    path = "assemblies/final.merged.provenance.gff3"
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path) as f:
+            for ln in f:
+                if ln.startswith("#") or "\t" not in ln:
+                    continue
+                cols = ln.rstrip("\n").split("\t")
+                if len(cols) < 9 or cols[2] != "contig":
+                    continue
+                attrs = {}
+                for kv in cols[8].split(";"):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        attrs[k.strip()] = v.strip()
+                name = attrs.get("ID") or cols[0]
+                out[name] = {
+                    "original_name": attrs.get("original_name"),
+                    "assembler_contig": attrs.get("assembler_contig"),
+                    "source_assembler": attrs.get("source_assembler"),
+                }
+    except Exception:
+        return {}
+    return out
+
+
+def _purify_selected_assembler():
+    """Backbone assembler name from ``selection_decision.txt``, or None."""
+    for path in ("assemblies/selection_decision.txt",
+                 "final_results/selection_decision.txt"):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                for ln in f:
+                    parts = ln.rstrip("\n").split("\t")
+                    if len(parts) >= 2 and parts[0] == "selected_assembler":
+                        return parts[1].strip()
+        except Exception:
+            return None
+    return None
+
+
+def _purify_coverage_table():
+    """``{contig: row}`` from the step-12 coverage summary, or empty."""
+    out = {}
+    for cand in ("assemblies/coverage_qc/coverage_summary.tsv",
+                 "final_results/coverage_summary.tsv"):
+        if not os.path.isfile(cand):
+            continue
+        try:
+            with open(cand, newline="") as f:
+                for r in csv.DictReader(f, delimiter="\t"):
+                    c = (r.get("contig") or "").strip()
+                    if c:
+                        out[c] = r
+        except Exception:
+            return {}
+        break
+    return out
+
+
+def _purify_busco_per_contig(runner):
+    """``{contig: n_busco_genes}`` from the final BUSCO run, or empty.
+
+    Recorded for the report only.  Gene content deliberately never drives a
+    removal: on the *F. tricinctum* assembly a real 3.08 Mb chromosome carries
+    zero ascomycota BUSCOs while the bacterial contig carries three.
+    """
+    out = defaultdict(int)
+    hits = sorted(glob.glob("busco/final/run_*/full_table.tsv"))
+    if not hits:
+        return {}
+    try:
+        with open(hits[0]) as f:
+            for ln in f:
+                if ln.startswith("#"):
+                    continue
+                cols = ln.rstrip("\n").split("\t")
+                if len(cols) >= 3 and cols[1] != "Missing" and cols[2]:
+                    out[cols[2]] += 1
+    except Exception:
+        return {}
+    return dict(out)
+
+
+def _purify_compare_unaligned_set(runner):
+    """Final contigs with no alignment to the ``--compare`` genome, or None."""
+    path = "final_results/compare_report/unique_final_contigs.tsv"
+    if not getattr(runner, "compare_fasta", None) or not os.path.isfile(path):
+        return None
+    unaligned = set()
+    try:
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f, delimiter="\t"):
+                if (r.get("reason") or "").strip() == "no_alignment":
+                    unaligned.add((r.get("final_contig") or "").strip())
+    except Exception:
+        return None
+    return unaligned
+
+
+def _purify_telomere_tiers(runner, fa):
+    """``{contig: tier}`` for *fa*, running detection now.
+
+    The tier is needed as a *guard* before purification decides anything, and
+    sub-step 13D has not run yet, so detection is invoked here on the unpurified
+    merge.  It is cheap — about 20 s on a 51 Mb fungal assembly.
+    """
+    tiers = {}
+    try:
+        results = detect_telomeres(
+            fa, mode=runner.telomere_mode, user_motif=runner.motif,
+            end_window=runner.telo_end_window,
+            score_window=runner.telo_score_window,
+            kmer_min=runner.telo_kmer_min, kmer_max=runner.telo_kmer_max,
+            threads=runner.threads, taxon=getattr(runner, "taxon", "other"))
+        for r in results:
+            key = r.get("contig") or r.get("name")
+            if key:
+                tiers[key] = r.get("classification")
+    except Exception as e:
+        runner.log_warn(f"Purify: telomere detection for guards failed: {e}; "
+                        f"telomere protection will not be applied")
+    return tiers
+
+
+def _purify_contig_records(runner, fa, tiers):
+    """Per-contig statistics for the contaminant screen."""
+    cov = _purify_coverage_table()
+    busco = _purify_busco_per_contig(runner)
+    unaligned = _purify_compare_unaligned_set(runner)
+
+    recs = []
+    for name, seq in _read_fasta_records(fa):
+        u = seq.upper()
+        n = len(u)
+        if n == 0:
+            continue
+        # ACGT only in the denominator: counting N as non-GC would drag the GC of
+        # a gappy contig downward and manufacture a composition outlier.
+        acgt = u.count("A") + u.count("C") + u.count("G") + u.count("T")
+        gc = (100.0 * (u.count("G") + u.count("C")) / acgt) if acgt else None
+        row = cov.get(name) or {}
+
+        def num(key, _row=row):
+            try:
+                v = _row.get(key)
+                return float(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        recs.append({
+            "contig": name, "length": n, "gc": gc,
+            "median_cov": num("median_cov"),
+            "max_cov": num("max_cov"),
+            "zero_bp": num("zero_bp"), "low_bp": num("low_bp"),
+            "telomere_tier": tiers.get(name),
+            "busco_count": busco.get(name),
+            "aligned_to_compare": (None if unaligned is None
+                                   else name not in unaligned),
+        })
+    return recs
+
+
+def _purify_all_contig_concordance(runner, fa):
+    """Cross-check *every* large contig of the delivered assembly against the others.
+
+    v1.3.7 only tested contigs already classified strict-T2T, for the narrow
+    purpose of correcting the backbone selection score, and it deleted the
+    alignment PAFs immediately afterwards.  Two consequences: a chimera that does
+    not happen to carry telomeres at both ends was never looked at at all, and
+    the coordinates needed to *act* on a mis-join were thrown away.
+
+    This tests every contig above :data:`PURIFY_MIN_CHIMERA_LEN` and keeps the
+    per-voter query intervals, which is what makes a reference-free breakpoint
+    estimate possible.
+
+    Returns ``{contig: {"verdict": ..., "intervals": {voter: {target: [...]}}}}``.
+    """
+    if not shutil.which("minimap2"):
+        runner.log_warn("Purify: minimap2 not found; skipping the mis-join "
+                        "cross-check")
+        return {}
+
+    backbone = _purify_selected_assembler()
+    skip = set(EXCLUDED_FROM_BACKBONE) | {"final", "backbone", "merged",
+                                          "assembly"}
+    if backbone:
+        # The v1.3.7 gate listed only "compare" here, so the backbone's own
+        # assembly was itself a voting target and every backbone contig
+        # self-aligned at 100% coverage.  That made the check incapable of ever
+        # firing on an assembler-sourced contig.
+        skip.add(backbone.lower())
+
+    voters = []
+    for path in sorted(glob.glob("assemblies/*.result.fasta")):
+        name = os.path.basename(path)[: -len(".result.fasta")]
+        if name.lower() in skip or os.path.getsize(path) == 0:
+            continue
+        voters.append(name)
+    if len(voters) < 2:
+        runner.log_info("Purify: fewer than two independent assemblies "
+                        "available; skipping the mis-join cross-check")
+        return {}
+
+    names = [n for n, s in _read_fasta_records(fa)
+             if len(s) >= PURIFY_MIN_CHIMERA_LEN]
+    if not names:
+        return {}
+
+    work = "assemblies/purify_concordance"
+    os.makedirs(work, exist_ok=True)
+    qfa = os.path.join(work, "delivered.fa")
+    if _subset_fasta(fa, names, qfa) == 0:
+        return {}
+
+    runner.log(f"Purify 13B - cross-checking {len(names)} contig(s) of the "
+               f"delivered assembly against {len(voters)} independent "
+               f"assemblies ({', '.join(voters)})")
+
+    votes = {c: {} for c in names}
+    intervals = {c: {} for c in names}
+    for v in voters:
+        paf = os.path.join(work, f"delivered__vs__{v}.paf")
+        cmd = (f"minimap2 -cx asm5 -t {runner.threads} --secondary=no "
+               f"assemblies/{v}.result.fasta {shlex.quote(qfa)} "
+               f"> {shlex.quote(paf)}")
+        res = _run_shell_capture(
+            runner, cmd, f"Purify: delivered contigs vs {v}",
+            stderr_log=os.path.join(work, f"delivered__vs__{v}.stderr.log"))
+        if res.returncode != 0:
+            continue
+        ivals, qlens = _paf_query_intervals(paf)
+        for c in names:
+            per_target = ivals.get(c, {})
+            votes[c][v] = split_vote(qlens.get(c, 0), per_target)
+            if per_target:
+                intervals[c][v] = per_target
+
+    out = {}
+    for c in names:
+        verdict = concordance_verdict(votes[c])
+        out[c] = {"verdict": verdict, "intervals": intervals[c],
+                  "votes": votes[c]}
+        if verdict["verdict"] == "mis_join_candidate":
+            runner.log_warn(
+                f"  Possible mis-join: {c} — {verdict['n_split']} of "
+                f"{verdict['n_informative']} independent assemblies split it")
+    return out
+
+
+def _purify_bam_path():
+    """Coordinate-sorted HiFi-to-assembly BAM from step 12, if it survived."""
+    for cand in ("assemblies/polish_work/hifi_vs_asm.sorted.bam",
+                 "temp/polish/polish_work/hifi_vs_asm.sorted.bam"):
+        if os.path.isfile(cand) and os.path.isfile(cand + ".bai"):
+            return cand
+    return None
+
+
+_PURIFY_CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def _purify_spanning_counts(runner, bam, ref, pos, anchor):
+    """Reads spanning *pos* on *ref* with *anchor* bp aligned on both sides.
+
+    Returns ``(n_spanning, n_overlapping)``, or ``(None, None)`` when the region
+    cannot be queried.  Secondary and supplementary alignments are excluded, so a
+    read only counts where its primary alignment genuinely covers both flanks —
+    the distinction that separates a real junction from a collapsed repeat which
+    merely recruits a deep pileup.  On the *F. tricinctum* mis-join the seam had
+    5,894 overlapping reads and none spanning, while a genuine locus on the same
+    contig had 301 overlapping and 106 spanning.
+    """
+    samtools = shutil.which("samtools")
+    if not samtools:
+        return None, None
+    lo = max(1, pos - anchor - 60000)
+    hi = pos + anchor + 60000
+    cmd = [samtools, "view", "-F", "0x904", bam, f"{ref}:{lo}-{hi}"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except Exception as e:
+        runner.log_warn(f"Purify: samtools view failed on {ref}: {e}")
+        return None, None
+    if res.returncode != 0:
+        return None, None
+
+    n_span = 0
+    n_over = 0
+    for ln in res.stdout.splitlines():
+        f = ln.split("\t")
+        if len(f) < 6:
+            continue
+        try:
+            start = int(f[3])
+            mapq = int(f[4])
+        except ValueError:
+            continue
+        ref_len = sum(int(n) for n, op in _PURIFY_CIGAR_RE.findall(f[5])
+                      if op in "MDN=X")
+        end = start + ref_len - 1
+        if start <= pos <= end:
+            n_over += 1
+        if mapq >= 1 and start <= pos - anchor and end >= pos + anchor:
+            n_span += 1
+    return n_span, n_over
+
+
+def _purify_assembly(runner):
+    """Sub-steps 13A-13C: screen contaminants, resolve chimeras, emit the result.
+
+    Returns the path of the assembly that sub-step 13D should measure.
+    """
+    if getattr(runner, "purify_mode", "on") == "off" \
+            or getattr(runner, "no_contam_screen", False):
+        runner.log_info("Purification disabled; final QC will measure the "
+                        "unfiltered merge")
+        return MERGED_FASTA
+
+    fa = MERGED_FASTA
+    if not os.path.isfile(fa) or os.path.getsize(fa) == 0:
+        runner.log_warn(f"Purify: {fa} not found; nothing to purify")
+        return fa
+
+    out_dir = "final_results" if os.path.isdir("final_results") else "assemblies"
+    os.makedirs(out_dir, exist_ok=True)
+    metagenome = bool(getattr(runner, "metagenome", False))
+    chimera_action = getattr(runner, "chimera_action", "split")
+
+    # ---- 13A. Foreign-sequence screen ---------------------------------------
+    runner.log("Purify 13A - foreign-sequence screen")
+    tiers = _purify_telomere_tiers(runner, fa)
+    recs = _purify_contig_records(runner, fa, tiers)
+    rows, baseline = screen_contaminants(recs, metagenome=metagenome)
+
+    dbase, gbase = baseline["depth"], baseline["gc"]
+    runner.log_info(
+        f"Purify baseline: core depth {dbase['center']:.0f}x "
+        f"(sigma {dbase['sigma']:.1f}, {100 * dbase['weight_frac']:.0f}% of "
+        f"assembly length), core GC {gbase['center']:.2f}% "
+        f"(sigma {gbase['sigma']:.2f}); removal "
+        f"{'enabled' if baseline['removal_allowed'] else 'disabled'}")
+    if metagenome:
+        runner.log_info("Metagenome mode: anomalies are reported, never removed")
+
+    report = os.path.join(out_dir, "purification_report.tsv")
+    with open(report, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["contig", "length", "median_cov", "depth_ratio", "depth_z",
+                    "gc", "gc_deviation", "gc_z", "telomere_tier",
+                    "busco_count", "n_primary_signals", "n_corroborating",
+                    "guards", "tier", "reason"])
+        for r in rows:
+            w.writerow([r["contig"], r["length"], r["median_cov"],
+                        r["depth_ratio"], r["depth_z"], r["gc"],
+                        r["gc_deviation"], r["gc_z"], r["telomere_tier"],
+                        r["busco_count"], r["n_primary_signals"],
+                        r["n_corroborating"], r["guards"], r["tier"],
+                        r["reason"]])
+    runner.log(f"Wrote {report}")
+
+    drop = contaminant_removal_set(rows)
+    for r in rows:
+        if r["tier"] == "foreign":
+            runner.log_warn(f"  Foreign sequence: {r['contig']} "
+                            f"({r['length']:,} bp) — {r['reason']}")
+        elif r["tier"] in ("suspect", "organelle_candidate"):
+            runner.log_info(f"  {r['tier']}: {r['contig']} "
+                            f"({r['length']:,} bp) — {r['reason']}")
+    if drop:
+        removed_bp = sum(r["length"] for r in rows if r["contig"] in drop)
+        runner.log_warn(f"Purify 13A: removing {len(drop)} contig(s) totalling "
+                        f"{removed_bp:,} bp as foreign")
+    else:
+        runner.log("Purify 13A: no contig meets the foreign-sequence bar")
+
+    # ---- 13B. Chimera resolution --------------------------------------------
+    decisions = []
+    splits = {}
+    if chimera_action == "off":
+        runner.log_info("Purify 13B - chimera resolution disabled")
+    else:
+        conc = _purify_all_contig_concordance(runner, fa)
+        bam = _purify_bam_path()
+        prov = _purify_provenance_map()
+        if conc and not bam:
+            runner.log_info("Purify 13B - no indexed HiFi BAM available; "
+                            "mis-joins will be judged on cross-assembler "
+                            "agreement alone")
+        anchor = int(getattr(runner, "spanning_anchor", SPANNING_ANCHOR_BP))
+
+        for contig, info in sorted(conc.items()):
+            if contig in drop:
+                continue
+            bp_info = consensus_breakpoint(info["intervals"])
+            bp = bp_info.get("breakpoint")
+            spanning = None
+            # Only a flagged contig needs the read test: a corroborated contig is
+            # kept whatever the reads say, and one BAM region query per contig
+            # would cost real time on a fragmented assembly.
+            candidate = info["verdict"]["verdict"] == "mis_join_candidate"
+            if bam and bp and candidate:
+                ref = (prov.get(contig) or {}).get("original_name") or contig
+                n_span, n_over = _purify_spanning_counts(
+                    runner, bam, ref, bp, anchor)
+                if n_span is not None:
+                    spanning = spanning_read_verdict(n_span, n_over)
+                    runner.log_info(
+                        f"  {contig} junction {bp:,}: {n_span} spanning / "
+                        f"{n_over} overlapping reads -> {spanning['verdict']}")
+            d = chimera_decision(
+                contig, info["verdict"], bp_info, spanning,
+                action=chimera_action,
+                protected_telomere=(tiers.get(contig) == "strict_t2t"))
+            decisions.append(d)
+            if d["action_taken"] in ("split", "replace") and bp:
+                splits[contig] = bp
+                runner.log_warn(f"  {d['action_taken']}: {contig} at {bp:,} — "
+                                f"{d['reason']}")
+            elif d["action_taken"] == "report":
+                runner.log_warn(f"  flagged only: {contig} — {d['reason']}")
+
+        dpath = os.path.join(out_dir, "chimera_decisions.tsv")
+        with open(dpath, "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(["contig", "concordance_verdict", "n_split",
+                        "n_informative", "breakpoint", "breakpoint_voters",
+                        "spanning_verdict", "action_taken", "confidence",
+                        "reason"])
+            for d in decisions:
+                w.writerow([d["contig"], d["concordance_verdict"], d["n_split"],
+                            d["n_informative"], d["breakpoint"],
+                            d["breakpoint_voters"], d["spanning_verdict"],
+                            d["action_taken"], d["confidence"], d["reason"]])
+        runner.log(f"Wrote {dpath}")
+
+    # ---- 13C. Emit the purified assembly ------------------------------------
+    if not drop and not splits:
+        runner.log("Purify 13C - assembly is already clean; final QC will "
+                   "measure the unfiltered merge")
+        return fa
+
+    kept, removed = [], []
+    for name, seq in _read_fasta_records(fa):
+        if name in drop:
+            removed.append((name, seq))
+            continue
+        if name in splits:
+            parts = apply_split(name, seq, splits[name])
+            kept.extend(parts)
+            if len(parts) == 2:
+                runner.log(f"  split {name} ({len(seq):,} bp) into "
+                           f"{parts[0][0]} ({len(parts[0][1]):,} bp) and "
+                           f"{parts[1][0]} ({len(parts[1][1]):,} bp)")
+        else:
+            kept.append((name, seq))
+
+    kept.sort(key=lambda p: -len(p[1]))
+    _write_fasta(kept, PURIFIED_FASTA)
+    if removed:
+        _write_fasta(removed, EXCLUDED_FASTA)
+
+    total_kept = sum(len(s) for _, s in kept)
+    runner.log_warn(
+        f"Purify 13C - wrote {PURIFIED_FASTA}: {len(kept)} contigs, "
+        f"{total_kept:,} bp ({len(drop)} removed, {len(splits)} split). "
+        f"{MERGED_FASTA} is unchanged"
+        + (f" and removed sequence is preserved in {EXCLUDED_FASTA}"
+           if removed else "") + ".")
+    return PURIFIED_FASTA
+
+
 def step_13_final_qc(runner):
-    """Step 13 - Final QC: BUSCO + Telomere + QUAST + Merqury on refined assembly."""
-    runner.log("Step 13 - Final QC (BUSCO + Telomere + QUAST + Merqury on final)")
+    """Step 13 - Purify the assembly, then measure it.
+
+    Sub-steps:
+      13A  Foreign-sequence screen                -> purification_report.tsv
+      13B  Chimera resolution from cross-assembler
+           agreement and read-spanning evidence   -> chimera_decisions.tsv
+      13C  Emit the purified assembly             -> final.purified.fasta
+      13D  BUSCO + Telomere + QUAST + Merqury on whatever 13C produced
+
+    Purification runs here, ahead of the QC helpers, rather than in step 14 where
+    v1.3.7 put it.  That ordering is the fix: in v1.3.7 an accurate contaminant
+    screen ran *after* BUSCO, telomere, QUAST and Merqury had already measured
+    the unfiltered merge, so the published length and GC were those of a
+    contaminated assembly and nothing the screen found ever reached a metric.
+    """
+    runner.log("Step 13 - Purify + final QC (13A screen / 13B chimeras / "
+               "13C emit / 13D BUSCO + Telomere + QUAST + Merqury)")
+    _purify_assembly(runner)
+    runner.log(f"Step 13D - final QC on {_final_assembly_path(runner)}")
     _final_busco_qc(runner)
     _final_telomere_qc(runner)
     _final_quast_qc(runner)
@@ -8969,7 +9428,8 @@ def step_14_report(runner):
     else:
         runner.log("Step 14A - Final comparison report and cleanup")
         _final_comparison_report(runner)
-        _screen_contamination(runner)
+        # Contaminant screening used to run here.  It is sub-step 13A now, so
+        # that the metrics step 14A tabulates describe the purified assembly.
         # 14C: compare-vs-final report — only when --compare was supplied
         # and final.merged.fasta exists (the helper itself short-circuits
         # if either condition is unmet).
