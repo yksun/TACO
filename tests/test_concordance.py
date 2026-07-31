@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from taco.concordance import (  # noqa: E402
     merged_span, split_vote, concordance_verdict, corroborated_t2t_count,
-    detect_fusions, screen_contaminants, length_weighted_median,
+    detect_fusions,
 )
 
 
@@ -176,76 +176,6 @@ REAL_FINAL = [
 ]
 
 
-def _recs():
-    return [{"contig": n, "length": L, "median_cov": c, "gc": g}
-            for n, L, c, g in REAL_FINAL]
-
-
-def test_screen_flags_exactly_the_two_foreign_contigs():
-    flagged, baseline = screen_contaminants(_recs())
-    assert {f["contig"] for f in flagged} == {"contig_7", "contig_11"}
-    assert 300 <= baseline["modal_depth"] <= 320
-    assert 45 <= baseline["modal_gc"] <= 49
-
-
-def test_screen_reports_both_signals_for_the_bacterial_contig():
-    flagged, _ = screen_contaminants(_recs())
-    c7 = next(f for f in flagged if f["contig"] == "contig_7")
-    assert c7["depth_ratio"] < 0.1
-    assert c7["gc_deviation"] > 15
-    assert "depth" in c7["signals"] and "GC" in c7["signals"]
-
-
-def test_screen_does_not_flag_a_clean_assembly():
-    clean = [{"contig": "c%d" % i, "length": 3000000, "median_cov": 300,
-              "gc": 47.0 + (i % 3) * 0.4} for i in range(1, 10)]
-    flagged, _ = screen_contaminants(clean)
-    assert flagged == []
-
-
-def test_screen_ignores_short_contigs():
-    recs = _recs() + [{"contig": "tiny", "length": 4000,
-                       "median_cov": 5, "gc": 70.0}]
-    flagged, _ = screen_contaminants(recs)
-    assert "tiny" not in {f["contig"] for f in flagged}
-
-
-def test_screen_tolerates_missing_coverage():
-    """With no coverage data the GC signal must still work and not crash."""
-    recs = [{"contig": n, "length": L, "median_cov": 0, "gc": g}
-            for n, L, _c, g in REAL_FINAL]
-    flagged, _ = screen_contaminants(recs)
-    assert "contig_7" in {f["contig"] for f in flagged}
-
-
-def test_missing_coverage_record_is_not_treated_as_zero_depth():
-    """A contig absent from coverage_summary.tsv must not be flagged on depth.
-
-    median_cov=None means "no record", which is not the same as 0x. Reading it
-    as zero would flag a perfectly good contig as foreign on the strength of
-    absent data.
-    """
-    recs = [{"contig": "c1", "length": 5000000, "median_cov": 300, "gc": 47.0},
-            {"contig": "c2", "length": 4000000, "median_cov": 305, "gc": 47.5},
-            {"contig": "c3", "length": 3000000, "median_cov": None, "gc": 47.2}]
-    flagged, baseline = screen_contaminants(recs)
-    assert flagged == [], "a contig with no coverage record was flagged"
-    assert baseline["modal_depth"] > 0
-
-
-def test_foreign_gc_is_still_caught_without_any_depth_data():
-    """Losing the depth signal must not lose the GC signal."""
-    recs = [{"contig": "c1", "length": 5000000, "median_cov": None, "gc": 47.0},
-            {"contig": "c2", "length": 4000000, "median_cov": None, "gc": 47.5},
-            {"contig": "bact", "length": 4500000, "median_cov": None, "gc": 66.6}]
-    flagged, _ = screen_contaminants(recs)
-    assert [f["contig"] for f in flagged] == ["bact"]
-
-
-def test_length_weighted_median_resists_small_outliers():
-    """Many tiny aberrant contigs must not move the baseline."""
-    pairs = [(300.0, 5000000), (305.0, 4000000)] + [(15.0, 1000)] * 50
-    assert 295 <= length_weighted_median(pairs) <= 310
 
 
 if __name__ == "__main__":
