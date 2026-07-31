@@ -257,7 +257,7 @@ def _cumulative_offsets(lengths):
     return offs
 
 
-# ── Contaminant screening moved to taco.purify in v1.4.0 ─────────────────────
+# ── Contaminant screening moved to taco.purify in v1.3.9 ─────────────────────
 #
 # ``screen_contaminants`` and ``length_weighted_median`` lived here in v1.3.7.
 # They now live in :mod:`taco.purify`, rewritten, because the versions here had

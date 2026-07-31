@@ -5,14 +5,7 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.4.0] — 2026-07-31
-
-A minor-version bump rather than a patch, because the default behaviour changes in
-two ways a user will notice: `final_assembly.fasta` is now the purified assembly
-rather than the unfiltered merge, and step 13 modifies the assembly where it
-previously only measured it. Both are opt-out via `--purify-mode off`. The work
-was developed on `main` as 1.3.9 and released as 1.4.0; there is no 1.3.8 or
-1.3.9 release.
+## [1.3.9] — 2026-07-31
 
 ### Purification now runs before measurement, and it acts
 
@@ -164,13 +157,6 @@ unit at ~19× the assembly's modal depth, spanning roughly 62 kb as assembled an
 therefore ~1.2 Mb in reality. Peregrine joined two chromosomes through it. Both
 reference scaffolds terminate at that array, which is why each lacks exactly the
 telomere facing the other.
-
-### Provenance
-
-A **Use Of AI Assistance** section is added to the README, noting that an AI
-coding assistant was used for bug fixing and for implementing the chimera check
-and contaminant screening, and that no sequencing data, assembly or reference
-genome was generated or modified by an AI tool.
 
 Tests: `tests/test_purify.py` adds 58, including the three false-positive traps
 above as regressions, and `tests/run_all.py` runs the whole suite in one command for the first time. Suite total 87 across four files (eight contaminant tests moved out of `test_concordance.py` into the rewritten module's own file), no external tools required.
