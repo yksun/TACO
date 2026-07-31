@@ -14,14 +14,15 @@ and per-contig statistics and return verdicts, so the decision logic can be
 unit-tested without minimap2, BUSCO, or a reference genome.  The orchestration
 that produces their inputs lives in ``taco.steps``.
 
-Three independent checks are provided:
+Two independent checks are provided:
 
 ``concordance_verdict``
     Does another assembly split this contig?  Majority vote across assemblers.
 ``detect_fusions``
     In ``--compare`` mode, do two reference sequences land on one contig?
-``screen_contaminants``
-    Is a contig anomalous in read depth and/or GC relative to the assembly?
+
+Contaminant screening and the machinery that *acts* on a mis-join — breakpoint
+estimation and read-spanning confirmation — live in :mod:`taco.purify`.
 """
 
 # ── Cross-assembler split voting ─────────────────────────────────────────────
@@ -38,6 +39,9 @@ INFORMATIVE_FRAC = 0.60
 #: Minimum number of assemblies that must vote "split" before a contig is
 #: called a mis-join candidate, regardless of the majority.
 MIN_SPLIT_VOTES = 2
+#: Two "substantial" targets may overlap on the query by at most this fraction
+#: of the smaller one before they are treated as a repeat rather than a split.
+MAX_SEGMENT_OVERLAP_FRAC = 0.50
 
 
 def merged_span(intervals):
@@ -88,9 +92,34 @@ def split_vote(query_len, target_intervals,
         return "intact"
 
     substantial = [t for t, c in covers.items() if c >= segment_frac * query_len]
-    if len(substantial) >= 2:
-        return "split"
-    return "uninformative"
+    if len(substantial) < 2:
+        return "uninformative"
+
+    # Two substantial targets are only evidence of a split if they occupy
+    # *different* parts of the query.  Targets that pile up on the same region
+    # are a repeat family, and calling that a split would break real contigs
+    # wherever a segmental duplication happens to be present in two contigs of
+    # another assembly.
+    ranked = sorted(substantial, key=lambda t: -covers[t])[:2]
+    a, b = target_intervals[ranked[0]], target_intervals[ranked[1]]
+    overlap = _interval_overlap(a, b)
+    if overlap >= MAX_SEGMENT_OVERLAP_FRAC * min(covers[ranked[0]],
+                                                 covers[ranked[1]]):
+        return "uninformative"
+    return "split"
+
+
+def _interval_overlap(ivs_a, ivs_b):
+    """Bases covered by both interval sets."""
+    if not ivs_a or not ivs_b:
+        return 0
+    total = 0
+    for s1, e1 in ivs_a:
+        for s2, e2 in ivs_b:
+            lo, hi = max(s1, s2), min(e1, e2)
+            if hi > lo:
+                total += hi - lo
+    return total
 
 
 def concordance_verdict(votes, min_split_votes=MIN_SPLIT_VOTES):
@@ -109,6 +138,14 @@ def concordance_verdict(votes, min_split_votes=MIN_SPLIT_VOTES):
 
     Only informative votes count toward the majority, so an assembly that is
     too fragmented to have an opinion neither supports nor opposes the join.
+
+    A tie among informative voters counts as a flag, not as corroboration.  In
+    v1.3.7 the majority test was strictly ``n_split > n_intact``, so an even
+    split — two assemblies breaking the contig and two reproducing it — was
+    silently reported as corroborated and the candidate escaped scrutiny
+    entirely.  Flagging a tie is safe because being flagged only escalates a
+    contig to investigation: :mod:`taco.purify` still requires an agreed
+    breakpoint and read evidence before anything is broken.
     """
     n_intact = sum(1 for v in votes.values() if v == "intact")
     n_split = sum(1 for v in votes.values() if v == "split")
@@ -117,7 +154,7 @@ def concordance_verdict(votes, min_split_votes=MIN_SPLIT_VOTES):
 
     if n_inf == 0:
         verdict, reason = "unresolved", "no assembly produced an informative alignment"
-    elif n_split >= min_split_votes and n_split > n_intact:
+    elif n_split >= min_split_votes and n_split >= n_intact:
         verdict = "mis_join_candidate"
         reason = f"{n_split} of {n_inf} informative assemblies split this contig"
     elif n_intact >= n_split:
@@ -220,110 +257,11 @@ def _cumulative_offsets(lengths):
     return offs
 
 
-# ── Contaminant / foreign-sequence screening ─────────────────────────────────
-
-#: A contig whose median depth falls below this fraction of the assembly's
-#: modal depth is anomalous — too shallow to be a chromosome of the sequenced
-#: organism at the observed coverage.
-DEPTH_RATIO_MAX = 0.34
-#: Absolute GC deviation (percentage points) from the assembly mode that marks
-#: a contig as compositionally foreign.
-GC_DEV_MAX = 8.0
-#: Contigs shorter than this are ignored, since short contigs are noisy in both
-#: depth and GC.
-MIN_SCREEN_LEN = 10000
-
-
-def length_weighted_median(pairs):
-    """Median of ``(value, weight)`` pairs, weighting by *weight*.
-
-    Used for the assembly's modal depth and GC so that a few small aberrant
-    contigs cannot move the baseline they are being compared against.
-    """
-    items = [(float(v), float(w)) for v, w in pairs if w and w > 0]
-    if not items:
-        return 0.0
-    items.sort()
-    half = sum(w for _, w in items) / 2.0
-    run = 0.0
-    for v, w in items:
-        run += w
-        if run >= half:
-            return v
-    return items[-1][0]
-
-
-def screen_contaminants(contigs, depth_ratio_max=DEPTH_RATIO_MAX,
-                        gc_dev_max=GC_DEV_MAX, min_len=MIN_SCREEN_LEN):
-    """Flag contigs that look like foreign sequence rather than target genome.
-
-    Args:
-        contigs: iterable of dicts with ``contig``, ``length``, ``median_cov``,
-            ``gc`` and optionally ``aligned_to_compare`` (bool) and
-            ``busco_count`` (int).  Extra keys are ignored.
-        depth_ratio_max / gc_dev_max / min_len: see module constants.
-
-    Returns:
-        ``(flagged, baseline)``.  *flagged* is a list of dicts with the
-        triggering signals and a ``signals`` count; *baseline* records the modal
-        depth and GC the comparison was made against.
-
-    Read depth and GC are independent signals, so a contig is reported when
-    either fires and the report states which.  Nothing is removed here: the
-    caller decides, and TACO's convention is to write a filtered assembly
-    alongside the unfiltered one rather than to delete sequence.
-    """
-    recs = [c for c in contigs if int(c.get("length") or 0) > 0]
-    if not recs:
-        return [], {"modal_depth": 0.0, "modal_gc": 0.0, "n_contigs": 0}
-
-    # ``median_cov`` of None means "no coverage record for this contig", which
-    # is not the same as zero coverage.  Treating a missing record as 0x would
-    # flag it as a contaminant on the strength of absent data, so contigs
-    # without depth are excluded from the baseline and only screened on GC.
-    modal_depth = length_weighted_median(
-        [(c.get("median_cov"), c.get("length") or 0) for c in recs
-         if c.get("median_cov") is not None])
-    modal_gc = length_weighted_median(
-        [(c.get("gc") or 0, c.get("length") or 0) for c in recs])
-    baseline = {"modal_depth": modal_depth, "modal_gc": modal_gc,
-                "n_contigs": len(recs)}
-
-    flagged = []
-    for c in recs:
-        length = int(c["length"])
-        if length < min_len:
-            continue
-        raw_depth = c.get("median_cov")
-        has_depth = raw_depth is not None
-        depth = float(raw_depth) if has_depth else 0.0
-        gc = float(c.get("gc") or 0)
-        depth_informative = has_depth and modal_depth > 0
-        ratio = (depth / modal_depth) if depth_informative else 1.0
-        gc_dev = abs(gc - modal_gc)
-
-        signals = []
-        if depth_informative and ratio < depth_ratio_max:
-            signals.append(f"depth {depth:.0f}x is {ratio:.2f} of modal {modal_depth:.0f}x")
-        if gc_dev > gc_dev_max:
-            signals.append(f"GC {gc:.1f}% deviates {gc_dev:.1f} points from modal {modal_gc:.1f}%")
-        if c.get("aligned_to_compare") is False:
-            signals.append("no alignment to the compare genome")
-        if c.get("busco_count") is not None and int(c["busco_count"]) == 0 and length >= 1000000:
-            signals.append(f"no BUSCO genes over {length:,} bp")
-
-        # Depth or GC alone is enough to report; the other keys only corroborate.
-        primary = (depth_informative and ratio < depth_ratio_max) or (gc_dev > gc_dev_max)
-        if primary:
-            flagged.append({
-                "contig": c.get("contig"),
-                "length": length,
-                "median_cov": depth,
-                "depth_ratio": round(ratio, 4),
-                "gc": gc,
-                "gc_deviation": round(gc_dev, 2),
-                "n_signals": len(signals),
-                "signals": "; ".join(signals),
-            })
-    flagged.sort(key=lambda r: -r["length"])
-    return flagged, baseline
+# ── Contaminant screening moved to taco.purify in v1.3.9 ─────────────────────
+#
+# ``screen_contaminants`` and ``length_weighted_median`` lived here in v1.3.7.
+# They now live in :mod:`taco.purify`, rewritten, because the versions here had
+# two defects that only a rewrite could fix: a length-weighted median baseline
+# inverts host and contaminant once foreign sequence passes half the assembly,
+# and an OR over a single depth or GC signal at fixed absolute thresholds both
+# condemns real atypical chromosomes and cannot adapt across genomes.

@@ -42,7 +42,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.3.7"
+    PIPELINE_NAME = "TACO-1.3.9"
 
     def __init__(self, args):
         # Core parameters
@@ -91,6 +91,14 @@ class PipelineRunner:
         self.no_coverage_qc = getattr(args, 'no_coverage_qc', False)
         self.concordance_mode = getattr(args, 'concordance_mode', 'exclude')
         self.no_contam_screen = getattr(args, 'no_contam_screen', False)
+        # --no-contam-screen stays an alias for --purify-mode off, so a v1.3.7
+        # command line behaves the way its author intended instead of silently
+        # gaining a stage that now modifies the assembly.
+        self.purify_mode = ('off' if self.no_contam_screen
+                            else getattr(args, 'purify_mode', 'on'))
+        self.metagenome = getattr(args, 'metagenome', False)
+        self.chimera_action = getattr(args, 'chimera_action', 'split')
+        self.spanning_anchor = getattr(args, 'spanning_anchor', 1000)
         self.allow_t2t_replace = getattr(args, 'allow_t2t_replace', False)
 
         # Backbone selection

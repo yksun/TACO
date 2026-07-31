@@ -59,7 +59,7 @@ TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the p
 | Rebuild only assembly-only summary/cleanup | `--assembly-only -s 14` | 14B | `final_results/assembly_only_result.csv` |
 | Add a comparison against an external assembly | add `--compare <fasta>` to any of the above | adds 14C | `final_results/compare_report/` (per-contig synteny, weak regions, alignment gaps, Circos input, optional QUAST `-R`/dnadiff/paftools/mash) |
 
-TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mode-adaptive: **14A** runs in full mode for final reporting and cleanup, while **14B** runs only when `--assembly-only` is set. **14C** runs in addition to 14A whenever `--compare` is supplied — it produces a passive contig-to-contig comparison report against `final.merged.fasta` without touching the assembly itself.
+TACO uses public step numbers **0-14**. Step 13 is **purify + final QC**: it screens foreign sequence (13A), resolves chimeras (13B), emits the purified assembly (13C), and only then measures it (13D) — so the reported metrics always describe the assembly TACO delivers. Step 14 is mode-adaptive: **14A** runs in full mode for final reporting and cleanup, while **14B** runs only when `--assembly-only` is set. **14C** runs in addition to 14A whenever `--compare` is supplied — it produces a passive contig-to-contig comparison report against `final.merged.fasta` without touching the assembly itself.
 
 ## Key Features
 
@@ -77,7 +77,7 @@ TACO uses public step numbers **0-14**. Step 13 is final QC only. Step 14 is mod
 - Structural quickmerge validation with parent alignment checks
 - Cross-assembler concordance checking: a contig that one assembler presents as telomere-to-telomere while the other assemblies split it is flagged as a possible mis-join and, by default, does not earn the T2T scoring reward — so a single assembler's chimera cannot win backbone selection. Needs no reference genome (`--concordance-mode`)
 - Mis-join detection against `--compare`: reports contigs that absorb two or more reference sequences, with the implied junction coordinate
-- Contaminant screen: flags final contigs whose read depth and/or GC mark them as foreign and writes `final.clean.fasta` alongside the unfiltered assembly, deleting nothing (`--no-contam-screen`)
+- Purification (Step 13A-13C, on by default): removes foreign sequence and repairs chimeras *before* final QC. Removal needs two independent signals — depth and composition, judged as robust z-scores against the assembly's heaviest cluster plus an absolute effect size — and is vetoed for telomere-bearing contigs, organelles, collapsed repeats, and anything that would discard over 25% of the assembly. `final.merged.fasta` keeps the unfiltered merge and removals are preserved in `purify_excluded.fasta`, so no sequence is destroyed (`--purify-mode off`, `--metagenome`)
 - Coverage QC: sliding-window read depth analysis with GFF3 output for genome browser visualization
 - Full provenance tracking: GFF3 annotation tracing every contig to its original assembler, with quickmerge region-level mapping
 - Mode-aware final reporting: Step 14A creates the full final comparison report; Step 14B creates the assembly-only summary
@@ -183,7 +183,11 @@ taco -g 12m -t 16 \
 | `--no-polish` | Skip automatic polishing after refinement |
 | `--allow-t2t-replace` | Allow rescue donors to replace immutable Tier 1 (T2T) contigs. Disabled by default for safety |
 | `--concordance-mode` | Cross-assembler validation of strict-T2T contigs: `exclude` (default) discounts a contig that most other assemblies split, so one assembler's mis-join cannot win backbone selection; `flag` reports such contigs without changing the score; `off` disables the check. Costs one minimap2 alignment per (assembly, voter) pair — roughly 5 s each on a 45 Mb fungal genome. Needs no reference. |
-| `--no-contam-screen` | Skip the final coverage/GC contaminant screen. By default TACO flags final contigs whose read depth and/or GC mark them as foreign, writes `final_results/contamination_candidates.tsv`, and emits `final.clean.fasta` alongside the unfiltered assembly without deleting anything. |
+| `--purify-mode {on,off}` | Step 13A-13C purification, `on` by default. Screens foreign sequence and resolves chimeras before final QC. Writes `final_results/purification_report.tsv` and `chimera_decisions.tsv`. |
+| `--metagenome` | Treat the sample as a deliberate mixture: anomalies are reported but nothing is removed, because a metagenome has no single modal depth or composition to screen against. For co-cultures, holobionts, lichens, and symbiont assemblies. |
+| `--chimera-action {split,replace,report,off}` | What to do with a contig other assemblies split and reads fail to span. `split` (default) cuts at the consensus breakpoint, preserving the backbone sequence and its polish. Nothing is broken without a cross-assembler majority, an agreed breakpoint, and read evidence against the join. |
+| `--spanning-anchor BP` | Aligned anchor required each side of a candidate junction for a read to count as spanning it (default 1000). |
+| `--no-contam-screen` | Alias for `--purify-mode off`. |
 
 ### Assembly-Only Mode
 
@@ -205,7 +209,7 @@ When running selected steps with `-s`/`--steps`, TACO checks only the tools need
 
 Step 10 checks for raw assembler outputs from Steps 1-9 or existing normalized FASTAs. Step 12 and later check for the Step 10/11 outputs they need. Step 13 runs only final QC on the refined assembly. Step 14 does not rerun final QC; it builds the report and organizes outputs. In full mode, `-s 14` always runs 14A. In assembly-only mode, `--assembly-only -s 14` runs 14B.
 
-For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.7, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.7 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
+For common cleanup outputs, TACO can restore active inputs from `final_results/`, `telomere_pool/`, or `temp/assemblers/` back into the working locations needed by a resumed step. As of TACO v1.3.9, restoration covers all of steps 8–14: normalized `assemblies/*.result.fasta` are restored from the corresponding `temp/assemblers/...` paths, `assembly_info.csv` and the per-merged metric CSVs are restored from `final_results/`, telomere-pool FASTAs and provenance TSVs are restored from `telomere_pool/`, and `assemblies/final.merged.fasta` is restored from `final_results/final.merged.fasta` (or from `--final-fa` when supplied — that override is authoritative). TACO v1.3.9 uses public steps 0-14; use `-s 12-14` for the full final resume path rather than older `12-17` ranges.
 
 Cleanup keeps resumable working files in place when possible, copies stable publication-facing outputs into `final_results/`, copies telomere-pool products into `telomere_pool/`, and moves bulky transient work files into `temp/`. Final cleanup and assembly-only cleanup move raw assembler work directories into `temp/assemblers/`; normalized `assemblies/*.result.fasta` files remain the canonical comparison inputs, and Step 10 can also normalize from `temp/assemblers/` if those raw directories were already organized. If a resumed step warns that an upstream file is missing, rerun the producing step range (for example `-s 10-14`) or place the expected file back at the path shown in the warning.
 
@@ -271,7 +275,7 @@ TACO exposes 15 public steps by number: **0-14**. Step 14 has two internal repor
 | 10 | Normalize + QC comparison: BUSCO + Telomere + QUAST + Merqury on all assemblies | QC |
 | 11 | Build telomere pool (pairwise quickmerge + structural validation) | Telomere pool |
 | 12 | Backbone selection and telomere-aware refinement | Refinement |
-| 13 | Final QC only: BUSCO + Telomere + QUAST + Merqury on refined assembly | Final QC |
+| 13 | Purify + final QC: 13A foreign-sequence screen, 13B chimera resolution, 13C emit purified assembly, 13D BUSCO + Telomere + QUAST + Merqury on it | Purify + final QC |
 | 14 / 14A | Final comparison report + cleanup into `final_results/` (full mode) | Report |
 | 14 / 14B | Assembly-only comparison summary + cleanup (only with `--assembly-only`) | Report |
 | 14 / 14C | Compare-vs-final contig-to-contig report (only with `--compare`) | Report |
@@ -282,9 +286,13 @@ TACO exposes 15 public steps by number: **0-14**. Step 14 has two internal repor
 
 Step 0 runs automatically before assembly. It validates that the FASTQ file exists and is non-empty, parses the genome size, estimates total read bases and coverage by sampling the first 100K reads, and warns if coverage is below recommended thresholds (HiFi: 25×, ONT: 40×, CLR: 50×). It also logs which assemblers are compatible with the selected platform and confirms the BUSCO lineage setting. Step 0 runs in both full and assembly-only modes.
 
-### Step 13 — Final QC Only
+### Step 13 — Purify + Final QC
 
-Step 13 evaluates the refined assembly produced by Step 12. It runs BUSCO, telomere detection, QUAST, and optional Merqury on `final.merged.fasta`, then writes component metric files used by Step 14A. Step 13 does not perform cleanup and does not create the full final comparison report by itself.
+Step 13 purifies the assembly produced by Step 12 and then measures it. **13A** screens each contig for foreign sequence using read depth and composition against the assembly's heaviest cluster, guarded so that telomere-bearing contigs, organelles, collapsed repeats and gene-poor accessory chromosomes are not removed. **13B** cross-checks every contig above 500 kb against every other assembly, estimates a breakpoint for any the majority splits, and confirms or refutes it with the count of reads spanning that position. **13C** writes `final.purified.fasta` and preserves anything removed in `purify_excluded.fasta`; `final.merged.fasta` is never modified. **13D** runs BUSCO, telomere detection, QUAST and optional Merqury on whatever 13C produced, writing the component metric files Step 14A consumes.
+
+Purification and measurement sit in the same step deliberately. Through v1.3.7 the screen ran in Step 14A, after every published metric had already been computed on the unfiltered merge, so an accurate screen changed nothing a user read. Pass `--purify-mode off` for the old measure-the-merge behaviour.
+
+Step 13 does not perform cleanup and does not create the full final comparison report by itself.
 
 ### Step 14 — Mode-Adaptive Reporting
 
@@ -316,7 +324,7 @@ Steps 0-10, 14: runs all assemblers (1-9), normalizes and QC-compares all assemb
 |---|---|
 | Step 10 (Normalize + QC) | Compare FASTA is normalized to `assemblies/compare.result.fasta` and gets BUSCO, telomere, QUAST, and Merqury rows in `assembly_info.csv` and (later) `final_result.csv`. |
 | Steps 11 / 12 | **Skipped for compare** — it is excluded from the telomere pool, the all-vs-all quickmerge candidate set, polish, and purge_dups. |
-| Step 13 (Final QC) | Unchanged — runs on `final.merged.fasta` only. |
+| Step 13 (Purify + Final QC) | Purifies `final.merged.fasta` into `final.purified.fasta`, then measures the result. Re-runnable on its own with `-s 13` to retune purification without repeating Step 12. |
 | **Step 14C** (new) | Builds the contig-to-contig report at `final_results/compare_report/` against `final.merged.fasta`, then proceeds to standard 14A cleanup. |
 
 ### Outputs in `final_results/compare_report/`
@@ -387,7 +395,7 @@ taco -g 40m -t 30 --fastq reads.fastq --platform nanopore --taxon fungal \
 
 ## Telomere Detection
 
-TACO v1.3.7 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
+TACO v1.3.9 uses a taxon-aware hybrid telomere detection system that combines built-in motif families with de novo k-mer discovery.
 
 ### Taxon-Aware Presets
 
@@ -571,7 +579,11 @@ Example workflow for inspecting weak spots:
 |---|---|---|
 | `assemblies/assembly_info.csv` | Step 10 | Unified assembler comparison table used for benchmarking and backbone selection |
 | `final_results/assembly_only_result.csv` | Step 14B | Publication-facing summary for `--assembly-only` runs |
-| `final_results/final_assembly.fasta` | Step 14A | Final refined candidate assembly for downstream analysis |
+| `final_results/final_assembly.fasta` | Step 14A | Final **purified** assembly for downstream analysis — the file to use |
+| `final_results/final.purified.fasta` | Step 13C | Same content, under its explicit name |
+| `final_results/purify_excluded.fasta` | Step 13C | Sequence removed as foreign, preserved |
+| `final_results/purification_report.tsv` | Step 13A | Per-contig signals, guards, tier and reason |
+| `final_results/chimera_decisions.tsv` | Step 13B | Per-contig concordance verdict, breakpoint, spanning-read verdict, action |
 | `final_results/final_result.csv` | Step 14A | Final report combining assembler metrics with the final refined assembly metrics |
 | `final_results/final.merged.provenance.gff3` | Step 12/14A | Contig-level and region-level provenance for the refined assembly |
 | `final_results/coverage_summary.tsv` | Step 12K/14A | Per-contig read-depth QC summary for the final assembly |
@@ -596,7 +608,7 @@ project_directory/
 ├── final_results/
 │   ├── final_result.csv                 # Full-mode final comparison report (Step 14A)
 │   ├── final.merged.fasta               # Refined assembly used internally for final QC
-│   ├── final_assembly.fasta             # Publication-facing refined assembly copy
+│   ├── final_assembly.fasta             # Publication-facing PURIFIED assembly
 │   ├── final.merged.provenance.gff3     # GFF3 provenance: full assembler tracing per contig
 │   ├── pool_contig_provenance.tsv       # Pool contig → assembler + original name mapping
 │   ├── quickmerge_validation.tsv        # Quickmerge structural validation decisions
@@ -648,7 +660,7 @@ TACO/
 ├── setup.py                # pip install entry point
 ├── run_taco                # Shell wrapper (no install needed)
 ├── taco/                   # Python package
-│   ├── __init__.py         # Package metadata (v1.3.7)
+│   ├── __init__.py         # Package metadata (v1.3.9)
 │   ├── __main__.py         # CLI entry point: taco [options]
 │   ├── cli.py              # Argument parsing
 │   ├── pipeline.py         # Pipeline runner, logging, benchmarking
@@ -657,6 +669,8 @@ TACO/
 │   ├── telomere_detect.py  # Hybrid telomere detection engine
 │   ├── telomere_pool.py    # Telomere pool classification
 │   ├── clustering.py       # Minimap2-based contig clustering
+│   ├── concordance.py      # Cross-assembler split voting, fusion detection
+│   ├── purify.py           # Contaminant screening and chimera resolution
 │   ├── backbone.py         # Backbone selection and scoring
 │   └── reporting.py        # Final report generation
 ├── docs/                   # Documentation and images
