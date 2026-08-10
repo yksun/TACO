@@ -5,6 +5,43 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.4.1] — 2026-08-03
+
+### Audit only: the Tier 1 / cross-assembler disagreement is now recorded
+
+Step 12 assigns Tier 1 immutability from telomere status alone and never
+consults the cross-assembler verdict. A contig fusing two chromosomes at ends
+that are themselves incomplete carries genuine telomeres at both outer ends, so
+it classifies strict-T2T, becomes immutable, and the telomere pool is barred
+from competing for that chromosome — precisely because the contig fakes the
+property that earns protection. 13B resolves it later, but refinement has
+finished by then and no replacement can be offered for the pieces.
+
+This release makes that visible and changes nothing else.
+
+- New `assemblies/tier_assignment.tsv` (copied to `final_results/` when present)
+  with `tier` — what TACO used — beside `would_be_tier` — what the verdict
+  implies — plus the vote counts and the reason. Where the two columns differ,
+  the run directory now says so.
+- A warning naming each contested Tier 1 contig and stating that resolution is
+  deferred to 13B.
+- Reuses `_purify_all_contig_concordance`, which already excludes the backbone's
+  own assembly from the voter set and already handles a missing minimap2 or
+  fewer than two voters. Cost is one call, roughly 25 s on a 45 Mb fungal
+  genome; skipped entirely under `--concordance-mode off`.
+
+**No output changes.** No tier is modified, no path is altered, and the
+delivered assembly is byte-identical to v1.4.0 on the same inputs.
+
+Acting on the disagreement is deferred deliberately. Demoting a contested contig
+to Tier 2 makes it eligible for donor paths — 12E2 single-telomere rescue at
+`RESCUE_MIN_COV_BB` 0.60, and the 12F2 partial path at `min_tcov` 0.15 — whose
+thresholds have not been evaluated against a multi-chromosome target. Demotion
+is therefore not obviously safer than current behavior, and needs a genome where
+a donor can actually win before it is worth the risk.
+
+---
+
 ## [1.4.0] — 2026-07-31
 
 A minor-version bump rather than a patch, because the default behaviour changes in

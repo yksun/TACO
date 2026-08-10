@@ -5296,6 +5296,99 @@ def _collision_free_name(name, existing, exclude=None):
     return f"{name}__dup{i}"
 
 
+def _audit_tier_assignment(runner, backbone_fa, bb_t2t_ids, bb_telo_ids):
+    """Record — without acting on it — where Tier 1 disagrees with the other assemblies.
+
+    Step 12 assigns Tier 1 immutability from telomere status alone.  A contig
+    that fuses two chromosomes at ends which are themselves incomplete carries
+    genuine telomeric repeat at both outer ends, so it classifies strict-T2T and
+    becomes immutable, and the telomere pool is barred from competing for that
+    chromosome precisely because the contig fakes the property that earns
+    protection.  Sub-step 13B resolves such a contig later, but by then
+    refinement has finished and no replacement can be offered for the pieces.
+
+    This function deliberately changes nothing.  It reuses the cross-assembler
+    machinery already present in :func:`_purify_all_contig_concordance` — which
+    excludes the backbone's own assembly from the voter set and handles a
+    missing minimap2 or fewer than two voters internally — and writes
+    ``tier_assignment.tsv`` recording both the tier TACO used and the tier the
+    cross-assembler verdict implies.  Where those two columns differ, the run
+    directory now says so.
+
+    Acting on the disagreement is deferred: demoting a contig to Tier 2 makes it
+    eligible for donor paths whose acceptance thresholds have not been evaluated
+    for a multi-chromosome target, so demotion is not obviously safer than the
+    current behavior and needs a genome to test against.
+    """
+    if getattr(runner, "concordance_mode", "exclude") == "off":
+        runner.log_info("Tier audit: --concordance-mode off; skipping")
+        return {}
+    if not backbone_fa or not os.path.isfile(backbone_fa) or \
+            os.path.getsize(backbone_fa) == 0:
+        return {}
+
+    try:
+        conc = _purify_all_contig_concordance(
+            runner, backbone_fa, label="Tier audit (12D)",
+            workdir="assemblies/tier_audit_concordance")
+    except Exception as exc:                                  # never fatal
+        runner.log_warn(f"Tier audit: cross-check failed ({exc}); "
+                        "tier_assignment.tsv not written")
+        return {}
+    if not conc:
+        runner.log_info("Tier audit: no cross-assembler verdicts available")
+        return {}
+
+    rows = []
+    contested = []
+    for name, seq in _read_fasta_records(backbone_fa):
+        if name in bb_t2t_ids:
+            raw_class, tier = "strict_t2t", 1
+        elif name in bb_telo_ids:
+            raw_class, tier = "telomere_bearing", 2
+        else:
+            raw_class, tier = "none", 2
+        info = conc.get(name) or {}
+        v = info.get("verdict") or {}
+        vd = v.get("verdict", "not_tested")
+        would_be = 2 if (tier == 1 and vd == "mis_join_candidate") else tier
+        if would_be != tier:
+            contested.append((name, len(seq), v))
+        rows.append([name, len(seq), raw_class, vd,
+                     v.get("n_split", ""), v.get("n_intact", ""),
+                     v.get("n_informative", ""), tier, would_be,
+                     v.get("reason", "not tested")])
+
+    out = "assemblies/tier_assignment.tsv"
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["contig", "length", "raw_telomere_class",
+                    "concordance_verdict", "n_split", "n_intact",
+                    "n_informative", "tier", "would_be_tier", "reason"])
+        w.writerows(rows)
+    if os.path.isdir("final_results"):
+        try:
+            shutil.copy(out, os.path.join("final_results",
+                                          "tier_assignment.tsv"))
+        except OSError:
+            pass
+
+    for name, length, v in contested:
+        runner.log_warn(
+            f"Tier 1 contig {name} ({length:,} bp) is contradicted by "
+            f"{v.get('n_split')} of {v.get('n_informative')} independent "
+            f"assemblies. TACO will resolve this at sub-step 13B rather than "
+            f"offering a replacement here; see {out}")
+    if contested:
+        runner.log_warn(f"Tier audit: {len(contested)} of {len(bb_t2t_ids)} "
+                        f"Tier 1 contigs are contested. No behavior change in "
+                        f"this release.")
+    else:
+        runner.log(f"Tier audit: all {len(bb_t2t_ids)} Tier 1 contigs are "
+                   f"corroborated by the other assemblies")
+    return conc
+
+
 def step_12_refine(runner):
     """Step 12 - Backbone-first telomere-aware refinement with BUSCO trial validation.
 
@@ -5532,6 +5625,10 @@ def step_12_refine(runner):
     runner.log_info(f"Tier 1 (backbone T2T, immutable): {len(bb_t2t_ids)} contigs"
                     f"{' (--allow-t2t-replace ON)' if allow_t2t_replace else ''}")
     runner.log_info(f"Tier 2 (backbone non-T2T, upgradeable): {bb_tier2_count} contigs")
+
+    # v1.4.1: record where the cross-assembler verdict contradicts Tier 1.
+    # Audit only — nothing below reads this, and no tier is changed.
+    _audit_tier_assignment(runner, backbone_fa, bb_t2t_ids, bb_telo_ids)
 
     # Copy pool T2T for reference (chimera-checked version)
     if protected_fasta and os.path.isfile(protected_fasta) and \
@@ -9068,7 +9165,8 @@ def _purify_contig_records(runner, fa, tiers):
     return recs
 
 
-def _purify_all_contig_concordance(runner, fa):
+def _purify_all_contig_concordance(runner, fa, label="Purify 13B",
+                                   workdir="assemblies/purify_concordance"):
     """Cross-check *every* large contig of the delivered assembly against the others.
 
     v1.3.7 only tested contigs already classified strict-T2T, for the narrow
@@ -9084,8 +9182,8 @@ def _purify_all_contig_concordance(runner, fa):
     Returns ``{contig: {"verdict": ..., "intervals": {voter: {target: [...]}}}}``.
     """
     if not shutil.which("minimap2"):
-        runner.log_warn("Purify: minimap2 not found; skipping the mis-join "
-                        "cross-check")
+        runner.log_warn(f"{label}: minimap2 not found; skipping the "
+                        f"cross-assembler check")
         return {}
 
     backbone = _purify_selected_assembler()
@@ -9105,8 +9203,8 @@ def _purify_all_contig_concordance(runner, fa):
             continue
         voters.append(name)
     if len(voters) < 2:
-        runner.log_info("Purify: fewer than two independent assemblies "
-                        "available; skipping the mis-join cross-check")
+        runner.log_info(f"{label}: fewer than two independent assemblies "
+                        f"available; skipping the cross-assembler check")
         return {}
 
     names = [n for n, s in _read_fasta_records(fa)
@@ -9114,15 +9212,15 @@ def _purify_all_contig_concordance(runner, fa):
     if not names:
         return {}
 
-    work = "assemblies/purify_concordance"
+    work = workdir
     os.makedirs(work, exist_ok=True)
     qfa = os.path.join(work, "delivered.fa")
     if _subset_fasta(fa, names, qfa) == 0:
         return {}
 
-    runner.log(f"Purify 13B - cross-checking {len(names)} contig(s) of the "
-               f"delivered assembly against {len(voters)} independent "
-               f"assemblies ({', '.join(voters)})")
+    runner.log(f"{label} - cross-checking {len(names)} contig(s) against "
+               f"{len(voters)} independent assemblies "
+               f"({', '.join(voters)})")
 
     votes = {c: {} for c in names}
     intervals = {c: {} for c in names}
@@ -9132,7 +9230,7 @@ def _purify_all_contig_concordance(runner, fa):
                f"assemblies/{v}.result.fasta {shlex.quote(qfa)} "
                f"> {shlex.quote(paf)}")
         res = _run_shell_capture(
-            runner, cmd, f"Purify: delivered contigs vs {v}",
+            runner, cmd, f"{label}: contigs vs {v}",
             stderr_log=os.path.join(work, f"delivered__vs__{v}.stderr.log"))
         if res.returncode != 0:
             continue
