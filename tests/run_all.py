@@ -13,6 +13,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = [
+    "test_assembly_mode.py",
     "test_concordance.py",
     "test_purify.py",
     "test_review_fixes.py",

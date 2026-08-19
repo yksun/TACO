@@ -3,11 +3,13 @@ import os
 import sys
 import argparse
 import csv
-import math
 
 from taco.utils import ALL_ASSEMBLERS
+from taco.policy import DEFAULT_MODE, VALID_MODES, score_assembly
 ASSEMBLERS = ALL_ASSEMBLERS
 
+#: Retained for backward compatibility with callers that introspect it.  The
+#: authoritative weights now live in taco.policy.TAXON_OVERRIDES.
 TAXON_WEIGHTS = {
     "fungal": {"dup_penalty": 600, "t2t_weight": 350, "n50_weight": 150, "frag_penalty": 30},
     "plant":      {"dup_penalty": 300, "t2t_weight": 200, "n50_weight": 150, "frag_penalty": 50},
@@ -59,70 +61,58 @@ def parse_assembly_info(csv_path):
     return info
 
 
-def _compute_score(metrics, taxon="other", genomesize=None):
-    """Compute assembly score using taxon-aware weights and BUSCO D penalty.
+def _compute_score(metrics, taxon="other", genomesize=None,
+                   assembly_mode=DEFAULT_MODE):
+    """Compute assembly score under the active representation profile.
+
+    Delegates to :func:`taco.policy.score_assembly` so this path and the one in
+    :mod:`taco.steps` cannot disagree about what a good assembly is.  The
+    metric names here are this module's CSV names; they are translated to the
+    policy's names below.
 
     Args:
         metrics: dict of {metric: value} for a single assembly
         taxon: Taxonomy (fungal, plant, vertebrate, animal, insect, other)
-        genomesize: Expected genome size in bp (optional); used for size deviation penalty
+        genomesize: Expected haploid genome size in bp (optional); used for the
+            size term
+        assembly_mode: 'primary' (nonredundant) or 'full' (alternate sequence
+            retained)
 
     Returns:
         float: Computed score
     """
-    # Get taxon-specific weights
-    weights = TAXON_WEIGHTS.get(taxon, TAXON_WEIGHTS["other"])
-    dup_penalty = weights["dup_penalty"]
-    t2t_weight = weights["t2t_weight"]
-    n50_weight = weights["n50_weight"]
-    frag_penalty = weights["frag_penalty"]
-
-    # Extract metrics with defaults
-    busco_s = float(metrics.get("BUSCO_S", 0))
-    busco_d = float(metrics.get("BUSCO_D", 0))
-    t2t = float(metrics.get("T2T", 0))
-    single = float(metrics.get("single", 0))
-    merqury_comp = float(metrics.get("MerquryComp", 0))
-    merqury_qv = float(metrics.get("MerquryQV", 0))
-    contigs = float(metrics.get("contigs", 1))
-    n50 = float(metrics.get("N50", 1))
-
-    # Size deviation penalty
-    size_penalty = 0
-    if genomesize and genomesize > 0:
-        total_len = float(metrics.get("total_length", 0))
-        if total_len > 0:
-            deviation = abs(total_len - genomesize) / genomesize
-            size_penalty = deviation * 500  # 500 points penalty per 100% deviation
-        else:
-            size_penalty = 0
-    else:
-        size_penalty = 0
-
-    # Smart scoring formula with BUSCO_D penalty and taxon-aware weights
-    score = (
-        busco_s * 1000
-        - busco_d * dup_penalty
-        + merqury_comp * 200
-        + merqury_qv * 20
-        + t2t * t2t_weight
-        + single * 150
-        + (math.log10(n50) if n50 > 0 else 0) * n50_weight
-        - contigs * frag_penalty
-        - size_penalty
+    # `contigs` and `N50` default to 1 rather than 0 to preserve the historical
+    # behaviour of this entry point on rows that omit them.
+    score, _ = score_assembly(
+        {
+            "busco_s": metrics.get("BUSCO_S", 0),
+            "busco_d": metrics.get("BUSCO_D", 0),
+            "busco_c": metrics.get("BUSCO_C", 0),
+            "t2t": metrics.get("T2T", 0),
+            "single_tel": metrics.get("single", 0),
+            "merqury_comp": metrics.get("MerquryComp", 0),
+            "merqury_qv": metrics.get("MerquryQV", 0),
+            "contigs": metrics.get("contigs", 1),
+            "n50": metrics.get("N50", 1),
+            "total_len": metrics.get("total_length", 0),
+        },
+        mode=assembly_mode, taxon=taxon,
+        expected_haploid=genomesize or 0,
     )
-
     return score
 
 
-def select_backbone(info, mode="smart", taxon="other", genomesize=None):
+def select_backbone(info, mode="smart", taxon="other", genomesize=None,
+                    assembly_mode=DEFAULT_MODE):
     """Select best backbone assembler using smart scoring with taxon-aware weights.
 
     Args:
         info: dict of {assembler: {metric: value}}
         mode: Selection mode ('smart' currently)
         taxon: Taxonomy preset (fungal, plant, vertebrate, animal, insect, other)
-        genomesize: Expected genome size in bp (optional)
+        genomesize: Expected haploid genome size in bp (optional)
+        assembly_mode: 'primary' (default, nonredundant representation) or
+            'full' (alternate/haplotype sequence retained)
 
     Returns:
         str: Selected assembler name
@@ -134,7 +124,8 @@ def select_backbone(info, mode="smart", taxon="other", genomesize=None):
     best_score = float('-inf')
 
     for assembler, metrics in info.items():
-        score = _compute_score(metrics, taxon=taxon, genomesize=genomesize)
+        score = _compute_score(metrics, taxon=taxon, genomesize=genomesize,
+                               assembly_mode=assembly_mode)
 
         if score > best_score:
             best_score = score
@@ -151,6 +142,11 @@ def main():
                         help="Selection mode")
     parser.add_argument("--debug-tsv", help="Optional debug TSV output with scores")
     parser.add_argument("--decision-txt", help="Optional decision text output")
+    parser.add_argument("--assembly-mode", dest="assembly_mode",
+                        default=DEFAULT_MODE, choices=list(VALID_MODES),
+                        help="Assembly representation to select for: 'primary' "
+                             "(default, nonredundant) or 'full' (alternate/"
+                             "haplotype sequence retained)")
 
     args = parser.parse_args()
 
@@ -158,20 +154,22 @@ def main():
     info = parse_assembly_info(args.info_csv)
 
     # Select backbone
-    selected = select_backbone(info, mode=args.mode)
+    selected = select_backbone(info, mode=args.mode,
+                               assembly_mode=args.assembly_mode)
 
     # Write debug output if requested
     if args.debug_tsv:
         with open(args.debug_tsv, 'w') as f:
             f.write("assembler\tscore\n")
             for assembler, metrics in info.items():
-                score = _compute_score(metrics)
+                score = _compute_score(metrics, assembly_mode=args.assembly_mode)
                 f.write(f"{assembler}\t{score:.2f}\n")
 
     # Write decision output if requested
     if args.decision_txt:
         with open(args.decision_txt, 'w') as f:
             f.write(f"Selected backbone assembler: {selected}\n")
+            f.write(f"Assembly representation mode: {args.assembly_mode}\n")
 
     # Print to stdout
     print(selected)

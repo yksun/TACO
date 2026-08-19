@@ -33,6 +33,7 @@ TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natu
 - [Pipeline Steps](#pipeline-steps)
 - [Compare Mode (`--compare`)](#compare-mode---compare)
 - [Telomere Detection](#telomere-detection)
+- [Assembly Representation Modes](#assembly-representation-modes)
 - [Assembly Selection Strategy](#assembly-selection-strategy)
 - [Outputs And Reports](#outputs-and-reports)
 - [Project Structure](#project-structure)
@@ -165,6 +166,7 @@ taco -g 12m -t 16 \
 | `--taxon` | Taxonomy preset for telomere detection: `vertebrate`, `animal`, `plant`, `insect`, `fungal`, or `other` (default). Sets motif-family priors and detection behavior automatically. |
 | `-m`, `--motif` | Telomere motif override (optional). Only use when the exact motif is biologically known for the species. When omitted, taxon-aware hybrid detection is used instead. |
 | `--platform` | Sequencing platform: `pacbio-hifi` (default), `nanopore`, or `pacbio`. Determines compatible assemblers and the default polishing tool. |
+| `--assembly-mode` | What TACO should deliver: `primary` (default) or `full`. See [Assembly Representation Modes](#assembly-representation-modes). `primary` is a nonredundant primary representation and reproduces pre-1.5.0 behavior exactly. `full` retains divergent alternate/haplotype sequence instead of collapsing it. |
 | `-s`, `--steps` | Run selected public steps only (e.g., `1,3-5`, `13-14`). TACO uses steps 0-14; `-s 14` runs 14A unless `--assembly-only` is set. |
 | `--reference`, `-ref` | Reference FASTA. Active participant: appears in QC tables, contributes its `*.telo.fasta` to the all-vs-all quickmerge candidate pool, is used as a chimera-detection alignment target during refinement, and can be selected as the backbone if it wins the scoring contest (use `--choose <assembler>` to force a specific backbone if you want to keep the reference out of selection). |
 | `--compare` | Compare-only FASTA — fully passive. Goes through the same QC as the assemblers (BUSCO / Telomere / QUAST / Merqury, with a `compare` row in `final_result.csv`), and triggers **step 14C**, the contig-to-contig comparison report at `final_results/compare_report/`. The report contains: `compare_vs_final.paf` (minimap2 `-cx asm5`), `contig_to_contig.tsv` (per-compare-contig 1-to-1 mapping with identity/coverage), `unique_compare_contigs.tsv` and `unique_final_contigs.tsv` (contigs absent or < 5 % covered in the other assembly), `synteny_blocks.tsv` (1-to-1 / many-to-1 synteny summary), `weak_regions.tsv` (10 kb windows of `final.merged.fasta` < 50 % covered by compare), `compare_telomere_end_scores.tsv` and `TELOMERE_NOTES.txt` (per-contig telomere classification + threshold notes), and `circos/{karyotype.txt, links.txt, circos.conf, README.txt}` (a ready-to-render Circos plot bundle). Optional add-ons when their binaries are on PATH: `compare_quast/` (QUAST `-R compare.fa`), `compare_dnadiff/out.report` (MUMmer SNP/indel summary), `compare_paftools_variants.vcf` (`paftools.js call`), and `compare_mash_distance.tsv` (`mash dist`). Never used for backbone selection, quickmerge, telomere pool, polishing, or purge_dups. |
@@ -180,7 +182,7 @@ taco -g 12m -t 16 \
 | `--merqury-k` | K-mer size for an auto-built Merqury database (default: `auto`; uses Merqury `best_k.sh` when available, otherwise a genome-size/collision-rate fallback) |
 | `--no-merqury` | Disable Merqury even if installed and auto-detected |
 | `--benchmark` | Write optional timing/provenance files to `benchmark_logs/`; disabled by default |
-| `--no-purge-dups` | Skip purge_dups after refinement |
+| `--no-purge-dups` | Skip purge_dups after refinement. This flag can only **disable** purge_dups, never enable it: `--assembly-mode full` already skips it, and omitting this flag does not bring it back. |
 | `--no-polish` | Skip automatic polishing after refinement |
 | `--allow-t2t-replace` | Allow rescue donors to replace immutable Tier 1 (T2T) contigs. Disabled by default for safety |
 | `--concordance-mode` | Cross-assembler validation of strict-T2T contigs: `exclude` (default) discounts a contig that most other assemblies split, so one assembler's mis-join cannot win backbone selection; `flag` reports such contigs without changing the score; `off` disables the check. Costs one minimap2 alignment per (assembly, voter) pair — roughly 5 s each on a 45 Mb fungal genome. Needs no reference. |
@@ -291,7 +293,7 @@ Step 0 runs automatically before assembly. It validates that the FASTQ file exis
 
 Step 13 purifies the assembly produced by Step 12 and then measures it. **13A** screens each contig for foreign sequence using read depth and composition against the assembly's heaviest cluster, guarded so that telomere-bearing contigs, organelles, collapsed repeats and gene-poor accessory chromosomes are not removed. **13B** cross-checks every contig above 500 kb against every other assembly, estimates a breakpoint for any the majority splits, and confirms or refutes it with the count of reads spanning that position. **13C** writes `final.purified.fasta` and preserves anything removed in `purify_excluded.fasta`; `final.merged.fasta` is never modified. **13D** runs BUSCO, telomere detection, QUAST and optional Merqury on whatever 13C produced, writing the component metric files Step 14A consumes.
 
-Purification and measurement sit in the same step deliberately. Through v1.3.7 the screen ran in Step 14A, after every published metric had already been computed on the unfiltered merge, so an accurate screen changed nothing a user read. Pass `--purify-mode off` for the old measure-the-merge behaviour.
+Purification and measurement sit in the same step deliberately. Through v1.3.7 the screen ran in Step 14A, after every published metric had already been computed on the unfiltered merge, so an accurate screen changed nothing a user read. Pass `--purify-mode off` for the old measure-the-merge behavior.
 
 Step 13 does not perform cleanup and does not create the full final comparison report by itself.
 
@@ -317,7 +319,7 @@ Steps 0-10, 14: runs all assemblers (1-9), normalizes and QC-compares all assemb
 `--compare` works in two invocation modes and produces identical outputs in both:
 
 - **Full pipeline:** `taco ... --compare X.fa` runs steps 0–14 normally; the comparison report is generated as part of step 14.
-- **Resume on an existing run:** `taco ... --compare X.fa -s 10,13,14` after a prior full run reuses the existing assemblies and merged FASTA and only adds the comparison artefacts.
+- **Resume on an existing run:** `taco ... --compare X.fa -s 10,13,14` after a prior full run reuses the existing assemblies and merged FASTA and only adds the comparison artifacts.
 
 ### What runs where
 
@@ -425,9 +427,167 @@ Each contig end is scored using a composite of four metrics: telomere density (w
 
 Contigs are classified into three tiers based on their end scores: **strict T2T** contigs have strong telomere signal at both ends (score >= 0.25 at each end), **single-end strong** contigs have strong signal at one end only, and **telomere-supported** contigs have at least weak signal (score >= 0.08) at one end.
 
+## Assembly Representation Modes
+
+`--assembly-mode` selects **what TACO should deliver**. The two modes are not the
+same objective at different thresholds — they disagree about what a good assembly
+*is*, so they score assemblies differently and remove different things.
+
+| | `primary` (default) | `full` |
+|---|---|---|
+| Goal | One nonredundant representative sequence per chromosome | Full sequence representation; divergent alternate sequence retained |
+| BUSCO term rewarded | `BUSCO_S` (single-copy) | `BUSCO_C` (complete = S + D) |
+| BUSCO duplication | Penalized (`w_busco_d` 300–600 by taxon) | **Neutral** — neither rewarded nor punished |
+| Merqury completeness | × 200 | × 400 |
+| Merqury QV | × 20 (kept separate from completeness) | × 20 (kept separate from completeness) |
+| Fragmentation charge | absolute contig count × `w_contigs` | contig **density** (contigs/Mb) × 30 × haploid Mb |
+| Expected size | point deviation from `-g`, penalized | tolerance band `[-g, 2 × -g × 1.15]`, **reported but not scored** |
+| purge_dups | runs | skipped |
+| Self-dedup / containment filtering | runs | skipped |
+| Contaminant screen (13A) | runs | **runs** |
+| Chimera resolution (13B) | runs | **runs** |
+
+### `full` is not a phased assembly
+
+TACO does not order or orient contigs into haplotypes and does not validate
+haplotype consistency. `full` mode **retains** alternate sequence; it does not
+assign it. Do not describe its output as phased, haplotype-resolved, or as
+hap1/hap2.
+
+### Why full mode does not simply relax its constraints
+
+Selection alone is not enough, and neither is loosening the size expectation.
+
+No assembler declares an expected *total* assembly size for a heterozygous
+sample: hifiasm and Verkko take no genome size at all, Flye's is optional, and
+Canu's `genomeSize` is a coverage knob (it feeds `corOutCoverage`,
+`mhapSensitivity`, and NG50 logging) rather than a size expectation. Where a
+declared size *is* compared against a finished assembly, NCBI uses a wide
+taxon-derived band anchored on the haploid value to **flag for human review,
+never to rank**. TACO follows that: in `full` mode the band populates the report
+and the advisory, and contributes nothing to the score.
+
+The guard against an inflated assembly is therefore structural. On a real
+*Puccinia triticina* HiFi read set (`-g 127m`, `--taxon fungal`), a 287 Mb /
+46,812-contig artifact had the **highest** Merqury completeness of any candidate
+(99.26 %) and sat *inside* any band wide enough to admit the genuine 254 Mb
+assembly — so size could not separate them. Contig density does: 163 contigs/Mb
+for the artifact against 3.8 for the 254 Mb assembly and 2.5 for the collapsed
+134 Mb one.
+
+Density rather than absolute count matters because an assembly that legitimately
+carries roughly twice the sequence also carries roughly twice the contigs.
+Charging the absolute count would penalize it for precisely the property `full`
+mode exists to select. Fragmentation is priced at the same per-contig rate in
+both modes; only the double-charge for retained sequence is removed.
+
+### What full mode does *not* switch off
+
+Contaminant screening (13A) and chimera resolution (13B) run in **both** modes.
+Foreign sequence and read-unsupported joins are errors under either objective,
+and they are identified from independent evidence — composition, read depth, and
+read spanning — rather than from a contig resembling a second haplotype. Full
+mode only declines to remove sequence *because it looks redundant*.
+
+### Bounded telomere reward
+
+The number of telomere-bearing contigs is bounded by biology — two telomeres per
+contig, `2 x n_chromosomes x ploidy` per genome — so the score stops rewarding
+counts beyond `2 x (expected total / 1 Mb)`. The 1 Mb minimum-chromosome floor is
+deliberately permissive (127 "chromosomes" in a 127 Mb haploid genome against a
+real 18), so the bound only fires on counts that are impossible by a wide margin
+and changes no realistic selection. It exists because one real candidate reported
+1,668 single-end-telomere contigs in an 18-chromosome genome, worth three times
+its entire BUSCO term. With no `-g` no bound can be derived and the count is used
+as-is.
+
+### Comparing against a different representation
+
+If the `--compare` assembly keeps both haplotypes and this run delivers one (or
+vice versa), each reference haplotype pair maps onto the same single contig and
+`contig_to_contig.tsv` will label those rows `1-to-N (split)`. That is a
+representation difference, not a mis-join.
+`final_results/compare_report/REPRESENTATION_NOTES.txt` reports the fraction of
+chromosome-scale compare contigs sharing a best target and explains how to read
+the other tables when it is high. Match the comparator to the mode where you
+can: a haploid reference for `primary`, a haplotype-retaining one for `full`.
+
+### Advisory
+
+When a `primary` run ends with high Merqury completeness (≥ 95 %), strong BUSCO
+duplication (≥ 20 %), and a substantially larger assembly (≥ 1.4 × the expected
+haploid size) all at once, TACO emits a warning suggesting `--assembly-mode
+full`. This is a prompt to look, not a biological conclusion: these metrics alone
+do not establish the ploidy of the sample, and the warning does not claim they
+do.
+
+### Where the results land
+
+Under the default `both`, each representation is reported inside its own
+directory while the run proceeds, and the run root receives a combined table at
+the end:
+
+```
+mode_primary/final_results/      per-deliverable reports, primary
+mode_full/final_results/         per-deliverable reports, full
+final_results/final_result.csv   every assembler + merged_primary + merged_full
+final_results/assembly_modes_comparison.tsv    headline metrics, side by side
+```
+
+`final_result.csv` at the root is the one table to read: it carries the
+per-assembler columns from step 10, the `--compare` reference if given, and one
+`merged_<mode>` column per deliverable, so the assemblers and both genomes can be
+compared without opening three files.
+
+While a `both` run is in flight the root `final_results/` may still hold output
+from an **earlier** run. TACO writes `final_results/RESULTS_NOT_READY.txt` naming
+those stale files and pointing at the `mode_*/` directories, and removes it when
+the combined report is written. If that file is present, the run has not
+finished.
+
+### Reports
+
+Every run writes `final_results/assembly_mode_summary.txt`, which states
+`Assembly representation mode: primary|full` and the selected assembler,
+selection score, active score profile, BUSCO C/S/D, Merqury QV and completeness,
+assembly length, contig count, N50, T2T and single-end telomere counts, and the
+individual score contributions that produced the winning score. The mode also
+appears in `final_results/final_result.csv`,
+`assemblies/selection_decision.txt`, and the per-component columns of
+`assemblies/selection_debug.tsv`.
+
+### Examples
+
+```bash
+# Default — BOTH genomes from one set of assemblies
+TACO -g 127m -t 32 --fastq /path/reads.fastq.gz --taxon fungal
+```
+
+Produces `mode_primary/`, `mode_full/`, and
+`final_results/assembly_modes_comparison.tsv`. Steps 0–10 run once and are
+shared; only steps 11–14 run twice, so the second genome costs no reassembly.
+
+```bash
+# Only the nonredundant primary genome
+TACO -g 127m -t 32 --fastq /path/reads.fastq.gz --taxon fungal \
+     --assembly-mode primary
+```
+
+```bash
+# Only the full sequence representation, with a matched comparator
+TACO -g 127m -t 32 --fastq /path/reads.fastq.gz --taxon fungal \
+     --assembly-mode full --busco basidiomycota_odb10 \
+     --compare ref/haplotype_retaining_reference.fna
+```
+
+Match the comparator to the representation where you can: a haploid reference
+for `primary`, a haplotype-retaining one for `full`. Under the default `both`,
+`--compare` applies to each deliverable and
+`REPRESENTATION_NOTES.txt` in each `compare_report/` says which pairing you got.
+
 ## Assembly Selection Strategy
 
-When `--choose` is not provided, TACO automatically selects the backbone assembly for refinement. The scoring formula adapts its weights based on `--taxon` to match the biological characteristics of each organism group.
+When `--choose` is not provided, TACO automatically selects the backbone assembly for refinement. The scoring formula adapts its weights based on `--assembly-mode` (which objective to pursue) and `--taxon` (the biological characteristics of the organism group).
 
 ### Smart Scoring (default)
 
@@ -440,17 +600,17 @@ score = BUSCO_S × w_busco_s + T2T × w_t2t + single_tel × w_single
       - BUSCO_D × w_busco_d
 ```
 
-BUSCO single-copy completeness (S%) is used instead of total completeness (C%) to avoid rewarding highly duplicated assemblies. BUSCO duplication (D%) is explicitly penalised. When Merqury is available, its k-mer-based QV and completeness provide an independent quality signal that helps distinguish assemblies with similar BUSCO scores. The weights are tuned per taxon as described below.
+Under the default `--assembly-mode primary`, BUSCO single-copy completeness (S%) is used instead of total completeness (C%) to avoid rewarding highly duplicated assemblies, and BUSCO duplication (D%) is explicitly penalized. Under `--assembly-mode full` the score rewards `BUSCO_C` and treats duplication as neutral — see [Assembly Representation Modes](#assembly-representation-modes). The weights below are the primary-mode weights. When Merqury is available, its k-mer-based QV and completeness provide an independent quality signal that helps distinguish assemblies with similar BUSCO scores. The weights are tuned per taxon as described below.
 
 ### Taxon-Specific Scoring Strategies
 
-**Fungal** (`--taxon fungal`): Fungal genomes are typically small (10–60 Mb) with well-defined chromosomes. TACO uses strict BUSCO duplicate penalty (`w_busco_d = 600`) because duplicated assemblies are almost always artefactual in haploid fungi. T2T contigs are weighted heavily (`w_t2t = 350`) since telomere rescue is highly effective for small genomes where individual T2T chromosomes can be resolved. The contig-count penalty remains moderate (`w_contigs = 30`) because most fungal genomes have few chromosomes.
+**Fungal** (`--taxon fungal`): Fungal genomes are typically small (10–60 Mb) with well-defined chromosomes. TACO uses strict BUSCO duplicate penalty (`w_busco_d = 600`) because duplicated assemblies are almost always artifactual in haploid fungi. T2T contigs are weighted heavily (`w_t2t = 350`) since telomere rescue is highly effective for small genomes where individual T2T chromosomes can be resolved. The contig-count penalty remains moderate (`w_contigs = 30`) because most fungal genomes have few chromosomes.
 
 **Plant** (`--taxon plant`): Plant genomes vary enormously in size and ploidy. TACO relaxes the BUSCO duplicate penalty (`w_busco_d = 300`) because polyploidy naturally inflates D% even in correct assemblies. The contig-count penalty is increased (`w_contigs = 50`) to discourage fragmented assemblies in these often large genomes. T2T weight is reduced (`w_t2t = 200`) because long repetitive arrays near telomeres can produce false-positive signals, and interstitial telomeric repeats (ITRs) are common in plants.
 
-**Vertebrate / Animal** (`--taxon vertebrate` or `--taxon animal`): Vertebrate genomes are large (1–3+ Gb) and repeat-rich. TACO increases the N50 weight (`w_n50 = 200`) to favour contiguous assemblies and moderates the contig-count penalty (`w_contigs = 40`). T2T weight is reduced (`w_t2t = 200`) because interstitial telomeric repeats are frequent in vertebrates and can inflate telomere counts. BUSCO duplicate penalty stays at the default (`w_busco_d = 500`).
+**Vertebrate / Animal** (`--taxon vertebrate` or `--taxon animal`): Vertebrate genomes are large (1–3+ Gb) and repeat-rich. TACO increases the N50 weight (`w_n50 = 200`) to favor contiguous assemblies and moderates the contig-count penalty (`w_contigs = 40`). T2T weight is reduced (`w_t2t = 200`) because interstitial telomeric repeats are frequent in vertebrates and can inflate telomere counts. BUSCO duplicate penalty stays at the default (`w_busco_d = 500`).
 
-**Insect / Other** (`--taxon insect` or `--taxon other`): These taxa use the balanced default weights: `w_busco_s = 1000`, `w_t2t = 300`, `w_single = 150`, `w_contigs = 30`, `w_n50 = 150`, `w_busco_d = 500`. This is appropriate when the biological characteristics of the target organism are not well characterised.
+**Insect / Other** (`--taxon insect` or `--taxon other`): These taxa use the balanced default weights: `w_busco_s = 1000`, `w_t2t = 300`, `w_single = 150`, `w_contigs = 30`, `w_n50 = 150`, `w_busco_d = 500`. This is appropriate when the biological characteristics of the target organism are not well characterized.
 
 | Weight | Fungal | Plant | Vertebrate/Animal | Insect/Other |
 |---|---|---|---|---|
@@ -494,7 +654,7 @@ Before adding "novel" pool T2T contigs, TACO checks each candidate against the c
 
 Thresholds: `NOVEL_DUP_COV` (default 0.80), `NOVEL_DUP_ID` (default 0.90), `NOVEL_UPGRADE_TCOV` (default 0.80).
 
-### Taxon-Specific purge_dups Behaviour (Step 12H)
+### Taxon-Specific purge_dups Behavior (Step 12H)
 
 purge_dups strategy is taxon-aware. Fungi use two-round purging (`-2`) with upstream-default chaining lengths, which is safer than short-match fungal tuning when the selected backbone is already close to the expected genome size. Vertebrate, animal, and insect genomes use two-round purging for high-heterozygosity haplotig/overlap cleanup. Plant genomes use conservative single-round purging with stricter sequence-level evidence to avoid collapsing homeologous sequences in polyploid species — use `--no-purge-dups` or `PURGE_DUPS_MODE=skip` if this is still too aggressive. TACO runs `get_seqs -e` by default, so only end duplications are removed, and rejects purged output if the taxon-specific size drop or expected genome-size floor suggests over-purging. If purging makes an overlarge assembly substantially closer to the expected genome size without falling below the floor, TACO accepts that drop instead of preserving duplicated sequence. Coverage cutoffs from `calcuts` are logged for debugging; override with `PURGE_DUPS_CALCUTS`. Advanced overrides: `PURGE_DUPS_MODE` (`auto`, `single`, `two-round`, `skip`), `PURGE_DUPS_EXTRA_OPTS`, `PURGE_DUPS_GET_SEQS_OPTS`, `PURGE_DUPS_MAX_BP_DROP`, and `PURGE_DUPS_MIN_EXPECTED_RATIO`.
 

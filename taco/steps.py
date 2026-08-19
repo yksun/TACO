@@ -21,12 +21,14 @@ import signal
 from pathlib import Path
 from collections import defaultdict
 
+from taco import policy
 from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
 from taco.utils import ALL_ASSEMBLERS, EXCLUDED_FROM_BACKBONE, active_assemblers
 from taco.concordance import (split_vote, concordance_verdict,
                               corroborated_t2t_count, detect_fusions)
-from taco.purify import (screen_contaminants, contaminant_removal_set,
+from taco.purify import (DEPTH_RATIO_MAX, DEPTH_RATIO_MAX_FULL,
+                         screen_contaminants, contaminant_removal_set,
                          consensus_breakpoint, spanning_read_verdict,
                          chimera_decision, apply_split, SPANNING_ANCHOR_BP)
 
@@ -188,6 +190,29 @@ def _fasta_sort_minlen_with_map(infa, outfa, prefix="contig", minlen=0):
         name_map[new_name] = old_name
     _write_fasta(renamed, outfa)
     return len(renamed), name_map
+
+
+def _assembly_policy(runner):
+    """The run's :class:`AssemblyPolicy`, or a default primary-mode policy.
+
+    The fallback exists so helpers stay callable from tests and from older
+    resume paths that predate the runner attribute; it reproduces v1.4.1
+    behaviour, which is what primary mode is defined to do.
+    """
+    pol = getattr(runner, "policy", None)
+    if pol is None:
+        pol = policy.AssemblyPolicy(
+            mode=getattr(runner, "assembly_mode", policy.DEFAULT_MODE),
+            taxon=getattr(runner, "taxon", "other"),
+            user_no_purge_dups=getattr(runner, "no_purge_dups", False))
+    if pol.is_both:
+        # The pipeline driver sets a per-deliverable policy before running any
+        # step that reaches here, so this means a step was invoked outside it.
+        raise ValueError(
+            "a deliverable-producing step was reached with assembly mode "
+            "'both'. Steps 11-14 must run under a single representation; the "
+            "'both' driver in taco.pipeline sets one per deliverable.")
+    return pol
 
 
 def _fasta_clean_contained(infa, outfa, pct_cov=30, exhaustive=True, runner=None,
@@ -2387,11 +2412,21 @@ def step_10_telomere_pool(runner):
         with open("t2t_clean.fasta", "w") as f:
             pass
 
+    # Containment filtering deletes a contig for being mostly covered by a
+    # longer one, which is indistinguishable from a retained alternate copy of
+    # the same locus.  Full mode therefore keeps the pool intact.
+    _collapse_ok = _assembly_policy(runner).collapse_redundancy_enabled
     for src, dst in [("single_tel_best.fasta", "single_tel_best_clean.fasta"),
                      ("telomere_supported_best.fasta", "telomere_supported_best_clean.fasta")]:
         if os.path.isfile(src) and os.path.getsize(src) > 0:
-            runner.log(f"Cleaning contained contigs from {src}")
-            _fasta_clean_contained(src, dst, pct_cov=30, exhaustive=True, runner=runner)
+            if _collapse_ok:
+                runner.log(f"Cleaning contained contigs from {src}")
+                _fasta_clean_contained(src, dst, pct_cov=30, exhaustive=True, runner=runner)
+            else:
+                runner.log_info(
+                    f"Containment filtering skipped for {src} "
+                    f"(--assembly-mode full retains alternate sequence)")
+                shutil.copy(src, dst)
         else:
             with open(dst, "w") as f:
                 pass
@@ -3445,24 +3480,14 @@ def _auto_select_backbone(runner):
     best_score = None
     records = []
 
-    # Taxon-aware scoring weights (defined outside loop so they're accessible
-    # for the decision file regardless of which assemblers were scored).
+    # Scoring is delegated to taco.policy so that the primary and full
+    # representation objectives cannot drift apart between here, backbone.py,
+    # and the reports.  The taxon-aware weights that used to be inlined here
+    # now live in policy.TAXON_OVERRIDES and are applied on top of the profile.
     taxon = getattr(runner, 'taxon', 'other')
-    w_busco_s = 1000
-    w_t2t = 300
-    w_single = 150
-    w_contigs = 30
-    w_n50 = 150
-    w_busco_d = 500
-
-    if taxon == "fungal":
-        w_busco_d = 600; w_t2t = 350; w_n50 = 150; w_contigs = 30
-    elif taxon == "plant":
-        w_busco_d = 300; w_t2t = 200; w_n50 = 150; w_contigs = 50
-    elif taxon in ("vertebrate", "animal"):
-        w_busco_d = 500; w_t2t = 200; w_n50 = 200; w_contigs = 40
-    elif taxon == "insect":
-        w_busco_d = 500; w_t2t = 300; w_n50 = 150; w_contigs = 30
+    asm_mode = getattr(runner, 'assembly_mode', policy.DEFAULT_MODE)
+    weights = policy.resolve_weights(asm_mode, taxon)
+    expected_size = _parse_genome_size(runner.genomesize)
 
     for idx, asm in enumerate(header[1:], start=1):
         asm = asm.strip()
@@ -3478,6 +3503,9 @@ def _auto_select_backbone(runner):
 
         busco_s = get_val("busco s (%)", idx)
         busco_d = get_val("busco d (%)", idx)
+        # BUSCO C (S + D) is what full mode rewards: under a full sequence
+        # representation a locus present twice is still a locus present.
+        busco_c = get_val("busco c (%)", idx)
         contigs = get_val("# contigs", idx)
         n50 = get_val("n50", idx)
         t2t = get_val("telomere strict t2t contigs", idx)
@@ -3492,6 +3520,9 @@ def _auto_select_backbone(runner):
         merqury_qv = get_val("merqury qv", idx)
         merqury_comp = get_val("merqury completeness (%)", idx)
 
+        total_len = get_val("total length", idx)
+        contributions = {}
+
         if mode == "n50":
             if n50 <= 0:
                 continue
@@ -3499,35 +3530,24 @@ def _auto_select_backbone(runner):
         else:
             if contigs <= 0 or n50 <= 0:
                 continue
-
-            # Size deviation penalty: assemblies far from expected size are suspect
-            size_penalty = 0.0
-            expected_size = _parse_genome_size(runner.genomesize)
-            total_len = get_val("total length", idx)
-            if expected_size > 0 and total_len > 0:
-                deviation = abs(total_len - expected_size) / expected_size
-                size_penalty = deviation * 500
-
-            score = (
-                busco_s * w_busco_s
-                + t2t * w_t2t
-                + single * w_single
-                + merqury_comp * 200
-                + merqury_qv * 20
-                - contigs * w_contigs
-                + math.log10(n50) * w_n50
-                - busco_d * w_busco_d
-                - size_penalty
-            )
+            score, contributions = policy.score_assembly(
+                {"busco_s": busco_s, "busco_d": busco_d, "busco_c": busco_c,
+                 "t2t": t2t, "single_tel": single, "merqury_qv": merqury_qv,
+                 "merqury_comp": merqury_comp, "contigs": contigs,
+                 "n50": n50, "total_len": total_len},
+                mode=asm_mode, taxon=taxon, expected_haploid=expected_size)
 
         records.append({
             "assembler": asm, "busco_s": busco_s, "busco_d": busco_d,
-            "t2t": t2t, "t2t_raw": t2t_raw, "single_tel": single, "merqury_qv": merqury_qv,
+            "busco_c": busco_c, "t2t": t2t, "t2t_raw": t2t_raw,
+            "single_tel": single, "merqury_qv": merqury_qv,
             "merqury_comp": merqury_comp, "contigs": contigs,
-            "n50": n50, "score": score,
+            "n50": n50, "total_len": total_len, "score": score,
+            "contributions": contributions,
         })
 
-        runner.log(f"  {asm}: BUSCO_S={busco_s} BUSCO_D={busco_d} T2T={t2t} single={single} "
+        runner.log(f"  {asm}: BUSCO_C={busco_c} BUSCO_S={busco_s} BUSCO_D={busco_d} "
+                   f"T2T={t2t} single={single} "
                    f"MerquryQV={merqury_qv} MerquryComp={merqury_comp} "
                    f"contigs={contigs} N50={n50} score={score:.1f}")
 
@@ -3535,28 +3555,68 @@ def _auto_select_backbone(runner):
             best_name = asm
             best_score = score
 
-    # Write debug TSV
+    # Write debug TSV.  The per-component columns make the decision auditable:
+    # a reader can see WHY an assembly won, not only that it did.
+    contrib_cols = ["busco", "duplication_penalty", "t2t", "single_telomere",
+                    "merqury_completeness", "merqury_qv", "contig_count_penalty",
+                    "contig_density_penalty", "contiguity", "size_penalty"]
     with open(debug_tsv, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["assembler", "busco_s", "busco_d", "t2t", "single_tel",
-                     "merqury_qv", "merqury_comp", "contigs", "n50", "score"])
+        w.writerow(["assembler", "busco_c", "busco_s", "busco_d", "t2t", "single_tel",
+                    "merqury_qv", "merqury_comp", "contigs", "n50", "total_len",
+                    "score"] + [f"score_{c}" for c in contrib_cols])
         for r in records:
-            w.writerow([r["assembler"], r["busco_s"], r["busco_d"], r["t2t"], r["single_tel"],
-                        r["merqury_qv"], r["merqury_comp"], r["contigs"], r["n50"], r["score"]])
+            c = r.get("contributions") or {}
+            w.writerow([r["assembler"], r["busco_c"], r["busco_s"], r["busco_d"],
+                        r["t2t"], r["single_tel"], r["merqury_qv"], r["merqury_comp"],
+                        r["contigs"], r["n50"], r["total_len"], r["score"]]
+                       + [round(c[k], 2) if k in c else "" for k in contrib_cols])
 
     # Write decision file
     with open(decision_txt, "w") as f:
         f.write(f"auto_mode\t{mode}\n")
+        f.write(f"assembly_mode\t{asm_mode}\n")
+        f.write(f"assembly_mode_description\t"
+                f"{policy.SCORING_PROFILES.get(asm_mode, {}).get('description', '')}\n")
         f.write(f"selected_assembler\t{best_name or ''}\n")
         f.write(f"selected_score\t{best_score if best_score is not None else ''}\n")
         # Note: MerquryComp and MerquryQV contribute 0 when Merqury is not enabled
         has_merqury = any(r["merqury_qv"] > 0 or r["merqury_comp"] > 0 for r in records)
-        if has_merqury:
-            f.write(f"score_formula\tBUSCO_S*{w_busco_s} + T2T*{w_t2t} + single*{w_single} + MerquryComp*200 + MerquryQV*20 - contigs*{w_contigs} + log10(N50)*{w_n50} - BUSCO_D*{w_busco_d} (taxon={taxon})\n")
-        else:
-            f.write(f"score_formula\tBUSCO_S*{w_busco_s} + T2T*{w_t2t} + single*{w_single} - contigs*{w_contigs} + log10(N50)*{w_n50} - BUSCO_D*{w_busco_d} (taxon={taxon}, Merqury not available)\n")
+        f.write(f"score_formula\t{_describe_score_formula(weights, taxon, has_merqury)}\n")
 
     return best_name
+
+
+def _describe_score_formula(w, taxon, has_merqury=True):
+    """Human-readable form of the active scoring profile.
+
+    Written into selection_decision.txt and the final report so a run states the
+    formula it actually used rather than a formula someone has to trust.
+    """
+    busco_label = "BUSCO_C" if w["busco_term"] == policy.BUSCO_TERM_COMPLETE else "BUSCO_S"
+    terms = [f"{busco_label}*{w['w_busco']}", f"T2T*{w['w_t2t']}",
+             f"single*{w['w_single_tel']}"]
+    if has_merqury:
+        terms += [f"MerquryComp*{w['w_merqury_comp']}",
+                  f"MerquryQV*{w['w_merqury_qv']}"]
+    if w.get("w_contigs"):
+        terms.append(f"- contigs*{w['w_contigs']}")
+    if w.get("w_contig_density"):
+        terms.append(f"- (contigs/Mb)*{w['w_contig_density']}*haploid_Mb")
+    terms.append(f"log10(N50)*{w['w_n50']}")
+    if w.get("w_busco_d"):
+        terms.append(f"- BUSCO_D*{w['w_busco_d']}")
+    if w.get("w_size_penalty"):
+        terms.append(f"- size_deviation*{w['w_size_penalty']}")
+    joined = " + ".join(terms).replace("+ -", "-")
+    notes = [f"taxon={taxon}"]
+    if not has_merqury:
+        notes.append("Merqury not available")
+    if not w.get("w_busco_d"):
+        notes.append("duplication neutral")
+    if not w.get("w_size_penalty"):
+        notes.append("size reported but not scored")
+    return f"{joined} ({', '.join(notes)})"
 
 
 def _clean_backbone_headers(asm_fa, out_fa):
@@ -5792,7 +5852,11 @@ def step_12_refine(runner):
     shutil.copy(backbone_fa, "assemblies/backbone.working.fa")
     working_backbone_fa = "assemblies/backbone.working.fa"
 
-    if os.environ.get("SELFDEDUP_ENABLE", "0") == "1":
+    if (os.environ.get("SELFDEDUP_ENABLE", "0") == "1"
+            and not _assembly_policy(runner).collapse_redundancy_enabled):
+        runner.log_info("Tier 2 self-dedup skipped (--assembly-mode full "
+                        "retains alternate sequence) despite SELFDEDUP_ENABLE=1")
+    elif os.environ.get("SELFDEDUP_ENABLE", "0") == "1":
         if taxon == "fungal":
             default_sd_cov, default_sd_id = "0.95", "0.95"
         elif taxon in ("plant", "vertebrate", "animal"):
@@ -6088,6 +6152,7 @@ def step_12_refine(runner):
     accepted_count = 0
     trial_results = []
     current_backbone = dict(backbone_seqs)
+    used_donors = set()   # a donor sequence may be inserted at most once
 
     if not candidates:
         runner.log_info("No upgrade/rescue candidates; backbone preserved as-is")
@@ -6105,6 +6170,11 @@ def step_12_refine(runner):
         if backbone_name not in current_backbone:
             continue
         if donor_name not in donor_seqs:
+            continue
+        if donor_name in used_donors:
+            # Already inserted against an earlier backbone target.  Without
+            # this guard the same donor is inserted once per accepting
+            # target while each of those targets is deleted.
             continue
 
         # Guard against a donor whose name collides with a DIFFERENT backbone
@@ -6202,6 +6272,7 @@ def step_12_refine(runner):
 
         if accepted:
             accepted_count += 1
+            used_donors.add(donor_name)
             del current_backbone[backbone_name]
             current_backbone[insert_name] = donor_seqs[donor_name]
             if insert_name != donor_name:
@@ -6546,7 +6617,11 @@ def step_12_refine(runner):
     # Only check if novel additions are redundant to existing backbone contigs.
     # Protect ALL backbone contigs (including non-telomeric Tier 2) to avoid
     # BUSCO completeness loss.  purge_dups at 12H handles true haplotig removal.
-    if novel_additions > 0 and shutil.which("minimap2"):
+    if (novel_additions > 0 and shutil.which("minimap2")
+            and not _assembly_policy(runner).collapse_redundancy_enabled):
+        runner.log_info("Post-upgrade dedup skipped (--assembly-mode full "
+                        "retains alternate sequence)")
+    elif novel_additions > 0 and shutil.which("minimap2"):
         # Protect everything that was in the backbone (all original names)
         all_backbone_names = set(backbone_seqs.keys())
         # Also protect upgrade donors that replaced backbone contigs
@@ -6573,13 +6648,19 @@ def step_12_refine(runner):
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
 
     # ---- 12H. purge_dups default cleanup ----
-    if not getattr(runner, 'no_purge_dups', False):
+    # purge_dups removes haplotigs by design, so full mode declines it.
+    # --no-purge-dups can only ever disable the step, never re-enable it.
+    _pol = _assembly_policy(runner)
+    if _pol.purge_dups_enabled:
         purged_fa = "assemblies/final_merge.purged.fasta"
         _run_purge_dups(runner, raw_out, purged_fa)
         if os.path.isfile(purged_fa) and os.path.getsize(purged_fa) > 0:
             shutil.copy(purged_fa, raw_out)
-    else:
+    elif _pol.user_no_purge_dups:
         runner.log_info("purge_dups skipped (--no-purge-dups)")
+    else:
+        runner.log_info("purge_dups skipped (--assembly-mode full retains "
+                        "alternate sequence; purge_dups removes haplotigs)")
 
     # ---- 12I. Platform-aware polishing ----
     if not getattr(runner, 'no_polish', False):
@@ -7359,6 +7440,97 @@ def _final_quast_qc(runner):
     runner.log("Wrote assemblies/merged.quast.csv")
 
 
+#: Metric names in the merged report, mapped to the summary field names the
+#: v1.5.0 report contract specifies.
+_SUMMARY_FIELDS = [
+    ("BUSCO_C", "BUSCO C (%)"),
+    ("BUSCO_S", "BUSCO S (%)"),
+    ("BUSCO_D", "BUSCO D (%)"),
+    ("Merqury_QV", "Merqury QV"),
+    ("Merqury_completeness", "Merqury completeness (%)"),
+    ("assembly_length", "Total length"),
+    ("contigs", "# contigs"),
+    ("N50", "N50"),
+    ("T2T", "Telomere strict T2T contigs"),
+    ("single_end_telomere", "Telomere single-end strong contigs"),
+]
+
+
+def _write_assembly_mode_summary(runner, final_map):
+    """Write final_results/assembly_mode_summary.txt and log any advisory.
+
+    Everything here is read back out of the report tables, so the summary cannot
+    describe an assembly other than the one that was measured.
+    """
+    mode = getattr(runner, "assembly_mode", policy.DEFAULT_MODE)
+    prof = policy.SCORING_PROFILES.get(
+        mode, {"description": "one deliverable per representation"})
+    out = os.path.join("final_results", "assembly_mode_summary.txt")
+
+    def g(metric):
+        v = final_map.get(metric, "")
+        return "" if v is None else str(v).strip()
+
+    def gf(metric):
+        try:
+            return float(g(metric))
+        except ValueError:
+            return None
+
+    lines = [
+        f"Assembly representation mode: {mode}",
+        f"  {prof['description']}",
+        "",
+        "TACO retains or collapses alternate sequence according to this mode.",
+        "It does not phase, order, or assign sequence to haplotypes.",
+        "",
+        "== Selection ==",
+        f"assembly_mode\t{mode}",
+        f"selected_assembler\t{g('Selected assembler')}",
+        f"selection_score\t{g('Selection score')}",
+        f"score_profile\t{g('Score formula')}",
+        "",
+        "== Final assembly ==",
+    ]
+    for field, metric in _SUMMARY_FIELDS:
+        lines.append(f"{field}\t{g(metric)}")
+
+    # Per-component score contributions for the selected assembler, lifted from
+    # the debug TSV so the report can state why it won, not only that it did.
+    debug_tsv = "assemblies/selection_debug.tsv"
+    selected = g("Selected assembler")
+    if selected and os.path.isfile(debug_tsv):
+        try:
+            with open(debug_tsv, newline="") as f:
+                for row in csv.DictReader(f, delimiter="\t"):
+                    if row.get("assembler") != selected:
+                        continue
+                    contribs = {k[len("score_"):]: v for k, v in row.items()
+                                if k and k.startswith("score_") and v not in (None, "")}
+                    if contribs:
+                        lines += ["", "== Score contributions (selected assembler) =="]
+                        lines += [f"{k}\t{v}" for k, v in contribs.items()]
+                    break
+        except Exception as e:
+            runner.log_warn(f"Could not read score contributions: {e}")
+
+    advisory = policy.haplotype_retention_advisory(
+        {"busco_d": gf("BUSCO D (%)"),
+         "merqury_comp": gf("Merqury completeness (%)"),
+         "total_len": gf("Total length")},
+        _parse_genome_size(runner.genomesize), mode=mode)
+    if advisory:
+        lines += ["", "== WARNING =="] + advisory.splitlines()
+        runner.log_warn("Possible retained alternate sequence:")
+        for ln in advisory.splitlines():
+            runner.log_warn(f"  {ln}")
+
+    os.makedirs("final_results", exist_ok=True)
+    with open(out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    runner.log(f"Wrote {out}")
+
+
 def _final_comparison_report(runner):
     """Generate final comparison report.
 
@@ -7435,6 +7607,14 @@ def _final_comparison_report(runner):
         final_map["Telomere single-end strong contigs"] = str(_single)
         final_map["Telomere-supported contigs"] = str(_t2t + _single + _supported)
 
+    # Assembly representation mode.  Reported unconditionally, so every run
+    # states which objective produced the numbers above it.
+    _mode = getattr(runner, "assembly_mode", policy.DEFAULT_MODE)
+    final_map["Assembly representation mode"] = _mode
+    final_map["Assembly representation description"] = \
+        policy.SCORING_PROFILES.get(
+            _mode, {"description": "one deliverable per representation"})["description"]
+
     # Add selection metadata
     decision_file = "assemblies/selection_decision.txt"
     if os.path.isfile(decision_file):
@@ -7453,6 +7633,12 @@ def _final_comparison_report(runner):
                     final_map["Auto-selection mode"] = v
                 elif k == "score_formula":
                     final_map["Score formula"] = v
+                elif k == "assembly_mode":
+                    # The mode the selection actually ran under.  It should
+                    # match the runner, and disagreement means the run was
+                    # resumed with a different flag — worth surfacing.
+                    if v and v != _mode:
+                        final_map["Assembly representation mode at selection"] = v
 
     # Protected mode
     if os.path.isfile("protected_telomere_mode.txt"):
@@ -7525,6 +7711,8 @@ def _final_comparison_report(runner):
                 w.writerow([m, v])
 
     runner.log("Wrote final_results/final_result.csv")
+
+    _write_assembly_mode_summary(runner, final_map)
 
     # Also copy assembly_info for easy access
     if os.path.isfile("assemblies/assembly_info.csv"):
@@ -7867,6 +8055,105 @@ def _read_telomere_status(tsv_path, weak_thr=0.08, strong_thr=0.25):
     except OSError:
         return {}
     return out
+
+
+#: Fraction of chromosome-scale compare contigs sharing a best target above
+#: which the two assemblies are reported as different REPRESENTATIONS rather
+#: than as one splitting the other.
+REPRESENTATION_SHARED_FRAC = 0.50
+#: Only compare contigs at least this long inform that judgement; short contigs
+#: share best targets for ordinary repeat reasons.
+REPRESENTATION_MIN_LEN = 1_000_000
+
+
+def _write_representation_note(runner, out_dir, contig_rows):
+    """Explain shared best targets as haplotype collapse, not as mis-joins.
+
+    When a collapsed assembly is compared against a reference that retains both
+    haplotypes, each reference haplotype pair maps onto the SAME single contig.
+    ``contig_to_contig.tsv`` then labels those rows ``1-to-N (split)``, which
+    reads as though TACO broke a chromosome when in fact the two assemblies are
+    different representations of it.  On the real Puccinia triticina Pt76
+    reference (253.5 Mb, 36 chromosomes = 2 x 18) 97% of chromosome-scale
+    reference contigs shared a best target with another.
+
+    This writes the observation and its interpretation next to the table.  It is
+    a note about representation, not a defect claim about either assembly.
+    """
+    if not contig_rows:
+        return
+    from collections import Counter
+    best = Counter(r["best_target"] for r in contig_rows if r.get("best_target"))
+    shared_targets = {t: n for t, n in best.items() if n > 1}
+
+    def _len(r):
+        try:
+            return int(r["compare_len"])
+        except (KeyError, ValueError, TypeError):
+            return 0
+
+    big = [r for r in contig_rows if _len(r) >= REPRESENTATION_MIN_LEN]
+    big_shared = [r for r in big
+                  if best.get(r.get("best_target"), 0) > 1]
+    frac = (len(big_shared) / len(big)) if big else 0.0
+    n_split = sum(1 for r in contig_rows if "split" in str(r.get("relationship", "")))
+
+    mode = getattr(runner, "assembly_mode", policy.DEFAULT_MODE)
+    lines = [
+        "Representation note for the compare-vs-final report",
+        "===================================================",
+        "",
+        f"TACO assembly representation mode : {mode}",
+        f"Compare contigs                   : {len(contig_rows)}",
+        f"  of which >= {REPRESENTATION_MIN_LEN/1e6:.0f} Mb              : {len(big)}",
+        f"Final contigs that are the best target for >1 compare contig : "
+        f"{len(shared_targets)}",
+        f"Compare contigs >= {REPRESENTATION_MIN_LEN/1e6:.0f} Mb sharing a best target : "
+        f"{len(big_shared)} ({100*frac:.0f}%)",
+        f"Rows labelled '1-to-N (split)'     : {n_split}",
+        "",
+    ]
+    if frac >= REPRESENTATION_SHARED_FRAC:
+        lines += [
+            "INTERPRETATION",
+            "--------------",
+            f"{100*frac:.0f}% of the chromosome-scale compare contigs map best to a final",
+            "contig that another compare contig also maps to. That is the signature of",
+            "two different REPRESENTATIONS of the same genome, not of a mis-assembly:",
+            "where the compare assembly keeps both copies of a chromosome and this",
+            "assembly keeps one, both compare copies necessarily map to that one copy.",
+            "",
+            "Consequences for reading the other tables:",
+            "  * '1-to-N (split)' in contig_to_contig.tsv does NOT by itself mean this",
+            "    assembly broke a compare chromosome. Confirm against",
+            "    chimera_decisions.tsv and the cross-assembler verdict before",
+            "    treating any such row as a mis-join.",
+            "  * weak_regions_compare.tsv and unique_compare_contigs.tsv will list",
+            "    sequence that is absent from this assembly BY DESIGN when the two",
+            "    assemblies differ in representation.",
+            "  * aligned_bases greater than target_len is expected here, not an error.",
+            "",
+            "To compare like with like, use a compare assembly of the same",
+            "representation as this run, or re-run with --assembly-mode full to",
+            "retain alternate sequence.",
+        ]
+    else:
+        lines += [
+            "INTERPRETATION",
+            "--------------",
+            "Shared best targets are not widespread, so the two assemblies appear to",
+            "be comparable representations and the relationship labels can be read",
+            "at face value.",
+        ]
+    path = os.path.join(out_dir, "REPRESENTATION_NOTES.txt")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    runner.log(f"Wrote {path}")
+    if frac >= REPRESENTATION_SHARED_FRAC:
+        runner.log_warn(
+            f"Compare assembly appears to be a different representation: "
+            f"{100*frac:.0f}% of its chromosome-scale contigs share a best target. "
+            f"See {os.path.basename(path)} before reading 'split' labels as mis-joins.")
 
 
 def _compare_vs_final_report(runner):
@@ -8339,6 +8626,7 @@ def _compare_vs_final_report(runner):
                         r["compare_telo_tier"],
                         r["best_target_left_telo"], r["best_target_right_telo"]])
     runner.log(f"Wrote {c2c_path} ({len(contig_rows)} compare contigs)")
+    _write_representation_note(runner, out_dir, contig_rows)
 
     # Per-pair table — exposes EVERY significant compare→final mapping,
     # including splits.  This is the file to inspect when one row in
@@ -9336,7 +9624,19 @@ def _purify_assembly(runner):
     runner.log("Purify 13A - foreign-sequence screen")
     tiers = _purify_telomere_tiers(runner, fa)
     recs = _purify_contig_records(runner, fa, tiers)
-    rows, baseline = screen_contaminants(recs, metagenome=metagenome)
+    # A haplotype-retaining assembly has a bimodal depth distribution, so the
+    # shallow-contig threshold is tightened to keep real alternate sequence well
+    # clear of it.  Screening itself is never skipped: foreign sequence is an
+    # error under either representation.
+    _pol = _assembly_policy(runner)
+    _depth_max = (DEPTH_RATIO_MAX_FULL if _pol.is_full else DEPTH_RATIO_MAX)
+    if _pol.is_full:
+        runner.log_info(
+            f"Contaminant screen: depth threshold tightened to {_depth_max} "
+            f"(from {DEPTH_RATIO_MAX}) because --assembly-mode full retains "
+            f"alternate sequence, which halves depth where both copies are kept")
+    rows, baseline = screen_contaminants(recs, metagenome=metagenome,
+                                        depth_ratio_max=_depth_max)
 
     dbase, gbase = baseline["depth"], baseline["gc"]
     runner.log_info(
@@ -9397,7 +9697,13 @@ def _purify_assembly(runner):
         for contig, info in sorted(conc.items()):
             if contig in drop:
                 continue
-            bp_info = consensus_breakpoint(info["intervals"])
+            # Only the assemblies that actually voted "split" have an
+            # opinion about where the junction is.  Feeding "intact" and
+            # "uninformative" voters into the estimate lets assemblies
+            # that see no junction at all decide where the cut goes.
+            bp_info = consensus_breakpoint(
+                {v: iv for v, iv in info["intervals"].items()
+                 if info["votes"].get(v) == "split"})
             bp = bp_info.get("breakpoint")
             spanning = None
             # Only a flagged contig needs the read test: a corroborated contig is
@@ -9462,6 +9768,10 @@ def _purify_assembly(runner):
 
     kept.sort(key=lambda p: -len(p[1]))
     _write_fasta(kept, PURIFIED_FASTA)
+    # Always rewrite the removal record, empty if nothing was removed:
+    # a stale file from a previous run would otherwise claim contigs
+    # were excluded from an assembly that still contains them.
+    _write_fasta(removed, EXCLUDED_FASTA)
     if removed:
         _write_fasta(removed, EXCLUDED_FASTA)
 

@@ -231,9 +231,17 @@ def test_collapsed_repeat_at_high_depth_is_not_removed():
 
 
 def test_depth_alone_yields_suspect_not_foreign():
-    """A haplotig at half depth with normal composition must not be removed."""
+    """A haplotig at low depth with normal composition must not be removed.
+
+    The fixture carries zero_bp/low_bp because steps.py supplies them from the
+    same coverage row that supplies median_cov — a fixture without them tests a
+    shape the pipeline never produces.  Coverage non-uniformity is the left tail
+    of the same depth distribution whose median is the primary signal, so it may
+    not corroborate that primary: doing so removes a contig on one axis.
+    """
     hap = {"contig": "haplotig", "length": 900000, "median_cov": 30,
-           "gc": 47.7, "telomere_tier": "none"}
+           "gc": 47.7, "telomere_tier": "none",
+           "zero_bp": 0, "low_bp": 110000}
     rows, _ = screen_contaminants(_real_contigs() + [hap])
     assert _tier_of(rows, "haplotig") == "suspect", \
         [r for r in rows if r["contig"] == "haplotig"]
@@ -516,6 +524,79 @@ def test_apply_split_names_keep_the_parent_visible():
     parts = apply_split("contig_3", "ACGTACGT", 4)
     assert [n for n, _ in parts] == ["contig_3_a", "contig_3_b"], parts
 
+
+
+# ── v1.4.1 audit regressions ────────────────────────────────────────────────
+
+def test_low_coverage_fraction_cannot_corroborate_a_depth_primary():
+    """Depth median and depth uniformity are one evidence axis, not two.
+
+    Both are depressed together whenever reads simply fail to map to a contig
+    (divergent haplotype, repeat-rich arm, poor local representation), so
+    treating the second as corroboration deletes real sequence on one signal.
+    """
+    hap = {"contig": "haplotig", "length": 900000, "median_cov": 60,
+           "gc": 47.7, "telomere_tier": "none",
+           "zero_bp": 0, "low_bp": 110000}          # 12% under the low-cov cut
+    rows, _ = screen_contaminants(_real_contigs() + [hap])
+    row = next(r for r in rows if r["contig"] == "haplotig")
+    assert row["tier"] == "suspect", row
+    assert "haplotig" not in contaminant_removal_set(rows)
+
+
+def test_gc_plus_low_coverage_fraction_is_still_two_axes():
+    """Composition and coverage uniformity ARE independent — keep that working."""
+    foreign = {"contig": "foreign_big", "length": 3000000, "median_cov": 313,
+               "gc": 66.0, "telomere_tier": "none",
+               "zero_bp": 0, "low_bp": 900000}
+    rows, _ = screen_contaminants(_real_contigs() + [foreign])
+    assert _tier_of(rows, "foreign_big") == "foreign"
+
+
+def test_real_contaminants_still_removed_after_the_corroboration_fix():
+    """contig_7 and contig_11 carry depth AND GC primaries, so both survive it."""
+    rows, _ = screen_contaminants(_real_contigs())
+    drop = contaminant_removal_set(rows)
+    assert "contig_7" in drop and "contig_11" in drop
+
+
+def test_sigma_is_length_weighted_like_the_centre():
+    """Many small contigs must not inflate the depth sigma out of usefulness.
+
+    A count-weighted MAD around a length-weighted centre lets a numerous
+    small-contig population raise sigma until no contig can reach |z| > 3.5,
+    silently disabling the depth signal for the whole assembly.
+    """
+    core = [(313.0, 6000000), (310.0, 5000000), (315.0, 4000000)]
+    noise = [(120.0, 12000)] * 60          # numerous, but a trivial share of length
+    base = robust_baseline(core + noise)
+    assert abs(base["center"] - 313.0) < 6.0
+    # the depth of a genuine contaminant must still be reachable
+    assert base["sigma"] < base["center"] / 3.5, base
+
+
+def test_breakpoint_uses_only_the_voters_that_saw_a_split():
+    """An 'intact' voter has no opinion on where a junction is.
+
+    Mixing non-split voters into the estimate drags the consensus toward the
+    middle of the contig, cutting at a coordinate no voter proposed.
+    """
+    splitters = {
+        "canu":  {"canu_6": [(0, 1580000)], "canu_11": [(1600000, 6500000)]},
+        "flye":  {"flye_6": [(0, 1585000)], "flye_10": [(1602000, 6500000)]},
+        "lja":   {"lja_6":  [(0, 1590000)], "lja_11":  [(1605000, 6500000)]},
+    }
+    only_split = consensus_breakpoint(splitters)
+    assert only_split["breakpoint"] is not None
+    assert 1560000 <= only_split["breakpoint"] <= 1620000, only_split
+
+    # an intact voter covering the whole contig contributes no interior gap and
+    # must not move the estimate
+    with_intact = dict(splitters)
+    with_intact["raven"] = {"raven_2": [(0, 6500000)]}
+    assert consensus_breakpoint(
+        {k: v for k, v in with_intact.items() if k != "raven"}
+    )["breakpoint"] == only_split["breakpoint"]
 
 if __name__ == "__main__":
     fails = 0

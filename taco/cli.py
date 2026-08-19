@@ -59,7 +59,7 @@ TAXON_BUSCO_LINEAGE = {
 
 def parse_args():
     """Parse command-line arguments for TACO."""
-    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.4.1 - Telomere-Aware Contig Optimization')
+    parser = argparse.ArgumentParser(prog='TACO', description='TACO v1.5.0 - Telomere-Aware Contig Optimization')
     parser.add_argument('-g', '--genomesize', type=str, required=True, help='Estimated genome size')
     parser.add_argument('-t', '--threads', type=int, required=True, help='Number of threads')
     parser.add_argument('--fastq', type=str, required=True, help='Path to input FASTQ')
@@ -68,6 +68,29 @@ def parse_args():
     parser.add_argument('--taxon', choices=['vertebrate', 'animal', 'plant', 'insect', 'fungal', 'other'],
                         default='other', help='Taxonomy preset for telomere motif priors (default: other)')
     parser.add_argument('--platform', choices=['pacbio-hifi', 'nanopore', 'pacbio'], default='pacbio-hifi')
+    parser.add_argument('--assembly-mode', dest='assembly_mode',
+                        choices=['both', 'primary', 'full'], default='both',
+                        help='Which genome representation(s) to deliver. '
+                             '"both" (default) emits BOTH from one set of '
+                             'assemblies: a nonredundant primary genome in '
+                             'mode_primary/ and a full sequence representation '
+                             'that retains divergent alternate/haplotype '
+                             'sequence in mode_full/, plus a side-by-side '
+                             'report. The two objectives disagree about what a '
+                             'good assembly is, and the reads cannot say which '
+                             'one your project needs, so TACO produces both '
+                             'rather than choosing for you. Steps 0-10 run once '
+                             'and are shared; only steps 11-14 run twice. '
+                             '"primary" or "full" emit just that one. In '
+                             'primary the score rewards BUSCO complete and '
+                             'contiguity and penalises duplication lightly '
+                             '(purge_dups removes it later anyway); in full it '
+                             'rewards k-mer completeness dominantly, treats '
+                             'duplication as neutral, and skips every '
+                             'redundancy-collapsing step. Contaminant screening '
+                             'and chimera resolution run in ALL modes. "full" '
+                             'retains alternate sequence; it does not phase, '
+                             'order, or assign it to haplotypes.')
     parser.add_argument('--reference', '-ref', type=str,
                         help='Reference FASTA. Included as the "reference" row in '
                              'comparison tables (BUSCO/Telomere/QUAST/Merqury). '
@@ -122,7 +145,14 @@ def parse_args():
                         help='K-mer size for Merqury database (default: auto; '
                              'uses Merqury best_k.sh or a genome-size fallback)')
     parser.add_argument('--no-merqury', action='store_true')
-    parser.add_argument('--no-purge-dups', action='store_true', help='Skip purge_dups after refinement')
+    parser.add_argument('--no-purge-dups', action='store_true',
+                        help='Skip purge_dups after refinement. Precedence: this flag '
+                             'can only ever DISABLE purge_dups, never enable it. '
+                             'The full deliverable already skips purge_dups, so this '
+                             'flag is redundant there but harmless; omitting it does '
+                             'not re-enable purge_dups for the full deliverable. '
+                             'Under --assembly-mode both it disables purge_dups for '
+                             'the primary deliverable too.')
     parser.add_argument('--no-polish', action='store_true', help='Skip automatic polishing after refinement')
     parser.add_argument('--no-coverage-qc', action='store_true', help='Skip final coverage QC')
     parser.add_argument('--concordance-mode', dest='concordance_mode',
@@ -172,7 +202,7 @@ def parse_args():
                         help='Allow rescue donors to replace immutable Tier 1 (protected T2T) contigs. '
                              'Disabled by default for safety. Use only if you have strong reason to '
                              'believe a donor is a better T2T contig than the existing one.')
-    parser.add_argument('--version', action='version', version='TACO v1.4.1')
+    parser.add_argument('--version', action='version', version='TACO v1.5.0')
     
     args = parser.parse_args()
 
@@ -226,7 +256,7 @@ def parse_args():
     for s in args.steps:
         if s < 0 or s > 14:
             parser.error(
-                f"Invalid step: {s}. TACO v1.4.1 uses steps 0-14. "
+                f"Invalid step: {s}. TACO v1.5.0 uses steps 0-14. "
                 f"Full mode: 0-14. Assembly-only: 0-10, 14. "
                 f"Resume from refinement: -s 12-14.")
     return args

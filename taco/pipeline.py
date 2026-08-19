@@ -15,6 +15,8 @@ import platform as plat
 from datetime import datetime
 
 from taco.cli import STEP_NAMES
+from taco.policy import (AssemblyPolicy, DELIVERABLE_MODES,
+                         DEFAULT_MODE, MODE_BOTH, SCORING_PROFILES)
 
 
 class TeeWriter:
@@ -42,7 +44,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.4.1"
+    PIPELINE_NAME = "TACO-1.5.0"
 
     def __init__(self, args):
         # Core parameters
@@ -97,6 +99,15 @@ class PipelineRunner:
         self.purify_mode = ('off' if self.no_contam_screen
                             else getattr(args, 'purify_mode', 'on'))
         self.metagenome = getattr(args, 'metagenome', False)
+
+        # Assembly representation mode (v1.5.0).  Everything that scores an
+        # assembly or removes sequence for looking redundant consults this one
+        # object, so the two objectives cannot drift apart across call sites.
+        # Built after no_purge_dups because the policy honours it.
+        self.assembly_mode = getattr(args, 'assembly_mode', DEFAULT_MODE)
+        self.policy = AssemblyPolicy(mode=self.assembly_mode, taxon=self.taxon,
+                                     user_no_purge_dups=self.no_purge_dups)
+
         self.chimera_action = getattr(args, 'chimera_action', 'split')
         self.spanning_anchor = getattr(args, 'spanning_anchor', 1000)
         self.allow_t2t_replace = getattr(args, 'allow_t2t_replace', False)
@@ -589,7 +600,9 @@ class PipelineRunner:
                     add_optional("meryl", "Step 12 Merqury read database build")
             if not getattr(self, 'no_coverage_qc', False):
                 add_optional("samtools", "Step 12 final assembly coverage QC")
-            if not getattr(self, 'no_purge_dups', False):
+            # Under 'both' the primary deliverable runs purge_dups and the full
+            # one does not, so the tool is needed if ANY deliverable wants it.
+            if any(p.purge_dups_enabled for p in self.policy.sub_policies()):
                 for tool in ["purge_dups", "pbcstat", "calcuts", "split_fa", "get_seqs"]:
                     add_optional(tool, "Step 12 purge_dups cleanup")
             if not getattr(self, 'no_polish', False):
@@ -1268,6 +1281,7 @@ nextgraph_options = -a 1
             ("reference_sha256", ref_meta["sha256"] or "not_computed"),
             ("platform", self.platform),
             ("taxon", self.taxon),
+            ("assembly_mode", self.assembly_mode),
             ("busco_lineage", self.busco_lineage or ""),
             ("motif", self.motif or "auto"),
             ("telomere_mode", self.telomere_mode),
@@ -1325,6 +1339,7 @@ nextgraph_options = -a 1
             "parameters": {
                 "threads": self.threads,
                 "steps": list(self.steps),
+                "assembly_mode": self.assembly_mode,
                 "assembly_only": self.assembly_only,
                 "busco_lineage": self.busco_lineage,
                 "telomere_mode": self.telomere_mode,
@@ -1390,7 +1405,8 @@ nextgraph_options = -a 1
             (
                 f"TACO {self.PIPELINE_NAME.replace('TACO-', '')} was run on "
                 f"{self.platform} reads with genome size {self.genomesize}, "
-                f"{self.threads} threads, taxon preset '{self.taxon}', BUSCO lineage "
+                f"{self.threads} threads, taxon preset '{self.taxon}', assembly "
+                f"representation mode '{self.assembly_mode}', BUSCO lineage "
                 f"'{self.busco_lineage or 'not set'}', and telomere mode "
                 f"'{self.telomere_mode}'."
             ),
@@ -1595,6 +1611,7 @@ nextgraph_options = -a 1
         self.check_requirements()
         self.resolve_reference_fasta()
         self.resolve_compare_fasta()
+        self._absolutise_input_paths()
         self.write_versions()
         self.write_run_metadata()
         self.write_benchmark_tool_versions()
@@ -1604,8 +1621,302 @@ nextgraph_options = -a 1
 
         from taco.steps import STEP_FUNCTIONS
 
-        for step_num in self.steps:
-            func = STEP_FUNCTIONS.get(step_num)
+        if self.policy.is_both:
+            self._run_both_modes(STEP_FUNCTIONS)
+        else:
+            self._run_step_list(self.steps, STEP_FUNCTIONS)
+
+        self.run_end_ts = datetime.now()
+        self.write_benchmark_summary()
+        self.log(f"{self.PIPELINE_NAME} completed successfully")
+
+    # ── step execution ──────────────────────────────────────────────────────
+
+    #: Steps whose products describe the READS and the assemblers, so they are
+    #: identical whichever representation is being delivered and are computed
+    #: once under ``--assembly-mode both``.
+    SHARED_STEPS = frozenset(range(0, 11))
+    #: Steps that build a deliverable from a chosen backbone.  These depend on
+    #: the objective and are run once per representation.
+    PER_MODE_STEPS = frozenset(range(11, 15))
+
+    #: Shared step 0-10 products each per-mode workspace needs to see.  Large
+    #: FASTAs are symlinked; small tables are copied because the per-mode steps
+    #: rewrite some of them.
+    SHARED_LINK_GLOBS = ("assemblies/*.result.fasta",
+                         "assemblies/*.telo.fasta")
+    SHARED_COPY_GLOBS = ("assemblies/*.telo.list",
+                         "assemblies/*.telomere_end_scores.tsv",
+                         "assemblies/*.telo_metrics.tsv",
+                         "assemblies/assembly_info.csv",
+                         "assemblies/assembly.*.csv",
+                         "assemblies/t2t_concordance.tsv")
+    #: Directories of shared per-assembly results.  Their CONTENTS are linked
+    #: rather than the directory itself, because the per-mode steps add their
+    #: own entries (busco/final, merqury/final) alongside them.
+    SHARED_LINK_DIRS = ("busco", "merqury", "assemblies/concordance")
+
+    def _prepare_mode_workspace(self, mode):
+        """Create ``mode_<mode>/`` sharing every step 0-10 product.
+
+        The per-mode steps address their inputs and outputs by paths relative to
+        the working directory, so giving each representation its own working
+        directory keeps two deliverables from overwriting one another without
+        having to thread an output prefix through all of steps 11-14.
+        """
+        ws = os.path.abspath(f"mode_{mode}")
+        os.makedirs(os.path.join(ws, "assemblies"), exist_ok=True)
+
+        def _link(src_abs, dst):
+            if os.path.lexists(dst):
+                return
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            try:
+                os.symlink(src_abs, dst)
+            except OSError as e:
+                self.log_warn(f"could not link {src_abs} -> {dst}: {e}")
+
+        n_link = n_copy = 0
+        for pattern in self.SHARED_LINK_GLOBS:
+            for src in glob.glob(pattern):
+                _link(os.path.abspath(src), os.path.join(ws, src))
+                n_link += 1
+        for pattern in self.SHARED_COPY_GLOBS:
+            for src in glob.glob(pattern):
+                dst = os.path.join(ws, src)
+                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+                shutil.copy2(src, dst)
+                n_copy += 1
+        for d in self.SHARED_LINK_DIRS:
+            if not os.path.isdir(d):
+                continue
+            os.makedirs(os.path.join(ws, d), exist_ok=True)
+            for entry in os.listdir(d):
+                _link(os.path.abspath(os.path.join(d, entry)),
+                      os.path.join(ws, d, entry))
+                n_link += 1
+
+        self.log_info(f"mode_{mode}/: {n_link} shared products linked, "
+                      f"{n_copy} copied")
+        return ws
+
+    #: Runner attributes holding paths supplied from outside the working
+    #: directory.  ``--assembly-mode both`` runs the per-mode steps with the CWD
+    #: inside ``mode_<name>/``, so a relative value here would silently resolve
+    #: against the wrong directory.  Absolutising unconditionally also makes a
+    #: single-mode run independent of any later chdir.
+    EXTERNAL_PATH_ATTRS = ("reference_fasta", "compare_fasta", "final_fa_override",
+                           "busco_download_path", "merqury_db")
+
+    def _absolutise_input_paths(self):
+        for attr in self.EXTERNAL_PATH_ATTRS:
+            val = getattr(self, attr, None)
+            if val and not os.path.isabs(val):
+                setattr(self, attr, os.path.abspath(val))
+                self.log_info(f"{attr}: resolved to {getattr(self, attr)}")
+
+    def _run_both_modes(self, step_functions):
+        """Deliver a primary and a full genome from one set of assemblies.
+
+        Steps 0-10 describe the reads and the assemblers, so they run once in the
+        run root.  Steps 11-14 depend on the objective and run once per
+        representation inside ``mode_primary/`` and ``mode_full/``.
+        """
+        shared = [s for s in self.steps if s in self.SHARED_STEPS]
+        per_mode = [s for s in self.steps if s in self.PER_MODE_STEPS]
+
+        self.log(f"Assembly representation mode: {MODE_BOTH} — delivering "
+                 f"{' and '.join(DELIVERABLE_MODES)}")
+        if shared:
+            self.log_info(f"Shared steps (run once): "
+                          f"{','.join(str(s) for s in shared)}")
+        if per_mode:
+            self.log_info(f"Per-representation steps (run once per mode): "
+                          f"{','.join(str(s) for s in per_mode)}")
+
+        if shared:
+            self._run_step_list(shared, step_functions)
+
+        if not per_mode:
+            self.log_info("No per-representation steps requested; "
+                          "nothing further to deliver.")
+            return
+
+        root = os.getcwd()
+        root_logs, root_mode = self.logs_dir, self.assembly_mode
+        root_policy = self.policy
+        self._mark_root_results_in_flight(
+            [p.mode for p in root_policy.sub_policies()])
+        delivered = []
+        try:
+            for sub in root_policy.sub_policies():
+                mode = sub.mode
+                ws = self._prepare_mode_workspace(mode)
+                self.log(f"===== DELIVERABLE {mode}: "
+                         f"{SCORING_PROFILES[mode]['description']} =====")
+                os.chdir(ws)
+                # Point the runner at this representation for the duration.
+                self.assembly_mode, self.policy = mode, sub
+                self.logs_dir = os.path.join(ws, os.path.basename(root_logs))
+                os.makedirs(self.logs_dir, exist_ok=True)
+                try:
+                    self._run_step_list(per_mode, step_functions)
+                    delivered.append((mode, ws))
+                finally:
+                    os.chdir(root)
+                    self.assembly_mode, self.policy = root_mode, root_policy
+                    self.logs_dir = root_logs
+        finally:
+            os.chdir(root)
+            self.assembly_mode, self.policy = root_mode, root_policy
+            self.logs_dir = root_logs
+
+        self._write_both_modes_report(delivered)
+
+    #: Written at the run root while the per-mode phase is in flight, so a
+    #: pre-existing final_results/ from an earlier run cannot be mistaken for
+    #: this one's output.  Removed once the combined report is written.
+    IN_FLIGHT_MARKER = "RESULTS_NOT_READY.txt"
+
+    def _mark_root_results_in_flight(self, modes):
+        """Say plainly that the root results are not this run's output yet.
+
+        Under ``both`` the per-deliverable reports are written inside
+        ``mode_<name>/final_results/``, so anything already sitting in the root
+        ``final_results/`` belongs to a previous run.  Without this marker that
+        stale file reads as current for as long as the run takes.
+        """
+        os.makedirs("final_results", exist_ok=True)
+        stale = sorted(f for f in os.listdir("final_results")
+                       if f != self.IN_FLIGHT_MARKER)
+        path = os.path.join("final_results", self.IN_FLIGHT_MARKER)
+        with open(path, "w") as f:
+            f.write(
+                "THIS RUN IS STILL IN PROGRESS — the files in this directory are\n"
+                "NOT its output.\n\n"
+                f"Run          : {self.run_id} ({self.PIPELINE_NAME})\n"
+                f"Mode         : {MODE_BOTH} ({' + '.join(modes)})\n\n"
+                "Under --assembly-mode both, each representation is reported inside\n"
+                "its own directory while the run proceeds:\n"
+                + "".join(f"    mode_{m}/final_results/\n" for m in modes) +
+                "\nWhen the run finishes, this directory receives a combined\n"
+                "final_result.csv carrying every assembler alongside a\n"
+                + "".join(f"    merged_{m}\n" for m in modes) +
+                "column, plus assembly_modes_comparison.tsv, and this file is\n"
+                "removed.\n")
+            if stale:
+                f.write(
+                    "\nFiles present here NOW are left over from an earlier run and\n"
+                    "are superseded, not current:\n"
+                    + "".join(f"    {n}\n" for n in stale))
+        self.log_warn(
+            f"Root final_results/ holds {len(stale)} file(s) from an earlier run; "
+            f"see final_results/{self.IN_FLIGHT_MARKER}. This run reports into "
+            f"{', '.join('mode_' + m + '/' for m in modes)} until it completes.")
+
+    @staticmethod
+    def _read_merged_column(csv_path):
+        """Metric -> value for the 'merged' column of a final_result.csv."""
+        vals = {}
+        if not os.path.isfile(csv_path):
+            return vals
+        with open(csv_path, newline="") as f:
+            r = csv.reader(f)
+            hdr = next(r, None) or []
+            lower = [h.strip().lower() for h in hdr]
+            try:
+                mi = lower.index("merged")
+            except ValueError:
+                mi = len(hdr) - 1
+            for row in r:
+                if row and row[0].strip():
+                    vals[row[0].strip()] = row[mi] if len(row) > mi else ""
+        return vals
+
+    def _write_both_modes_report(self, delivered):
+        """Combine the deliverables into one table at the run root.
+
+        Produces ``final_results/final_result.csv`` carrying every assembler
+        column from step 10 beside one ``merged_<mode>`` column per
+        representation, so the assemblers and both deliverables can be read off a
+        single table, plus a compact side-by-side of the headline metrics.
+        """
+        if not delivered:
+            return
+        os.makedirs("final_results", exist_ok=True)
+        per_mode = {m: self._read_merged_column(
+                        os.path.join(ws, "final_results", "final_result.csv"))
+                    for m, ws in delivered}
+        modes = [m for m, _ in delivered]
+
+        # Metric order: step 10's table first, then anything only a deliverable
+        # reports (selection metadata, pool counts) in first-seen order.
+        rows, assemblers = [], []
+        info = os.path.join("assemblies", "assembly_info.csv")
+        if os.path.isfile(info):
+            with open(info, newline="") as f:
+                r = csv.reader(f)
+                hdr = next(r, None) or ["Metric"]
+                assemblers = [h.strip() for h in hdr[1:]]
+                rows = [row for row in r if row and row[0].strip()]
+        seen = {row[0].strip() for row in rows}
+        extra = []
+        for m in modes:
+            for metric in per_mode[m]:
+                if metric not in seen:
+                    seen.add(metric)
+                    extra.append(metric)
+
+        out = os.path.join("final_results", "final_result.csv")
+        with open(out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Metric"] + assemblers
+                       + [f"merged_{m}" for m in modes])
+            for row in rows:
+                metric = row[0].strip()
+                body = list(row[1:]) + [""] * (len(assemblers) - len(row[1:]))
+                w.writerow([metric] + body
+                           + [per_mode[m].get(metric, "") for m in modes])
+            for metric in extra:
+                w.writerow([metric] + [""] * len(assemblers)
+                           + [per_mode[m].get(metric, "") for m in modes])
+        self.log(f"Wrote {out} "
+                 f"({len(rows) + len(extra)} metrics x "
+                 f"{len(assemblers)} assemblers + {len(modes)} deliverables)")
+
+        # Compact side-by-side of the headline metrics.
+        fields = ["Assembly representation mode", "Selected assembler",
+                  "Selection score", "BUSCO C (%)", "BUSCO S (%)", "BUSCO D (%)",
+                  "Merqury QV", "Merqury completeness (%)", "Total length",
+                  "# contigs", "N50", "Telomere strict T2T contigs",
+                  "Telomere single-end strong contigs"]
+        cmp_path = os.path.join("final_results", "assembly_modes_comparison.tsv")
+        with open(cmp_path, "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(["Metric"] + modes)
+            for field in fields:
+                vals = [(m if field == "Assembly representation mode"
+                         else per_mode[m].get(field, "")) for m in modes]
+                w.writerow([field] + vals)
+        self.log(f"Wrote {cmp_path}")
+
+        for mode, ws in delivered:
+            fa = os.path.join(ws, "final_results", "final.merged.fasta")
+            alt = os.path.join(ws, "assemblies", "final.merged.fasta")
+            self.log(f"  {mode:<8} genome: "
+                     f"{fa if os.path.isfile(fa) else alt}")
+        marker = os.path.join("final_results", self.IN_FLIGHT_MARKER)
+        if os.path.isfile(marker):
+            os.remove(marker)
+        self.log_info(
+            "The two genomes are different REPRESENTATIONS of one sample, not "
+            "competing attempts at the same thing. Neither is the 'correct' one; "
+            "pick by what the downstream analysis needs. The full "
+            "representation retains alternate sequence and is NOT phased.")
+
+    def _run_step_list(self, steps, step_functions):
+        for step_num in steps:
+            func = step_functions.get(step_num)
             if func is None:
                 self.log_error(f"Unknown step: {step_num}")
                 sys.exit(1)
@@ -1678,7 +1989,3 @@ nextgraph_options = -a 1
                     sys.stderr = old_stderr
                 if not log_fh.closed:
                     log_fh.close()
-
-        self.run_end_ts = datetime.now()
-        self.write_benchmark_summary()
-        self.log(f"{self.PIPELINE_NAME} completed successfully")

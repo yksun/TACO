@@ -190,7 +190,12 @@ def robust_baseline(pairs, tol_abs=None, tol_rel=None):
                 best = (key, members)
         members = best[1] if best else items
     center = weighted_median(members)
-    sigma = mad_sigma([v for v, _ in members], center)
+    # Weight the scale exactly as the centre is weighted.  A
+    # count-weighted MAD around a length-weighted centre lets a
+    # numerous small-contig population inflate sigma until no contig
+    # in the assembly can reach the z threshold.
+    sigma = MAD_TO_SIGMA * weighted_median(
+        [(abs(v - center), w) for v, w in members])
     return {"center": center, "sigma": sigma, "n_used": len(members),
             "n_total": len(items),
             "weight_frac": (sum(w for _, w in members) / total_w) if total_w else 0.0}
@@ -220,6 +225,16 @@ DEPTH_RATIO_MAX = 0.34
 #: Depth above this multiple of core depth marks an organelle or a collapsed
 #: repeat.  Both are real sequence, so this *protects* rather than accuses.
 DEPTH_RATIO_ORGANELLE = 3.0
+#: Depth threshold used when the assembly retains alternate haplotypes
+#: (``--assembly-mode full``).  Such an assembly is inherently BIMODAL in depth:
+#: homozygous regions collapse to one contig and carry full read depth, while
+#: heterozygous regions are represented twice and each copy carries about half.
+#: If the collapsed population is the heavier cluster it becomes the core, and a
+#: legitimate half-depth haplotype contig then sits at a ratio near 0.5 -- only
+#: 1.5x above the 0.34 default.  Tightening the threshold restores a ~2x margin
+#: so depth noise cannot push real alternate sequence over the line.  It can only
+#: ever make removal MORE conservative.
+DEPTH_RATIO_MAX_FULL = 0.25
 #: Absolute GC deviation, in percentage points, required alongside the z-score.
 #: Intra-genomic GC within one eukaryote routinely spans tens of points, so a
 #: small deviation is never sufficient however significant it looks.
@@ -378,7 +393,12 @@ def _classify_one(c, depth_base, gc_base, depth_ratio_max, gc_dev_min,
     # primary signal, but never sufficient alone.
     corroborating = []
     lowfrac = _low_cov_fraction(c, length)
-    if lowfrac is not None and lowfrac >= LOW_COV_FRAC_MIN:
+    # The low-coverage fraction is the left tail of the SAME depth
+    # distribution whose median produced ``depth_low``.  Letting it
+    # corroborate a depth primary would remove a contig on one evidence
+    # axis, which is exactly what the two-signal rule forbids: both are
+    # depressed together whenever reads simply fail to map to a contig.
+    if lowfrac is not None and lowfrac >= LOW_COV_FRAC_MIN and not depth_low:
         corroborating.append(f"{100 * lowfrac:.0f}% of the contig at near-zero depth")
     if c.get("aligned_to_compare") is False:
         corroborating.append("no alignment to the compare genome")
@@ -657,7 +677,11 @@ def chimera_decision(contig, concordance, breakpoint_info, spanning,
     if action == "off":
         return out("none", "not_assessed", "chimera handling disabled")
 
+    if verdict == "corroborated":
+        return out("none", "corroborated",
+                   f"{n_split} of {n_inf} informative assemblies split this contig")
     if verdict != "mis_join_candidate":
+        # "unresolved"/"not tested" is not agreement — do not label it so.
         return out("none", "corroborated",
                    f"{n_split} of {n_inf} informative assemblies split this contig")
 

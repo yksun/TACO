@@ -5,6 +5,253 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.5.0] — 2026-08-18
+
+### `--assembly-mode {both,primary,full}` — both is the default
+
+TACO now delivers **two genomes from one set of assemblies**: a nonredundant
+primary representation in `mode_primary/` and a full sequence representation that
+retains divergent alternate/haplotype sequence in `mode_full/`, plus
+`final_results/assembly_modes_comparison.tsv` side by side.
+
+`both` is the default because the two objectives disagree about what a good
+assembly *is*, and nothing in the reads says which one a given project needs.
+Choosing silently was the old behavior, and it was wrong in one direction for
+every heterozygous, diploid, or dikaryotic sample.
+
+Steps 0–10 describe the reads and the assemblers, so they are identical
+whichever representation is delivered and run **once**. Only steps 11–14 depend
+on the objective and run twice, each in its own working directory with the shared
+step 0–10 products symlinked in — so the second deliverable costs no reassembly
+and no duplicated 48 GB of FASTA. `--assembly-mode primary` or `full` emits just
+one.
+
+`full` is **not** a phased assembly. TACO does not order or orient contigs into
+haplotypes and does not validate haplotype consistency. It retains alternate
+sequence; it does not assign it.
+
+`both` names no scoring profile and answers no removal question: the two
+objectives disagree, so `AssemblyPolicy.sub_policies()` hands out one policy per
+deliverable and asking a `both` policy whether purge_dups may run raises rather
+than guessing.
+
+### One combined result table at the run root
+
+`final_results/final_result.csv` now carries the per-assembler columns from step
+10 beside one `merged_<mode>` column per deliverable, so the nine assemblers, the
+`--compare` reference, and both genomes read off a single table.
+`assembly_modes_comparison.tsv` remains as the compact headline side-by-side.
+
+This fixes a real defect in the first cut of `both`: every report was written
+inside `mode_*/` and the root `final_results/` was left holding a **previous
+run's** numbers, with nothing to say so. On a multi-day run that stale
+`final_result.csv` reads as current for as long as the run takes. TACO now writes
+`final_results/RESULTS_NOT_READY.txt` when the per-mode phase begins, naming the
+superseded files and pointing at the `mode_*/` directories, and removes it once
+the combined report exists.
+
+### Backbone selection now scores what refinement cannot fix
+
+The backbone is chosen *before* refinement runs. Measured on the real *Puccinia
+triticina* run, backbone (ipa) → delivered:
+
+| metric | backbone | delivered | |
+|---|---|---|---|
+| BUSCO C (%) | 96.3 | 96.2 | **unfixable** — only degraded |
+| Merqury completeness | 91.74 | 91.51 | **unfixable** — only degraded |
+| N50 (Mb) | 2.28 | 2.48 | barely movable |
+| Merqury QV | 40.50 | 47.85 | fixable — polishing |
+| BUSCO D (%) | 6.9 | 5.3 | fixable — purge_dups |
+| strict T2T | 1 | 4 | fixable — telomere-pool rescue |
+
+The pre-1.5.0 weights had this backward. `BUSCO_D` was charged 600/point — the
+heaviest term after BUSCO itself — for duplication that step 12H removes anyway,
+while contiguity got 30/contig and consensus accuracy 20 per QV point. On the
+real data that rejected a **99-contig / N50 4.08 Mb / QV 71.7** candidate in
+favor of a **329-contig / N50 2.28 Mb / QV 40.5** one, and delivered an assembly
+*less contiguous and 24 QV points worse* than the candidate it passed over.
+
+Selection now rewards BUSCO **complete** (not single — single is partly a
+function of duplication, so rewarding it pre-purge rewards work already done),
+weights contiguity and consensus accuracy far higher, and discounts duplication
+and telomere counts because refinement supplies them. A 31-point QV spread is a
+~1300× difference in consensus error, which 20/point effectively ignored.
+
+**Merqury completeness means opposite things in the two modes**, which is why it
+is not simply "a quality metric". It is the fraction of read k-mers present in
+the assembly, and a collapsed haploid representation of a heterozygous sample
+*cannot* contain both haplotypes'. So it is the dominant term in `full`, where it
+measures the objective directly, and a light one in `primary`, where a value
+above the haploid ceiling is evidence of retained redundancy rather than of
+quality. On the real data the collapsed candidates sit at 91.7–93.8% and the
+haplotype-retaining ones at 98.7–99.2%, so this distinction decides each mode's
+choice. Without a dominant completeness term, `full` has **no** positive signal
+for retention at all — BUSCO C saturates near 96% for every serious candidate and
+duplication and size are deliberately unscored — and it selects a collapsed
+147 Mb assembly over a genuine 254 Mb one.
+
+Result on the real candidates: `primary` selects peregrine (99 contigs, N50
+4.08 Mb, QV 71.7) and `full` selects lja (254.0 Mb, **1.002×** the published
+253.5 Mb dikaryotic reference, duplication 95.9% against its 95.8%). The
+46,812-contig artifact remains last in both.
+
+**This deliberately changes primary-mode selection.** The pre-1.5.0 weights are
+kept in `policy.LEGACY_PRIMARY_WEIGHTS` as a record of what the published v1.4.x
+runs used, and a test asserts no profile silently resurrects them. Taxon presets
+keep their relative ordering (fungal strictest on duplication, plant most
+permissive because polyploidy inflates it) rescaled to the new level.
+
+---
+
+## [1.5.0-pre] — 2026-08-17
+
+### `--assembly-mode {primary,full}`
+
+TACO had one objective: a nonredundant primary representation. Every part of the
+pipeline assumed it — the score rewarded `BUSCO_S` and penalized `BUSCO_D`, the
+size term expected the haploid value, and purge_dups, self-dedup, and containment
+filtering all removed sequence for looking redundant. On a heterozygous, diploid,
+or dikaryotic sample that assumption is wrong in the same direction at every step,
+and no single flag could undo it.
+
+This release makes the objective explicit and selectable. **`primary` is the
+default and reproduces pre-1.5.0 behavior exactly** — verified against the v1.4.1
+formula across 72,000 randomized metric/taxon/genome-size combinations, maximum
+difference 9.3 × 10⁻¹⁰ (float summation order).
+
+`full` is **not** a phased assembly. TACO does not order or orient contigs into
+haplotypes and does not validate haplotype consistency. The mode retains alternate
+sequence; it does not assign it.
+
+**Scoring** (`taco/policy.py`, new): the weights, the size expectation, and the
+removal rules live in one module as pure functions of metrics and configuration,
+so the two objectives cannot drift apart between `steps.py`, `backbone.py`, and
+the reports. `backbone.py` carried a second, divergent copy of the formula; it now
+delegates to the same function.
+
+- `full` rewards `BUSCO_C` (S + D) instead of `BUSCO_S`, sets the duplication
+  penalty to **zero** — neutral, not rewarded — and doubles the Merqury
+  completeness weight to 400. QV stays separate from completeness at 20 in both
+  modes.
+- Taxon overrides can no longer defeat the mode: `--taxon fungal` would otherwise
+  reimpose `w_busco_d = 600` on `full`.
+- `BUSCO_C` is now read from `assembly_info.csv`, and reconstructed as S + D on
+  older tables that lack it.
+
+**Size no longer ranks in `full` mode.** No assembler declares an expected total
+size for a heterozygous sample — hifiasm and Verkko take no genome size, Flye's is
+optional, and Canu's `genomeSize` is a coverage knob feeding `corOutCoverage` and
+`mhapSensitivity`, not a size expectation. Where a declared size is compared
+against a finished assembly, NCBI uses a wide taxon-derived band anchored on the
+haploid value to flag for human review, never to rank. `full` mode reports the
+band `[-g, 2 × -g × 1.15]` and scores nothing from it.
+
+The over-assembly guard is structural instead. On a real *Puccinia triticina* read
+set (`-g 127m`, `--taxon fungal`), a 287 Mb / 46,812-contig artifact had the
+highest Merqury completeness of any candidate (99.26 %) and sat *inside* any band
+wide enough to admit the genuine 254 Mb assembly, so size could not separate them.
+Contig **density** does: 163 contigs/Mb against 3.8 and 2.5. Density rather than
+absolute count, because an assembly carrying twice the sequence carries twice the
+contigs, and charging the absolute count penalizes it for exactly the property the
+mode selects for. Fragmentation is priced at the same per-contig rate in both
+modes — 30 per contig, evaluated against a haploid-sized assembly — so only the
+double-charge is removed, not the guard.
+
+**Selection alone is not enough.** `full` mode also declines every step that
+removes sequence *because it looks redundant*: purge_dups (12H), post-upgrade
+dedup (12G2), Tier 2 self-dedup, and containment filtering of the telomere pools
+(step 11). Each logs why it was skipped.
+
+Contaminant screening (13A) and chimera resolution (13B) run in **both** modes.
+Foreign sequence and read-unsupported joins are errors under either objective and
+are identified from composition, read depth, and read spanning — not from a contig
+resembling a second haplotype.
+
+`--no-purge-dups` is unchanged and still supported. Precedence: it can only ever
+*disable* purge_dups, never enable it. `full` mode already skips the step, and
+omitting the flag does not bring it back.
+
+**Reports.** New `final_results/assembly_mode_summary.txt` states
+`Assembly representation mode: primary|full` plus the selected assembler,
+selection score, active score profile, BUSCO C/S/D, Merqury QV and completeness,
+assembly length, contigs, N50, T2T and single-end telomere counts, and the
+individual score contributions behind the winning score. The mode also appears in
+`final_result.csv` and `selection_decision.txt`, and
+`assemblies/selection_debug.tsv` gains a `score_*` column per scoring component,
+so a run records *why* an assembly won rather than only that it did.
+
+**Advisory.** A `primary` run that ends with Merqury completeness ≥ 95 %, BUSCO
+duplication ≥ 20 %, and assembly size ≥ 1.4 × the expected haploid value emits a
+warning suggesting `--assembly-mode full`. It is worded as a prompt to look, not a
+biological conclusion: these metrics alone do not establish the ploidy of the
+sample, and the warning does not claim they do.
+
+`smart` and `both` modes are designed for but deliberately not exposed yet; a test
+asserts the CLI rejects them.
+
+41 new tests in `tests/test_assembly_mode.py` (133 total, up from 92), covering
+CLI defaults and rejection, v1.4.1 score equivalence, the two modes disagreeing on
+one input, the real *P. triticina* selections in both modes, the removal policy,
+and the advisory's wording.
+
+### Scientific-validity fixes found by re-analyzing the real data
+
+Three problems surfaced while validating the release against the *Puccinia
+triticina* Pt76 run, and are fixed here.
+
+**The telomere reward was unbounded in a quantity biology bounds.** A contig has
+two ends, so it carries at most two telomeres, and a genome holds
+2 x n_chromosomes x ploidy of them. The score rewarded `T2T` and single-end
+telomere counts linearly with no ceiling. On the real data the MBG assembly
+reported **1,668** single-end-strong telomere contigs for an 18-chromosome genome
+where at most 36 are possible (72 as a dikaryon), earning +250,200 points —
+three times its entire BUSCO term. Only its 46,812 contigs kept it from winning,
+so the safety margin rested entirely on fragmentation rather than on any bound.
+
+`policy.telomere_reward_cap` now bounds the rewarded count at
+2 x (expected total / `MIN_PLAUSIBLE_CHROMOSOME_BP`), with the floor set to 1 Mb.
+That is deliberately permissive — it implies 127 chromosomes in a 127 Mb haploid
+genome, roughly seven times the real 18 — so the bound only fires on counts that
+are impossible by a wide margin. Verified to change **no** real selection: both
+modes rank the nine real candidates exactly as before, and only the artifact's
+score moves. Counts past the bound stop being rewarded rather than being
+penalized, and with no `-g` no bound can be derived so behavior is unchanged.
+
+This is the one place primary mode is no longer identical to v1.4.1. The
+equivalence test now asserts equality within the bound and tests the bound
+separately, because past it v1.4.1 was rewarding false positives. A tighter
+taxon-aware bound would cut deeper but would start capping legitimate
+candidates, so it is left as future work.
+
+**Contaminant screening could misfire on a haplotype-retaining assembly.** Such
+an assembly is inherently bimodal in depth: homozygous regions collapse to one
+contig at full read depth, heterozygous regions are kept twice at about half. If
+the collapsed population is the heavier cluster it becomes the core, and a
+legitimate half-depth haplotype contig then sits at ratio ~0.5 against a 0.34
+removal threshold — a 1.5x margin. Full mode now screens with
+`DEPTH_RATIO_MAX_FULL = 0.25`, restoring a ~2x margin. Screening is still never
+skipped, and the change can only make removal more conservative.
+
+**The compare report read representation differences as mis-assemblies.** When a
+collapsed assembly is compared against a reference that keeps both haplotypes,
+each reference haplotype pair maps onto the same single contig, and
+`contig_to_contig.tsv` labeled those rows `1-to-N (split)` — which reads as
+though TACO broke a chromosome. Against the Pt76 reference (253.5 Mb, 36
+chromosomes = 2 x 18), **97%** of chromosome-scale reference contigs shared a
+best target and 48 rows were labeled "split". New
+`final_results/compare_report/REPRESENTATION_NOTES.txt` reports the shared-target
+fraction and, above 50%, explains that these are two representations of one
+genome, warns that `weak_regions_compare.tsv` and `unique_compare_contigs.tsv`
+will list sequence absent by design, and says so in the run log. It makes no
+defect claim about either assembly.
+
+### Known issue
+
+`taco/steps.py:_filter_redundant_to_protected` is defined but never called. It
+predates this release and was left in place.
+
+---
+
 ## [1.4.1] — 2026-08-03
 
 ### Audit only: the Tier 1 / cross-assembler disagreement is now recorded
@@ -30,6 +277,46 @@ This release makes that visible and changes nothing else.
   fewer than two voters. Cost is one call, roughly 25 s on a 45 Mb fungal
   genome; skipped entirely under `--concordance-mode off`.
 
+### Correctness fixes from a v1.4.0 audit
+
+An audit of v1.4.0 produced 70 candidate findings, of which 15 were confirmed by
+adversarial re-reading of the source. Six are fixed here; the rest are recorded
+in the audit report and deferred.
+
+- **Consensus breakpoint was computed from every voter, not only the ones that
+  saw a split.** Assemblies voting `intact` or `uninformative` contribute no
+  interior gap but still entered the estimate, dragging the consensus toward the
+  middle of the contig and cutting at a coordinate no assembly proposed. The
+  estimate now uses only `split` voters. This is the most consequential fix in
+  the release: it changes where a chimera is cut.
+- **A contig could be removed on read depth alone.** Removal requires two
+  independent primary signals, or one plus corroboration — but the only live
+  corroborator, the fraction of the contig at near-zero depth, is the left tail
+  of the same depth distribution whose median is the primary. Both are depressed
+  together whenever reads simply fail to map, so a divergent haplotype at low
+  coverage with entirely normal composition was classified `foreign` and dropped
+  from the delivered assembly. Coverage uniformity may no longer corroborate a
+  depth primary. The regression test that should have caught this was passing
+  against a fixture without `zero_bp`/`low_bp`, a shape the pipeline never
+  produces; it now carries them.
+- **The MAD was count-weighted around a length-weighted center.** A numerous
+  small-contig population could inflate the depth sigma past `centre / 3.5`,
+  making the depth signal unable to fire for any contig in the assembly. The
+  scale is now weighted exactly as the center is.
+- **`purify_excluded.fasta` was written only when something was removed** and
+  never cleared, so a re-run that removed nothing left the previous run's file
+  claiming exclusions from an assembly that still contained them. It is now
+  rewritten unconditionally, empty when nothing was removed.
+- **A single donor could be consumed by several backbone targets**, deleting N
+  contigs and inserting the same donor sequence N times. A donor is now used at
+  most once.
+- **`chimera_decision` labeled every non-mis-join verdict `corroborated`**,
+  asserting cross-assembler agreement for contigs that were never assessed.
+  Only a genuine corroborated verdict now says so.
+
+Tests: 92 across four files (five added). Each new test was verified to fail
+against the unfixed code.
+
 **No output changes.** No tier is modified, no path is altered, and the
 delivered assembly is byte-identical to v1.4.0 on the same inputs.
 
@@ -44,7 +331,7 @@ a donor can actually win before it is worth the risk.
 
 ## [1.4.0] — 2026-07-31
 
-A minor-version bump rather than a patch, because the default behaviour changes in
+A minor-version bump rather than a patch, because the default behavior changes in
 two ways a user will notice: `final_assembly.fasta` is now the purified assembly
 rather than the unfiltered merge, and step 13 modifies the assembly where it
 previously only measured it. Both are opt-out via `--purify-mode off`. The work
@@ -73,7 +360,7 @@ responsible and written it to a side file nothing downstream consumed.
 - New `taco/purify.py` holds the decision logic as pure functions, unit-tested
   without minimap2, samtools, BUSCO, or a reference genome.
 
-### Contaminant screening rewritten to generalise beyond one genome
+### Contaminant screening rewritten to generalize beyond one genome
 
 The v1.3.7 rule — fixed `DEPTH_RATIO_MAX = 0.34` **or** `GC_DEV_MAX = 8.0` on a
 length-weighted median baseline — worked on the genome it was written for and is
@@ -82,7 +369,7 @@ unsafe elsewhere. Three defects, each measured:
 - **The baseline inverted.** A length-weighted median is the assembly's midpoint
   by length, so once foreign sequence passes half the assembly the "baseline"
   becomes the contaminant and the host is measured against it. Iterative trimming
-  cannot rescue this — the initial centre sits on the wrong cluster and the sigma
+  cannot rescue this — the initial center sits on the wrong cluster and the sigma
   is inflated by the very gap that should be resolved, so nothing is ever trimmed.
   The baseline is now the **heaviest cluster** by sequence length, which is also
   what "modal depth" means in a coverage histogram.
@@ -608,7 +895,7 @@ behavioural gaps that 1.3.3 fixes.
   tcov ≥ 30 %, len ≥ 100 kb).  All four thresholds are independently
   overridable via `PARTIAL_T2T_MIN_TCOV`, `PARTIAL_T2T_MIN_BP`,
   `PARTIAL_T2T_MIN_QCOV`, `PARTIAL_T2T_MIN_IDENT`.
-- **purge_dups safety harmonised with genome-size budget.** The bp-drop
+- **purge_dups safety harmonized with genome-size budget.** The bp-drop
   safety check now accepts large drops when they move an over-large
   assembly closer to the expected genome size *and* stay above the
   expected-size floor (`PURGE_DUPS_MIN_EXPECTED_RATIO`).  The Step 12L
@@ -1082,7 +1369,7 @@ is an optional override.
   `--platform pacbio` (CLR).  hifiasm only supports HiFi reads as primary
   input.  Previously the pipeline attempted to run hifiasm with an `--ont`
   flag that does not exist.
-- **New** taxon-aware backbone scoring weights: fungi penalise BUSCO
+- **New** taxon-aware backbone scoring weights: fungi penalize BUSCO
   duplicates more heavily and reward T2T contigs; plant/vertebrate reduce
   contig-count penalty for naturally larger assemblies and increase N50 weight.
 - **New** taxon-aware BUSCO trial thresholds: fungi 2% C-drop / 0.3%
@@ -1317,7 +1604,7 @@ overridable via `PROTECT_COV` and `PROTECT_ID` environment variables.
 ### Step 12 — BUSCO D penalty added to backbone scoring (`steps.py`)
 
 **Problem:** The smart backbone scoring formula rewarded BUSCO single-copy
-completeness but did not penalise duplication.  An assembler with high BUSCO S
+completeness but did not penalize duplication.  An assembler with high BUSCO S
 but also high BUSCO D could be selected as backbone, carrying duplicated
 content into the final assembly.
 
@@ -1402,7 +1689,7 @@ role as a reference genome (not an "external" assembly).  The assembler name
 `external` is now `reference` in all CSV outputs, file paths, and comparison
 tables (`assembly_info.csv`, `selection_debug.tsv`, `final_result.csv`, etc.).
 The internal attribute is `runner.reference_fasta` (was `external_fasta`).
-The README documents this dual-mode behaviour.
+The README documents this dual-mode behavior.
 
 `taco-env.yml` now includes `redundans` from bioconda.
 
