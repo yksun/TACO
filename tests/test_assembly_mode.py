@@ -834,6 +834,138 @@ def test_mode_workspace_preparation_is_idempotent():
             os.chdir(cwd)
 
 
+# ── purge_dups must not remove complete genes unnoticed ──────────────────────
+#
+# Real Puccinia triticina data: purging a peregrine backbone removed 39
+# haplotigs and 25.7 Mb, took BUSCO complete from 95.6% to 92.5%, and passed
+# every existing check. The 12L do-no-harm test compares assembly size and
+# telomere counts -- and its size rule explicitly APPROVES a shrink that moves
+# toward the declared genome size, which is exactly what a purge does.
+
+def test_busco_thresholds_are_shared_by_every_harm_check():
+    from taco.steps import _busco_delta_thresholds
+    assert _busco_delta_thresholds("fungal")[0] == "2.0"
+    assert _busco_delta_thresholds("plant")[0] == "4.0"
+    assert _busco_delta_thresholds("other") == _busco_delta_thresholds("insect")
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    # The table must exist in exactly one place.
+    assert src.count('return "4.0", "1.0", "6.0"') == 1
+    assert src.count("_busco_delta_thresholds(") >= 3, "gate/trial/report share it"
+
+
+def test_busco_complete_is_read_from_the_summary_busco_already_wrote():
+    import tempfile
+    from taco.steps import _busco_complete_for_label
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        d = os.path.join(tmp, "busco", "final")
+        os.makedirs(d)
+        with open(os.path.join(d, "short_summary.specific.x.final.txt"), "w") as f:
+            f.write("\tC:92.5%[S:87.4%,D:5.1%],F:0.6%,M:6.9%,n:1752\n")
+        try:
+            os.chdir(tmp)
+            assert _busco_complete_for_label("final") == 92.5
+            assert _busco_complete_for_label("absent") is None
+        finally:
+            os.chdir(cwd)
+
+
+def _gate_runner(taxon="fungal"):
+    class R:
+        def __init__(self):
+            self.taxon = taxon
+            self.busco_lineage = "basidiomycota_odb10"
+            self.threads = 4
+            self.logged = []
+        def log(self, m): self.logged.append(m)
+        def log_info(self, m): self.logged.append(m)
+        def log_warn(self, m): self.logged.append(m)
+    return R()
+
+
+def _run_gate(before_c, after_c, taxon="fungal", before_d=20.0, after_d=5.0):
+    """Drive the gate with mocked BUSCO trials."""
+    from taco import steps as st
+    import tempfile
+    real_trial, real_which = st._run_busco_trial, st.shutil.which
+    seq = {"purge_before": {"C": before_c, "D": before_d},
+           "purge_after": {"C": after_c, "D": after_d}}
+    st._run_busco_trial = lambda fa, lin, thr, label, out, runner=None: seq[label]
+    st.shutil.which = lambda n: "/usr/bin/busco" if n == "busco" else real_which(n)
+    cwd = os.getcwd()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            r = _gate_runner(taxon)
+            return st._purge_preserves_gene_content(r, "before.fa", "after.fa"), r
+    finally:
+        os.chdir(cwd)
+        st._run_busco_trial, st.shutil.which = real_trial, real_which
+
+
+def test_gate_rejects_the_observed_gene_loss():
+    """95.6 -> 92.5 is a 3.1-point drop against a 2.0-point fungal tolerance."""
+    ok, r = _run_gate(95.6, 92.5)
+    assert ok is False
+    assert any("92.5" in m for m in r.logged), r.logged
+
+
+def test_gate_accepts_a_purge_that_only_removes_redundancy():
+    ok, r = _run_gate(96.3, 96.2)
+    assert ok is True
+    assert any("accepted" in m for m in r.logged), r.logged
+
+
+def test_gate_tolerance_follows_the_taxon():
+    """The same 3.1-point drop is inside a plant tolerance of 4.0."""
+    assert _run_gate(95.6, 92.5, taxon="plant")[0] is True
+    assert _run_gate(95.6, 92.5, taxon="fungal")[0] is False
+
+
+def test_gate_can_be_overridden_but_says_so():
+    os.environ["STEP12_SKIP_PURGE_BUSCO_GATE"] = "1"
+    try:
+        ok, r = _run_gate(95.6, 50.0)
+        assert ok is True
+        assert any("gate skipped" in m for m in r.logged), r.logged
+    finally:
+        del os.environ["STEP12_SKIP_PURGE_BUSCO_GATE"]
+
+
+def test_gate_is_permissive_when_busco_cannot_measure():
+    """Missing BUSCO must not silently block a purge, but must warn."""
+    from taco import steps as st
+    real = st._run_busco_trial
+    st._run_busco_trial = lambda *a, **k: None
+    try:
+        r = _gate_runner()
+        assert st._purge_preserves_gene_content(r, "b.fa", "a.fa") is True
+        assert any("inconclusive" in m or "unavailable" in m for m in r.logged)
+    finally:
+        st._run_busco_trial = real
+
+
+def test_a_rejected_purge_keeps_the_unpurged_assembly():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index("if _pol.purge_dups_enabled:"):]
+    blk = blk[:blk.index("elif _pol.user_no_purge_dups")]
+    assert "_purge_preserves_gene_content" in blk
+    # the copy that overwrites the assembly must be conditional on the gate
+    assert blk.index("_purge_preserves_gene_content") < blk.index("shutil.copy")
+    assert "REJECTED" in blk
+
+
+def test_do_no_harm_checks_gene_content():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index('# ---- 12L. "Do no harm" safety comparison ----'):]
+    blk = blk[:blk.index("\ndef ", 1)]
+    assert "_busco_complete_for_label" in blk, "12L still ignores gene content"
+    assert "BUSCO complete" in blk
+
+
 def test_policy_rejects_an_unknown_mode():
     try:
         AssemblyPolicy(mode="phased")

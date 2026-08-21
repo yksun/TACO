@@ -521,6 +521,23 @@ full`. This is a prompt to look, not a biological conclusion: these metrics alon
 do not establish the ploidy of the sample, and the warning does not claim they
 do.
 
+### Gene content is protected against purging
+
+purge_dups removes haplotigs by similarity and depth, with no notion of genes,
+so it can remove the only copy of a locus. Step 12H therefore accepts a purge
+only if BUSCO complete falls by no more than the taxon tolerance (2.0 points for
+fungi, 4.0 for plants, 3.0 for vertebrates, 2.5 otherwise — the same table the
+rescue trial uses). A rejected purge keeps the unpurged assembly and preserves
+both the purged version and the removed haplotigs for review;
+`STEP12_SKIP_PURGE_BUSCO_GATE=1` forces the purge through.
+
+This costs two BUSCO runs on the merged assembly. It exists because the selection
+rewrite deliberately tolerates a duplicated backbone on the grounds that
+purge_dups will clean it up, and that reasoning is only sound if the cleanup is
+checked. On real data an unchecked purge removed 25.7 Mb and 3.1 points of BUSCO
+complete while passing every other test — the size check *approves* a shrink
+toward `-g`, and the T2T count went up.
+
 ### If a deliverable fails
 
 Under `both` the two representations are independent products, so a failure in

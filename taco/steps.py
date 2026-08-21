@@ -4414,6 +4414,46 @@ def _busco_lineage_cached(lineage, runner=None):
     return any(os.path.isdir(p) for p in candidates)
 
 
+def _busco_complete_for_label(label):
+    """BUSCO complete percentage recorded for *label*, or None.
+
+    Reads the short summary BUSCO already wrote under ``busco/<label>/`` rather
+    than re-running it, so the do-no-harm report costs nothing.
+    """
+    import glob as _glob
+    import re as _re
+    for pattern in (f"busco/{label}/short_summary*.txt",
+                    f"busco/{label}/run_*/short_summary*.txt"):
+        for path in sorted(_glob.glob(pattern)):
+            try:
+                text = open(path, errors="ignore").read()
+            except OSError:
+                continue
+            m = _re.search(r"C:\s*([0-9.]+)%", text)
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def _busco_delta_thresholds(taxon):
+    """Largest tolerable (BUSCO C drop, M rise, D rise) for *taxon*, as strings.
+
+    Shared by every step that changes the assembly and then has to decide
+    whether the change did harm: the step 12F rescue trial and the 12H
+    purge_dups gate.  Keeping one table means a threshold tuned for one cannot
+    silently disagree with the other.
+    """
+    if taxon == "plant":
+        return "4.0", "1.0", "6.0"
+    if taxon in ("vertebrate", "animal"):
+        return "3.0", "0.5", "4.0"
+    if taxon == "fungal":
+        # Duplication in fungi is almost always artefactual, so the tolerance
+        # for losing complete genes is correspondingly tight.
+        return "2.0", "0.3", "2.0"
+    return "2.5", "0.5", "3.0"
+
+
 def _run_busco_trial(trial_fa, lineage, threads, trial_label, out_dir,
                      runner=None):
     """Run BUSCO on a trial assembly and return parsed metrics dict or None."""
@@ -4862,6 +4902,70 @@ def _purge_dups_safety_check(runner, before_recs, after_recs, profile, mode,
             f"purge_dups safety rejected output: {reason} "
             f"({before_bp:,} -> {after_bp:,} bp)")
     return verdict == "accept", reason
+
+
+def _purge_preserves_gene_content(runner, before_fa, after_fa):
+    """True when purge_dups did not remove complete genes beyond tolerance.
+
+    purge_dups removes haplotigs by sequence similarity and read depth; it has
+    no notion of gene content, so it can remove the only copy of a locus.
+    Nothing downstream would notice: the 12F BUSCO trial gates POOL
+    REPLACEMENTS, not purging, and the 12L do-no-harm check compares assembly
+    size and telomere counts, both of which a good purge improves.
+
+    Observed on real Puccinia triticina data: purging a peregrine backbone
+    removed 39 haplotigs and 25.7 Mb, took BUSCO complete from 95.6% to 92.5%,
+    and passed every existing check -- the size test explicitly APPROVED the
+    shrink because it moved toward the declared genome size, and the T2T count
+    rose from 4 to 6.
+
+    This matters more from v1.5.0 on. Backbone selection now tolerates a
+    duplicated backbone precisely because purge_dups is expected to clean it up,
+    which routes more sequence through an unguarded step. The tolerance is the
+    same taxon-aware BUSCO C drop the rescue trial uses.
+    """
+    if os.environ.get("STEP12_SKIP_PURGE_BUSCO_GATE", "0") == "1":
+        runner.log_warn("purge_dups gene-content gate skipped "
+                        "(STEP12_SKIP_PURGE_BUSCO_GATE=1)")
+        return True
+    lineage = getattr(runner, "busco_lineage", None)
+    if not lineage or not shutil.which("busco"):
+        runner.log_warn(
+            "purge_dups gene-content gate skipped: BUSCO unavailable, so the "
+            "purge cannot be checked for gene loss. Compare BUSCO on "
+            f"{before_fa} against {after_fa} before trusting the result.")
+        return True
+
+    taxon = getattr(runner, "taxon", "other")
+    max_c_drop = float(os.environ.get(
+        "STEP12_MAX_BUSCO_C_DROP", _busco_delta_thresholds(taxon)[0]))
+    trial_dir = "assemblies/purge_dups_work/busco_gate"
+    os.makedirs(trial_dir, exist_ok=True)
+
+    before = _run_busco_trial(before_fa, lineage, runner.threads,
+                              "purge_before", trial_dir, runner=runner)
+    after = _run_busco_trial(after_fa, lineage, runner.threads,
+                             "purge_after", trial_dir, runner=runner)
+    if not before or not after:
+        runner.log_warn(
+            "purge_dups gene-content gate inconclusive: a BUSCO trial did not "
+            "produce metrics. Accepting the purge.")
+        return True
+
+    c_before, c_after = float(before.get("C", 0)), float(after.get("C", 0))
+    d_before, d_after = float(before.get("D", 0)), float(after.get("D", 0))
+    c_delta, d_delta = c_after - c_before, d_after - d_before
+    runner.log(
+        f"purge_dups gene-content gate: BUSCO C {c_before:.1f}% -> "
+        f"{c_after:.1f}% ({c_delta:+.1f}), D {d_before:.1f}% -> {d_after:.1f}% "
+        f"({d_delta:+.1f}); tolerance for --taxon {taxon} is "
+        f"{-max_c_drop:+.1f} on C")
+    if c_delta < -max_c_drop:
+        return False
+    runner.log_info(
+        f"purge_dups accepted: removed {-d_delta:.1f} points of duplication for "
+        f"{-c_delta:.1f} points of complete genes")
+    return True
 
 
 def _run_purge_dups(runner, input_fa, output_fa):
@@ -6095,15 +6199,8 @@ def step_12_refine(runner):
         "STEP12_MIN_BP_RATIO",
         os.environ.get("STEP13_MIN_BP_RATIO", "0.90")))
 
-    # Taxon-aware BUSCO thresholds (C-drop, M-rise, D-rise):
-    default_c_drop, default_m_rise, default_d_rise = "2.5", "0.5", "3.0"
-    if taxon == "plant":
-        default_c_drop, default_m_rise, default_d_rise = "4.0", "1.0", "6.0"
-    elif taxon in ("vertebrate", "animal"):
-        default_c_drop, default_m_rise, default_d_rise = "3.0", "0.5", "4.0"
-    elif taxon == "fungal":
-        default_c_drop, default_m_rise = "2.0", "0.3"
-        default_d_rise = "2.0"  # fungi: duplication almost always artefactual
+    default_c_drop, default_m_rise, default_d_rise = \
+        _busco_delta_thresholds(taxon)
 
     max_busco_c_drop = float(os.environ.get(
         "STEP12_MAX_BUSCO_C_DROP",
@@ -6660,7 +6757,16 @@ def step_12_refine(runner):
         purged_fa = "assemblies/final_merge.purged.fasta"
         _run_purge_dups(runner, raw_out, purged_fa)
         if os.path.isfile(purged_fa) and os.path.getsize(purged_fa) > 0:
-            shutil.copy(purged_fa, raw_out)
+            if _purge_preserves_gene_content(runner, raw_out, purged_fa):
+                shutil.copy(purged_fa, raw_out)
+            else:
+                runner.log_warn(
+                    f"purge_dups REJECTED: it removed complete genes beyond the "
+                    f"tolerance for --taxon {getattr(runner, 'taxon', 'other')}. "
+                    f"Keeping the unpurged assembly. The purged version is "
+                    f"preserved at {purged_fa} and the removed haplotigs at "
+                    f"assemblies/purge_dups_work/hap.fa, so the call can be "
+                    f"reviewed or forced with STEP12_SKIP_PURGE_BUSCO_GATE=1.")
     elif _pol.user_no_purge_dups:
         runner.log_info("purge_dups skipped (--no-purge-dups)")
     else:
@@ -7120,6 +7226,31 @@ def step_12_refine(runner):
         if len(fn_t2t) < bb_t2t_count:
             warnings.append(f"Telomere T2T contigs decreased: "
                             f"{bb_t2t_count} → {len(fn_t2t)}")
+
+        # Gene content. Every other test here can be satisfied by a refinement
+        # that discards genes: the size test APPROVES a shrink that moves toward
+        # the declared genome size, and a good purge raises the T2T count. On
+        # real data this check reported "quality OK" while BUSCO complete fell
+        # 3.1 points. Reported whenever both measurements exist; the enforcing
+        # gate is at 12H, on purge_dups itself.
+        bb_c = _busco_complete_for_label(assembler)
+        fn_c = _busco_complete_for_label("final")
+        if bb_c is not None and fn_c is not None:
+            delta = fn_c - bb_c
+            runner.log(f"Do-no-harm: BUSCO complete {bb_c:.1f}% → {fn_c:.1f}% "
+                       f"({delta:+.1f})")
+            tol = float(_busco_delta_thresholds(
+                getattr(runner, "taxon", "other"))[0])
+            if delta < -tol:
+                warnings.append(
+                    f"BUSCO complete fell {-delta:.1f} points "
+                    f"({bb_c:.1f}% → {fn_c:.1f}%), beyond the {tol:.1f}-point "
+                    f"tolerance for this taxon: refinement removed complete "
+                    f"genes, not just redundancy")
+        else:
+            runner.log_info(
+                "Do-no-harm: BUSCO comparison unavailable for one of the two "
+                "assemblies; gene content was not verified")
 
         if warnings:
             warn_file = "final_results/refinement_warning.txt"

@@ -35,6 +35,43 @@ objectives disagree, so `AssemblyPolicy.sub_policies()` hands out one policy per
 deliverable and asking a `both` policy whether purge_dups may run raises rather
 than guessing.
 
+### purge_dups can no longer remove complete genes unnoticed
+
+Running v1.5.0 on real data exposed a gap that predates it. purge_dups removes
+haplotigs by sequence similarity and read depth and has no notion of gene
+content, so it can remove the only copy of a locus — and **nothing downstream
+would notice**. The 12F BUSCO trial gates *pool replacements*, not purging. The
+12L do-no-harm check compares assembly size and telomere counts, and its size
+rule explicitly *approves* a shrink that moves toward the declared genome size,
+which is exactly what a purge does.
+
+On *Puccinia triticina*, purging a peregrine backbone removed 39 haplotigs and
+25.7 Mb, took BUSCO complete from **95.6% to 92.5%**, raised the T2T count from 4
+to 6, and reported "final assembly quality OK".
+
+This matters more from v1.5.0 on, and the release is what made it visible.
+Backbone selection now tolerates a duplicated backbone *because purge_dups is
+expected to clean it up*, which deliberately routes more sequence through the
+unguarded step. The premise that duplication is "fixable, so don't pay for it at
+selection" only holds if the fixing step is safe.
+
+- **New gate at 12H.** purge_dups is accepted only if BUSCO complete falls by no
+  more than the taxon tolerance already used by the rescue trial — 2.0 points for
+  fungi, 4.0 for plants, 3.0 for vertebrates, 2.5 otherwise. On the run above
+  that rejects the purge. A rejected purge keeps the unpurged assembly; the
+  purged version and the removed haplotigs are preserved for review, and
+  `STEP12_SKIP_PURGE_BUSCO_GATE=1` forces the old behavior.
+- **The threshold table now lives in one place** (`_busco_delta_thresholds`), so
+  a value tuned for the rescue trial cannot silently disagree with the purge gate.
+- **12L reports gene content.** It reads the summary BUSCO already wrote, so the
+  comparison costs nothing, and it warns when the drop exceeds the same tolerance.
+
+The honest summary of the v1.5.0 primary genome on this data set is therefore
+*better contiguity and consensus accuracy, worse gene completeness* — 35 contigs
+against 117 and QV 76.8 against 47.9, but BUSCO complete 92.5% against 96.2%.
+With this gate the purge that caused the loss is rejected, so the trade-off
+should not recur; the run that produced those numbers predates the gate.
+
 ### Robustness fixes found by running it
 
 **An external command could hang a run forever.** `run_cmd` had no time limit,
