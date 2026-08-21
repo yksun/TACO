@@ -966,6 +966,119 @@ def test_do_no_harm_checks_gene_content():
     assert "BUSCO complete" in blk
 
 
+# ── full mode needs candidates that actually retain alternate sequence ───────
+#
+# Several assemblers emit more than one contig set and TACO used only the
+# primary, so `--assembly-mode full` chose among assemblies that had all been
+# reduced to one representation before it saw them. On real P. triticina data
+# hifiasm and IPA reported 5.2% and 6.9% BUSCO duplication while canu and LJA
+# reported 91.2% and 95.9% -- the full-representation winner was decided by
+# which assemblers collapse by default, not by which recovers alternate
+# sequence best. hifiasm had already written bp.hap1.p_ctg and bp.hap2.p_ctg,
+# and IPA a_ctg.fasta; both were discarded.
+
+def test_derived_candidates_are_registered_with_their_parent():
+    from taco.utils import ALL_ASSEMBLERS, DERIVED_ASSEMBLERS
+    assert DERIVED_ASSEMBLERS == {"hifiasm_hap": "hifiasm", "ipa_alt": "ipa"}
+    for child, parent in DERIVED_ASSEMBLERS.items():
+        assert child in ALL_ASSEMBLERS, child
+        assert parent in ALL_ASSEMBLERS, parent
+
+
+def test_a_derived_candidate_does_not_vote_beside_its_parent():
+    """One vote per INDEPENDENT assembly: a derived set shares its parent's
+    graph, reads and error profile, so two ballots would inflate agreement."""
+    from taco.utils import concordance_voters
+    got = concordance_voters(["canu", "hifiasm", "hifiasm_hap", "ipa",
+                              "ipa_alt", "lja"])
+    assert got == ["canu", "hifiasm", "ipa", "lja"], got
+    # parents keep voting even when the child is absent
+    assert concordance_voters(["hifiasm", "canu"]) == ["hifiasm", "canu"]
+
+
+def test_derived_candidates_are_still_selectable():
+    """They must compete for the backbone -- only the VOTE is withheld."""
+    from taco.utils import DERIVED_ASSEMBLERS, EXCLUDED_FROM_BACKBONE
+    for child in DERIVED_ASSEMBLERS:
+        assert child not in EXCLUDED_FROM_BACKBONE, child
+
+
+def test_concordance_applies_the_voter_filter():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index("def _t2t_concordance_check"):]
+    blk = blk[:blk.index("\ndef ", 1)]
+    assert "asms = concordance_voters(asms)" in blk, (
+        "the voter filter is imported but never applied")
+
+
+def test_normalize_knows_where_the_derived_outputs_live():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    for path in ("hifiasm/hifiasm.hap.fasta",
+                 "ipa/assembly-results/ipa.alt.fasta"):
+        assert path in src, path
+
+
+def test_hifiasm_haplotype_set_is_built_from_both_haplotypes():
+    """It must combine hap1 AND hap2; either alone is not the full set."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    fn = src[src.index("def _emit_hifiasm_haplotype_set"):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    assert 'for hap in ("hap1", "hap2")' in fn
+    assert "bp.{hap}.p_ctg.gfa" in fn
+
+
+def test_concat_fasta_never_fuses_records_across_a_missing_newline():
+    """A source FASTA without a trailing newline would otherwise glue its last
+    sequence line onto the next file's header, producing one fused contig with a
+    '>' buried in its sequence. A contig count alone would not reveal it."""
+    import tempfile
+    from taco import steps as st
+
+    class R:
+        def log_info(self, m): pass
+        def log_warn(self, m): pass
+
+    cases = [(">h1tg1\nACGTACGT",   ">h2tg1\nTTTTGGGG\n"),   # first lacks one
+             (">h1tg1\nACGTACGT\n", ">h2tg1\nTTTTGGGG\n"),   # both fine
+             (">h1tg1\nACGTACGT",   ">h2tg1\nTTTTGGGG")]      # neither
+    for a_txt, b_txt in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.fa")
+            b = os.path.join(tmp, "b.fa")
+            out = os.path.join(tmp, "out.fa")
+            open(a, "w").write(a_txt)
+            open(b, "w").write(b_txt)
+            assert st._concat_fasta(R(), [a, b], out, "t") is True
+            text = open(out).read()
+            lines = text.split("\n")
+            assert len([l for l in lines if l.startswith(">")]) == 2, text
+            fused = [l for l in lines if ">" in l and not l.startswith(">")]
+            assert not fused, f"header fused into sequence: {fused}"
+
+
+def test_concat_fasta_combines_only_what_exists():
+    import tempfile
+    from taco import steps as st
+
+    class R:
+        def log_info(self, m): pass
+        def log_warn(self, m): pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        a = os.path.join(tmp, "a.fa")
+        b = os.path.join(tmp, "b.fa")
+        out = os.path.join(tmp, "out.fa")
+        open(a, "w").write(">h1tg1\nACGT\n")
+        # b deliberately absent
+        assert st._concat_fasta(R(), [a, b], out, "t") is True
+        assert open(out).read() == ">h1tg1\nACGT\n"
+        # nothing present at all -> no file claimed
+        assert st._concat_fasta(R(), [b], os.path.join(tmp, "x.fa"), "t") is False
+
+
 def test_policy_rejects_an_unknown_mode():
     try:
         AssemblyPolicy(mode="phased")

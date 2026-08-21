@@ -24,7 +24,9 @@ from collections import defaultdict
 from taco import policy
 from taco.telomere_detect import detect_telomeres, write_detection_outputs
 from taco.clustering import cluster_and_select
-from taco.utils import ALL_ASSEMBLERS, EXCLUDED_FROM_BACKBONE, active_assemblers
+from taco.utils import (ALL_ASSEMBLERS, DERIVED_ASSEMBLERS,
+                        EXCLUDED_FROM_BACKBONE, active_assemblers,
+                        concordance_voters)
 from taco.concordance import (split_vote, concordance_verdict,
                               corroborated_t2t_count, detect_fusions)
 from taco.purify import (DEPTH_RATIO_MAX, DEPTH_RATIO_MAX_FULL,
@@ -1049,6 +1051,7 @@ def step_04_ipa(runner):
     if result.returncode != 0:
         runner.log_warn("Step 4: IPA failed. Skipping. Check logs/step_4.log for details.")
         return
+    _emit_ipa_alternate_set(runner)
     _log_file_status(runner, "ipa/assembly-results/final.p_ctg.fasta",
                      "IPA assembly output")
 
@@ -1129,6 +1132,7 @@ def step_06_hifiasm(runner):
         else:
             _log_file_status(runner, "hifiasm/hifiasm.fasta",
                              "Hifiasm assembly output")
+        _emit_hifiasm_haplotype_set(runner)
     else:
         runner.log_warn("Step 6: hifiasm primary contig GFA not found (hifiasm.asm.bp.p_ctg.gfa). "
                         "Assembly may have failed or produced no output.")
@@ -1451,6 +1455,94 @@ def _raven_thread_flag(help_text):
     return None
 
 
+def _concat_fasta(runner, sources, dest, label):
+    """Concatenate existing FASTA *sources* into *dest*; return True if written.
+
+    Used to build a derived candidate from contig sets the assembler already
+    produced.  Contig names carry set-specific prefixes (hifiasm h1tg/h2tg, IPA
+    ctg/actg), so concatenation cannot collide; step 10 renames them again
+    anyway.
+    """
+    present = [p for p in sources
+               if os.path.isfile(p) and os.path.getsize(p) > 0]
+    if not present:
+        return False
+    try:
+        with open(dest, "w") as out:
+            for p in present:
+                with open(p) as fh:
+                    shutil.copyfileobj(fh, out)
+                # Guarantee a record boundary. A source FASTA that does not end
+                # in a newline would otherwise glue its last sequence line onto
+                # the next file's header, producing one fused contig with a '>'
+                # buried inside its sequence -- silent corruption that a contig
+                # count alone would not reveal. Checked on the SOURCE, because
+                # *dest* is open write-only.
+                with open(p, "rb") as tail:
+                    tail.seek(-1, os.SEEK_END)
+                    if tail.read(1) != b"\n":
+                        out.write("\n")
+    except OSError as e:
+        runner.log_warn(f"{label}: could not write {dest}: {e}")
+        return False
+    if os.path.getsize(dest) == 0:
+        return False
+    runner.log_info(f"{label}: combined {len(present)} contig set(s) -> {dest}")
+    return True
+
+
+def _emit_hifiasm_haplotype_set(runner):
+    """Convert hifiasm's hap1 + hap2 GFAs into one haplotype-retaining FASTA.
+
+    hifiasm writes these beside the primary contig set in the SAME run, so this
+    costs no extra assembly.  They are the alternate sequence a full
+    representation is asking for, and TACO previously discarded them.
+    """
+    parts = []
+    for hap in ("hap1", "hap2"):
+        gfa = f"hifiasm/hifiasm.asm.bp.{hap}.p_ctg.gfa"
+        if not (os.path.isfile(gfa) and os.path.getsize(gfa) > 0):
+            continue
+        fa = f"hifiasm/hifiasm.{hap}.fasta"
+        cmd = (f"cd hifiasm && awk '/^S/{{print \">\"$2; print $3}}' "
+               f"hifiasm.asm.bp.{hap}.p_ctg.gfa > hifiasm.{hap}.fasta")
+        if runner.run_cmd(cmd, desc=f"Converting hifiasm {hap} GFA to FASTA",
+                          check=False).returncode == 0:
+            parts.append(fa)
+    if not parts:
+        runner.log_info(
+            "hifiasm: no hap1/hap2 contig sets found; no haplotype-retaining "
+            "candidate emitted (hifiasm only writes them when it can separate "
+            "the haplotypes)")
+        return
+    _concat_fasta(runner, parts, "hifiasm/hifiasm.hap.fasta",
+                  "hifiasm haplotype-retaining candidate")
+
+
+def _emit_ipa_alternate_set(runner):
+    """Combine IPA's primary and associate contigs into one candidate.
+
+    ``a_ctg.fasta`` is IPA's associate (alternate) contig set, written by the
+    same run as ``final.p_ctg.fasta``.  Primary alone is a collapsed
+    representation; primary + associate is the retentive one.
+    """
+    primary = "ipa/assembly-results/final.p_ctg.fasta"
+    alts = ["ipa/assembly-results/final.a_ctg.fasta",
+            "ipa/10-assemble/a_ctg.fasta"]
+    alt = next((p for p in alts
+                if os.path.isfile(p) and os.path.getsize(p) > 0), None)
+    if not (os.path.isfile(primary) and os.path.getsize(primary) > 0):
+        return
+    if alt is None:
+        runner.log_info(
+            "ipa: no associate contig set (a_ctg) found; no "
+            "alternate-retaining candidate emitted")
+        return
+    _concat_fasta(runner, [primary, alt],
+                  "ipa/assembly-results/ipa.alt.fasta",
+                  "ipa alternate-retaining candidate")
+
+
 def step_10_normalize(runner, embedded=False):
     """Copy and normalize all assembler outputs.
 
@@ -1477,6 +1569,11 @@ def step_10_normalize(runner, embedded=False):
                   "./temp/assemblers/flye/assembly.fasta"]),
         ("hifiasm", ["./hifiasm/hifiasm.fasta",
                      "./temp/assemblers/hifiasm/hifiasm.fasta"]),
+        # Derived candidates: alternate contig sets the parent run already wrote.
+        ("hifiasm_hap", ["./hifiasm/hifiasm.hap.fasta",
+                         "./temp/assemblers/hifiasm/hifiasm.hap.fasta"]),
+        ("ipa_alt", ["./ipa/assembly-results/ipa.alt.fasta",
+                     "./temp/assemblers/ipa/assembly-results/ipa.alt.fasta"]),
         ("lja", ["./lja_out/assembly.fasta",
                  "./temp/assemblers/lja_out/assembly.fasta"]),
         ("mbg", ["./mbg_out/mbg.fasta",
@@ -1639,6 +1736,8 @@ def step_09_telomere(runner):
             ("ipa", "./ipa/assembly-results/final.p_ctg.fasta"),
             ("flye", "./flye/assembly.fasta"),
             ("hifiasm", "./hifiasm/hifiasm.fasta"),
+            ("hifiasm_hap", "./hifiasm/hifiasm.hap.fasta"),
+            ("ipa_alt", "./ipa/assembly-results/ipa.alt.fasta"),
             ("lja", "./lja_out/assembly.fasta"),
             ("mbg", "./mbg_out/mbg.fasta"),
             ("raven", "./raven_out/raven.fasta"),
@@ -3241,6 +3340,16 @@ def _t2t_concordance_check(runner):
         if name.lower() in skip or os.path.getsize(fa) == 0:
             continue
         asms.append(name)
+    # A derived candidate shares a graph, a read set and an error profile with
+    # its parent, so letting both vote would count one opinion twice and inflate
+    # agreement.  The parent votes; the derived candidate is still scored and
+    # can still be selected, it just does not get a second ballot.
+    _dropped = [a for a in asms if a not in concordance_voters(asms)]
+    asms = concordance_voters(asms)
+    if _dropped:
+        runner.log_info(
+            f"T2T concordance: {', '.join(_dropped)} excluded from voting "
+            f"(derived from another candidate, so not independent evidence)")
     if len(asms) < 2:
         runner.log_info("Fewer than two assemblies available; "
                         "T2T concordance check needs at least two")

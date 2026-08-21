@@ -35,6 +35,39 @@ objectives disagree, so `AssemblyPolicy.sub_policies()` hands out one policy per
 deliverable and asking a `both` policy whether purge_dups may run raises rather
 than guessing.
 
+### Full mode now has candidates that actually retain alternate sequence
+
+`--assembly-mode full` selected among assemblies that had **all been reduced to
+one representation before it ever saw them**. Several assemblers emit more than
+one contig set and TACO used only the primary:
+
+| assembler | also wrote | TACO used | now |
+|---|---|---|---|
+| hifiasm | `bp.hap1.p_ctg.gfa`, `bp.hap2.p_ctg.gfa` | `bp.p_ctg.gfa` only | `hifiasm_hap` = hap1 + hap2 |
+| IPA | `a_ctg.fasta` (associate contigs) | `final.p_ctg.fasta` only | `ipa_alt` = primary + associate |
+
+The consequence is visible in the real data: hifiasm and IPA reported 5.2% and
+6.9% BUSCO duplication while canu and LJA reported 91.2% and 95.9%. The
+full-representation winner was therefore decided by **which assemblers happen to
+collapse haplotypes in their default configuration**, not by which recovers
+alternate sequence best — and hifiasm and IPA had already produced exactly the
+sequence the mode wants, then had it thrown away.
+
+Both derived candidates cost **no extra assembly**: the files exist as soon as
+the parent finishes. They are scored and selectable like any other candidate.
+
+**They do not get a second vote.** The cross-assembler concordance check assumes
+one ballot per independent assembly, and a derived candidate shares a graph, a
+read set and an error profile with its parent — counting both would inflate
+agreement and weaken the chimera evidence the vote exists to provide. The parent
+votes; the derived candidate is scored but excluded from voting, and the run log
+says which candidates were dropped and why.
+
+Flye's `--keep-haplotypes` is a genuine third case but it changes the assembly
+rather than reading a file that already exists, so it needs a reassembly and is
+not enabled here. Assemblies produced before this release have no derived
+candidates; re-run steps 4, 6 and 10 to generate them.
+
 ### purge_dups can no longer remove complete genes unnoticed
 
 Running v1.5.0 on real data exposed a gap that predates it. purge_dups removes

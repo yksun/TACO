@@ -19,7 +19,40 @@ from collections import defaultdict
 ALL_ASSEMBLERS = [
     "canu", "reference", "compare", "flye", "ipa", "nextDenovo",
     "peregrine", "hifiasm", "lja", "mbg", "raven",
+    # Derived candidates; see DERIVED_ASSEMBLERS.
+    "hifiasm_hap", "ipa_alt",
 ]
+
+# Candidates assembled from the ALTERNATE output of a run that already happened,
+# mapped to the assembler that produced them.
+#
+# Several assemblers emit more than one contig set. hifiasm writes
+# bp.hap1.p_ctg and bp.hap2.p_ctg beside the primary bp.p_ctg; IPA writes
+# a_ctg.fasta (associate contigs) beside final.p_ctg.fasta. TACO used only the
+# primary file and discarded the rest, which meant `--assembly-mode full` chose
+# among assemblies that had all been reduced to one representation before it ever
+# saw them: on real Puccinia triticina data hifiasm and IPA reported 5.2% and
+# 6.9% BUSCO duplication while canu and LJA reported 91.2% and 95.9%, so the
+# full-representation winner was decided by which assemblers happen to collapse
+# by default rather than by which recovers alternate sequence best.
+#
+# These candidates cost no extra assembly: the files already exist when the
+# parent finishes.
+DERIVED_ASSEMBLERS = {
+    "hifiasm_hap": "hifiasm",   # hap1 + hap2 contig sets
+    "ipa_alt": "ipa",           # primary + associate contigs
+}
+
+
+def concordance_voters(names):
+    """Filter *names* to assemblies that are independent evidence.
+
+    The cross-assembler vote assumes one vote per independent assembly. A
+    derived candidate shares a graph, a read set and an error profile with its
+    parent, so letting both vote would count the same opinion twice and inflate
+    agreement. The parent votes; the derived candidate does not.
+    """
+    return [n for n in names if n not in DERIVED_ASSEMBLERS]
 
 # --compare is the only fully passive entry: it appears in QC tables and
 # the contig-to-contig report (step 14C) but never participates in backbone

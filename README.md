@@ -521,6 +521,32 @@ full`. This is a prompt to look, not a biological conclusion: these metrics alon
 do not establish the ploidy of the sample, and the warning does not claim they
 do.
 
+### Derived candidates: alternate contig sets
+
+Several assemblers emit more than one contig set, and the extra sets are exactly
+what a full representation wants. TACO captures them as additional candidates at
+no extra assembly cost, because the parent run already wrote them:
+
+| candidate | built from | parent |
+|---|---|---|
+| `hifiasm_hap` | `bp.hap1.p_ctg` + `bp.hap2.p_ctg` | hifiasm |
+| `ipa_alt` | `final.p_ctg` + `a_ctg` (associate contigs) | IPA |
+
+Without them, `--assembly-mode full` chooses among assemblies that were all
+collapsed to one representation first, so its answer reflects which assemblers
+purge by default rather than which recover alternate sequence best.
+
+Derived candidates are scored and selectable like any other. They are **excluded
+from the cross-assembler concordance vote**: that check assumes one ballot per
+independent assembly, and a derived set shares its parent's graph, reads and
+error profile, so two ballots would inflate agreement. The parent votes; the log
+names any candidate dropped from voting.
+
+Flye's `--keep-haplotypes` is a third case, but it changes the assembly rather
+than reading an existing file, so it needs a reassembly and is not enabled by
+default. Runs made before v1.5.0 have no derived candidates — re-run steps 4, 6
+and 10 to generate them.
+
 ### Gene content is protected against purging
 
 purge_dups removes haplotigs by similarity and depth, with no notion of genes,
