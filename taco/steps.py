@@ -1594,7 +1594,12 @@ def step_08_busco(runner):
             runner.log_info(
                 f"Existing BUSCO dir for {base} does not match requested "
                 f"lineage '{lineage}' → wiping and re-running")
-            shutil.rmtree(f"busco/{base}")
+            # May be a symlink when a working directory shares results;
+            # rmtree refuses those, so drop the link instead.
+            if os.path.islink(f"busco/{base}"):
+                os.unlink(f"busco/{base}")
+            else:
+                shutil.rmtree(f"busco/{base}")
 
         runner.log_info(f"BUSCO on {base} (lineage={lineage}, threads={runner.threads})")
         runner.log_version("busco", "busco")
@@ -7173,7 +7178,12 @@ def _final_busco_qc(runner):
     # Remove old BUSCO output so we get fresh results.
     for old_dir in ["busco/final", "busco/run_final"]:
         if os.path.isdir(old_dir):
-            shutil.rmtree(old_dir)
+            # May be a symlink when a working directory shares results;
+            # rmtree refuses those, so drop the link instead.
+            if os.path.islink(old_dir):
+                os.unlink(old_dir)
+            else:
+                shutil.rmtree(old_dir)
             runner.log(f"  Removed stale BUSCO cache: {old_dir}")
 
     if True:
@@ -8154,6 +8164,12 @@ def _write_representation_note(runner, out_dir, contig_rows):
             f"Compare assembly appears to be a different representation: "
             f"{100*frac:.0f}% of its chromosome-scale contigs share a best target. "
             f"See {os.path.basename(path)} before reading 'split' labels as mis-joins.")
+
+
+#: Wall-clock limit for the optional MUMmer dnadiff summary in the compare
+#: report.  It is a convenience table, so it must never hold up a run; see the
+#: call site for why this one needs a deadline at all.
+DNADIFF_TIMEOUT_SEC = int(os.environ.get("TACO_DNADIFF_TIMEOUT", 3600))
 
 
 def _compare_vs_final_report(runner):
@@ -9232,14 +9248,36 @@ def _compare_vs_final_report(runner):
             f"({telo_src}); skipping telomere detail copy.")
 
     # ---- Optional dnadiff (MUMmer) for SNP/indel summary ----
+    #
+    # Time-bounded. dnadiff's `delta-filter -1` stage solves a 1-to-1 alignment
+    # selection whose cost explodes with the number of alignments, and a
+    # repeat-rich genome compared against a diverged assembly produces a great
+    # many. On a real run a 959 MB delta file left delta-filter burning a full
+    # core for 19 h with a zero-byte output, blocking step 14 behind an
+    # OPTIONAL add-on; two further orphans from earlier runs had been going for
+    # 8 and 11 days. The summary is a convenience, so it gets a deadline and the
+    # report proceeds without it.
     if shutil.which("dnadiff"):
         dna_dir = os.path.join(out_dir, "compare_dnadiff")
         os.makedirs(dna_dir, exist_ok=True)
         cmd = (f"cd {dna_dir} && dnadiff -p out "
                f"{os.path.relpath(compare_fa, dna_dir)} "
                f"{os.path.relpath(final_fa, dna_dir)}")
-        runner.run_cmd(cmd, desc="dnadiff: final vs compare", check=False)
-        runner.log(f"Wrote {dna_dir}/out.report")
+        res = runner.run_cmd(cmd, desc="dnadiff: final vs compare", check=False,
+                             timeout=DNADIFF_TIMEOUT_SEC)
+        report = os.path.join(dna_dir, "out.report")
+        if res.returncode == 124:
+            runner.log_warn(
+                f"dnadiff exceeded its {DNADIFF_TIMEOUT_SEC}s limit and was "
+                f"abandoned; the rest of the compare report is unaffected. "
+                f"Raise TACO_DNADIFF_TIMEOUT to allow longer, or ignore it: the "
+                f"minimap2-based tables in this directory do not depend on it.")
+        elif os.path.isfile(report):
+            runner.log(f"Wrote {report}")
+        else:
+            runner.log_warn(
+                f"dnadiff exited {res.returncode} without writing {report}; "
+                f"continuing without the MUMmer SNP/indel summary.")
     else:
         runner.log_info(
             "Compare report: dnadiff not found; skipping MUMmer SNP/indel summary "

@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 import shutil
+import signal
 import gzip
 import socket
 import csv
@@ -257,8 +258,19 @@ class PipelineRunner:
     # ------------------------------------------------------------------ #
     # Command execution
     # ------------------------------------------------------------------ #
-    def run_cmd(self, cmd, desc=None, check=True):
-        """Run an external command. cmd may be a string (shell) or list."""
+    def run_cmd(self, cmd, desc=None, check=True, timeout=None):
+        """Run an external command. cmd may be a string (shell) or list.
+
+        *timeout* bounds the wall-clock time in seconds. On expiry the command's
+        whole PROCESS GROUP is killed, not just the immediate child: a shell
+        pipeline leaves its real worker as a grandchild, so killing only the
+        child abandons that worker to run forever. This was observed on a real
+        machine, where MUMmer `delta-filter` processes from abandoned `dnadiff`
+        runs had each been burning a core for 8 and 11 days.
+
+        A timed-out command is reported as a failure (returncode 124, as
+        coreutils `timeout` does) and obeys *check* like any other failure.
+        """
         if desc:
             self.log(desc)
         if isinstance(cmd, list):
@@ -266,18 +278,54 @@ class PipelineRunner:
         else:
             display = cmd
         self.log(f"$ {display}")
+        if timeout:
+            self.log_info(f"Time limit: {timeout}s")
         start = time.time()
-        result = subprocess.run(
+        # start_new_session puts the child in its own process group so the whole
+        # tree can be signalled on timeout.
+        proc = subprocess.Popen(
             cmd,
             shell=isinstance(cmd, str),
-            capture_output=False,
+            start_new_session=True,
         )
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._kill_process_group(proc, display, timeout)
         elapsed = time.time() - start
-        self.log(f"Command exit={result.returncode} elapsed={elapsed:.1f}s")
-        if check and result.returncode != 0:
-            self.log_error(f"Command failed (exit {result.returncode}): {display}")
-            sys.exit(result.returncode)
-        return result
+        returncode = 124 if timed_out else proc.returncode
+        self.log(f"Command exit={returncode} elapsed={elapsed:.1f}s")
+        if check and returncode != 0:
+            self.log_error(f"Command failed (exit {returncode}): {display}")
+            sys.exit(returncode)
+        return subprocess.CompletedProcess(cmd, returncode)
+
+    def _kill_process_group(self, proc, display, timeout):
+        """SIGTERM then SIGKILL the timed-out command's whole process group."""
+        self.log_warn(
+            f"Command exceeded its {timeout}s time limit and was abandoned: "
+            f"{display}")
+        # Read the group id ONCE. Re-reading it after signalling races with the
+        # process exiting, and a ProcessLookupError on this path would turn a
+        # handled timeout into a crash.
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            return                      # already gone; nothing to signal
+        for sig, label, grace in ((signal.SIGTERM, "SIGTERM", 10),
+                                  (signal.SIGKILL, "SIGKILL", 5)):
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError):
+                return
+            self.log_info(f"Sent {label} to process group {pgid}")
+            try:
+                proc.wait(timeout=grace)
+                return
+            except subprocess.TimeoutExpired:
+                continue
 
     def require_cmd(self, name):
         """Return True if *name* is on PATH, else print warning and return False."""
@@ -1655,6 +1703,19 @@ nextgraph_options = -a 1
     #: rather than the directory itself, because the per-mode steps add their
     #: own entries (busco/final, merqury/final) alongside them.
     SHARED_LINK_DIRS = ("busco", "merqury", "assemblies/concordance")
+    #: Label steps 13 and 14 use for the assembly a run DELIVERS, as opposed to
+    #: the assemblies it evaluates.  Products under this label belong to one
+    #: representation and must never be shared between them: linking them would
+    #: give both deliverables the same final QC results, and the first attempt to
+    #: refresh one would try to remove a symlink.
+    DELIVERABLE_LABEL = "final"
+
+    @classmethod
+    def _is_deliverable_product(cls, name):
+        base = os.path.basename(name)
+        return (base == cls.DELIVERABLE_LABEL
+                or base.startswith(cls.DELIVERABLE_LABEL + ".")
+                or base.startswith(cls.DELIVERABLE_LABEL + "_"))
 
     def _prepare_mode_workspace(self, mode):
         """Create ``mode_<mode>/`` sharing every step 0-10 product.
@@ -1676,13 +1737,19 @@ nextgraph_options = -a 1
             except OSError as e:
                 self.log_warn(f"could not link {src_abs} -> {dst}: {e}")
 
-        n_link = n_copy = 0
+        n_link = n_copy = n_skip = 0
         for pattern in self.SHARED_LINK_GLOBS:
             for src in glob.glob(pattern):
+                if self._is_deliverable_product(src):
+                    n_skip += 1
+                    continue
                 _link(os.path.abspath(src), os.path.join(ws, src))
                 n_link += 1
         for pattern in self.SHARED_COPY_GLOBS:
             for src in glob.glob(pattern):
+                if self._is_deliverable_product(src):
+                    n_skip += 1
+                    continue
                 dst = os.path.join(ws, src)
                 os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
                 shutil.copy2(src, dst)
@@ -1692,12 +1759,16 @@ nextgraph_options = -a 1
                 continue
             os.makedirs(os.path.join(ws, d), exist_ok=True)
             for entry in os.listdir(d):
+                if self._is_deliverable_product(entry):
+                    n_skip += 1
+                    continue
                 _link(os.path.abspath(os.path.join(d, entry)),
                       os.path.join(ws, d, entry))
                 n_link += 1
 
         self.log_info(f"mode_{mode}/: {n_link} shared products linked, "
-                      f"{n_copy} copied")
+                      f"{n_copy} copied, {n_skip} deliverable product(s) left "
+                      f"for this representation to build")
         return ws
 
     #: Runner attributes holding paths supplied from outside the working
@@ -1747,7 +1818,7 @@ nextgraph_options = -a 1
         root_policy = self.policy
         self._mark_root_results_in_flight(
             [p.mode for p in root_policy.sub_policies()])
-        delivered = []
+        delivered, failed = [], []
         try:
             for sub in root_policy.sub_policies():
                 mode = sub.mode
@@ -1762,6 +1833,18 @@ nextgraph_options = -a 1
                 try:
                     self._run_step_list(per_mode, step_functions)
                     delivered.append((mode, ws))
+                # The representations are independent products, so one failing
+                # must not cancel the other -- these runs take days, and a
+                # failure in the first previously meant the second never began.
+                # SystemExit is caught explicitly because _run_step_list exits
+                # rather than raising on a failed step, and SystemExit does not
+                # derive from Exception.
+                except (Exception, SystemExit) as e:
+                    failed.append((mode, e))
+                    self.log_error(
+                        f"Deliverable {mode} failed ({e}); continuing with the "
+                        f"remaining representation(s). Its partial output is in "
+                        f"{ws}.")
                 finally:
                     os.chdir(root)
                     self.assembly_mode, self.policy = root_mode, root_policy
@@ -1772,6 +1855,20 @@ nextgraph_options = -a 1
             self.logs_dir = root_logs
 
         self._write_both_modes_report(delivered)
+
+        if failed:
+            for mode, e in failed:
+                self.log_error(f"Deliverable {mode} did not complete: {e}")
+            if delivered:
+                self.log_warn(
+                    f"{len(delivered)} of {len(delivered) + len(failed)} "
+                    f"representations completed: "
+                    f"{', '.join(m for m, _ in delivered)}. Re-run the failed "
+                    f"one with --assembly-mode <mode> once the cause is fixed; "
+                    f"completed work is preserved in its mode_* directory.")
+            self.run_end_ts = datetime.now()
+            self.write_benchmark_summary()
+            sys.exit(1)
 
     #: Written at the run root while the per-mode phase is in flight, so a
     #: pre-existing final_results/ from an earlier run cannot be mistaken for

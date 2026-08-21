@@ -520,9 +520,20 @@ def _runner_for_report():
             self.policy = AssemblyPolicy(mode=MODE_BOTH, taxon="fungal")
             self.run_id = "TEST"
             self.logged = []
+            self.benchmark = False
+            self.steps = []
+            self.logs_dir = "logs"
+            self.assembly_only = False
         def log(self, m): self.logged.append(m)
         def log_info(self, m): self.logged.append(m)
         def log_warn(self, m): self.logged.append(m)
+        def log_error(self, m): self.logged.append(m)
+        # The step loop records timings and restores resume inputs; neither is
+        # under test here.
+        def append_step_benchmark(self, *a, **k): pass
+        def write_benchmark_summary(self): pass
+        def restore_resume_inputs_for_step(self, step): pass
+        def warn_missing_step_inputs(self, step): pass
     return R()
 
 
@@ -577,6 +588,248 @@ def test_root_report_removes_the_in_flight_marker():
             assert "STILL IN PROGRESS" in text
             r._write_both_modes_report(delivered)
             assert not os.path.exists(marker)
+        finally:
+            os.chdir(cwd)
+
+
+def test_deliverable_products_are_never_shared_between_modes():
+    """Regression: a real run died on this, and would have corrupted results.
+
+    The mode workspace links step 0-10 products. It also linked busco/final,
+    merqury/final and assemblies/final.telo.fasta, which belong to whichever
+    representation PRODUCED them. Two consequences: step 13 tried to refresh
+    busco/final and hit `Cannot call rmtree on a symbolic link`, and had it not
+    crashed, both deliverables would have written their final QC through the same
+    links -- silently reporting one representation's metrics for the other.
+    """
+    from taco.pipeline import PipelineRunner as P
+    for name in ("final", "final.telo.fasta", "final.busco.stdout.log",
+                 "final_result.csv", "busco/final", "merqury/final"):
+        assert P._is_deliverable_product(name), name
+    for name in ("canu", "ipa.result.fasta", "compare", "peregrine.telo.fasta",
+                 "assembly_info.csv", "finalize.txt", "semifinal"):
+        assert not P._is_deliverable_product(name), name
+
+
+def test_mode_workspace_skips_deliverable_products():
+    import tempfile
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "assemblies"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "busco", "final"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "busco", "ipa"), exist_ok=True)
+        for n in ("ipa.result.fasta", "ipa.telo.fasta", "final.telo.fasta"):
+            open(os.path.join(tmp, "assemblies", n), "w").write(">x\nA\n")
+        try:
+            os.chdir(tmp)
+            r = _runner_for_report()
+            ws = r._prepare_mode_workspace("primary")
+            assert os.path.lexists(os.path.join(ws, "assemblies", "ipa.result.fasta"))
+            assert os.path.lexists(os.path.join(ws, "busco", "ipa"))
+            # the deliverable products must be absent, so this run builds its own
+            assert not os.path.lexists(os.path.join(ws, "assemblies", "final.telo.fasta"))
+            assert not os.path.lexists(os.path.join(ws, "busco", "final"))
+        finally:
+            os.chdir(cwd)
+
+
+def test_stale_busco_dir_can_be_a_symlink():
+    """The wipe path must not raise when the stale result is a link."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    assert "Cannot call rmtree" not in src
+    assert src.count("if os.path.islink(") >= 2, (
+        "rmtree sites are not guarded against symlinks")
+
+
+# ── external commands must be time-boundable ─────────────────────────────────
+
+def test_run_cmd_kills_the_whole_process_group_on_timeout():
+    """Regression: an optional add-on hung a run and orphaned CPU-burning children.
+
+    dnadiff's delta-filter stage ran 19 h on a 959 MB delta with a zero-byte
+    output, blocking step 14 behind an OPTIONAL table; two orphans from earlier
+    runs had been going 8 and 11 days. Killing only the immediate child is not
+    enough -- a shell pipeline's real worker is a grandchild -- so the whole
+    process group must go.
+    """
+    import subprocess as sp
+    import tempfile
+    from taco.pipeline import PipelineRunner
+
+    class R(PipelineRunner):
+        def __init__(self):
+            self.logged = []
+        def log(self, m): self.logged.append(m)
+        def log_info(self, m): self.logged.append(m)
+        def log_warn(self, m): self.logged.append(m)
+        def log_error(self, m): self.logged.append(m)
+
+    r = R()
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = os.path.join(tmp, "still_running")
+        # A shell that backgrounds a grandchild which would outlive a naive kill.
+        cmd = (f"sh -c 'while :; do echo x >> {marker}; sleep 0.2; done' & "
+               f"wait")
+        res = r.run_cmd(cmd, check=False, timeout=2)
+        assert res.returncode == 124, res.returncode
+        assert any("time limit" in m for m in r.logged), r.logged
+        size_after_kill = os.path.getsize(marker) if os.path.exists(marker) else 0
+        # give any survivor a chance to keep writing
+        sp.run(["sh", "-c", "sleep 2"], check=False)
+        grew = ((os.path.getsize(marker) if os.path.exists(marker) else 0)
+                > size_after_kill)
+        assert not grew, "a grandchild survived the timeout kill"
+
+
+def test_run_cmd_without_a_timeout_is_unchanged():
+    from taco.pipeline import PipelineRunner
+
+    class R(PipelineRunner):
+        def __init__(self): pass
+        def log(self, m): pass
+        def log_info(self, m): pass
+        def log_warn(self, m): pass
+        def log_error(self, m): pass
+
+    assert R().run_cmd("true", check=False).returncode == 0
+    assert R().run_cmd("false", check=False).returncode != 0
+
+
+def test_dnadiff_is_time_bounded_and_optional():
+    """It is a convenience table and must never hold up a run."""
+    from taco.steps import DNADIFF_TIMEOUT_SEC
+    assert 0 < DNADIFF_TIMEOUT_SEC <= 86400
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    call = src[src.index("Optional dnadiff"):]
+    call = call[:call.index("def ", 1)] if "def " in call[1:] else call[:4000]
+    assert "timeout=DNADIFF_TIMEOUT_SEC" in call
+    assert "check=False" in call, "a timed-out optional add-on must not fail the step"
+
+
+def test_one_failing_deliverable_does_not_cancel_the_other():
+    """Regression: it did, and it cost a day of compute.
+
+    A step-13 crash in the primary deliverable aborted the whole run, so
+    mode_full never started. The representations are independent products and a
+    run of this length must salvage the one that works. _run_step_list exits
+    rather than raising on a failed step, and SystemExit does not derive from
+    Exception, so it has to be caught explicitly.
+    """
+    import tempfile
+    cwd = os.getcwd()
+    attempted = []
+
+    def primary_explodes(runner):
+        attempted.append(runner.assembly_mode)
+        if runner.assembly_mode == "primary":
+            raise SystemExit(1)            # exactly how a failed step reports
+        os.makedirs("final_results", exist_ok=True)
+        import csv as _csv
+        with open(os.path.join("final_results", "final_result.csv"), "w",
+                  newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["Metric", "merged"])
+            w.writerow(["Selected assembler", "lja"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "assemblies"))
+        open(os.path.join(tmp, "assemblies", "ipa.result.fasta"), "w").write(">x\nA\n")
+        r = _runner_for_report()
+        r.steps = [11]
+        r.logs_dir = os.path.join(tmp, "logs")
+        try:
+            os.chdir(tmp)
+            try:
+                r._run_both_modes({11: primary_explodes})
+            except SystemExit as e:
+                # a failed deliverable must still make the RUN fail...
+                assert e.code == 1, e.code
+            else:
+                raise AssertionError("a failed deliverable must exit non-zero")
+            # ...but only after the other one was attempted and reported
+            assert attempted == ["primary", "full"], attempted
+            out = os.path.join("final_results", "final_result.csv")
+            assert os.path.isfile(out), "the surviving deliverable was not reported"
+            text = open(out).read()
+            assert "merged_full" in text, text
+            assert "merged_primary" not in text, text
+        finally:
+            os.chdir(cwd)
+
+
+def test_timeout_kill_reads_the_process_group_once():
+    """Regression: re-reading the pgid after signalling raced with process exit,
+    turning a handled timeout into an uncaught ProcessLookupError."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "pipeline.py")).read()
+    body = src[src.index("def _kill_process_group"):]
+    body = body[:body.index("\n    def ", 1)]
+    assert body.count("os.getpgid(") == 1, (
+        "the process group id must be read once, before signalling")
+    assert "os.killpg(pgid" in body
+
+
+def test_run_cmd_accepts_a_list_command_with_a_timeout():
+    from taco.pipeline import PipelineRunner
+
+    class R(PipelineRunner):
+        def __init__(self): pass
+        def log(self, m): pass
+        def log_info(self, m): pass
+        def log_warn(self, m): pass
+        def log_error(self, m): pass
+
+    assert R().run_cmd(["true"], check=False).returncode == 0
+    assert R().run_cmd(["sleep", "10"], check=False, timeout=1).returncode == 124
+
+
+def test_combined_report_survives_a_missing_deliverable_csv():
+    """A partially completed run must still produce a readable root table."""
+    import tempfile
+    import csv as _csv
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "assemblies"))
+        os.makedirs(os.path.join(tmp, "mode_primary", "final_results"))
+        with open(os.path.join(tmp, "assemblies", "assembly_info.csv"), "w",
+                  newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["Metric", "ipa"])
+            w.writerow(["BUSCO C (%)", 96.3])
+        with open(os.path.join(tmp, "mode_primary", "final_results",
+                               "final_result.csv"), "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["Metric", "merged"])
+            w.writerow(["BUSCO C (%)", 92.5])
+        try:
+            os.chdir(tmp)
+            _runner_for_report()._write_both_modes_report(
+                [("primary", os.path.join(tmp, "mode_primary")),
+                 ("full", os.path.join(tmp, "mode_full"))])   # full never ran
+            rows = list(_csv.reader(open(os.path.join("final_results",
+                                                      "final_result.csv"))))
+        finally:
+            os.chdir(cwd)
+    assert rows[0][-2:] == ["merged_primary", "merged_full"], rows[0]
+    assert rows[1][-2:] == ["92.5", ""], rows[1]
+
+
+def test_mode_workspace_preparation_is_idempotent():
+    """Resuming a deliverable re-runs it; it must not fail on existing links."""
+    import tempfile
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "assemblies"))
+        open(os.path.join(tmp, "assemblies", "ipa.result.fasta"), "w").write(">x\nA\n")
+        try:
+            os.chdir(tmp)
+            r = _runner_for_report()
+            a = r._prepare_mode_workspace("full")
+            b = r._prepare_mode_workspace("full")
+            assert a == b
+            assert os.path.lexists(os.path.join(b, "assemblies", "ipa.result.fasta"))
         finally:
             os.chdir(cwd)
 

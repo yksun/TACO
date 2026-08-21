@@ -35,6 +35,47 @@ objectives disagree, so `AssemblyPolicy.sub_policies()` hands out one policy per
 deliverable and asking a `both` policy whether purge_dups may run raises rather
 than guessing.
 
+### Robustness fixes found by running it
+
+**An external command could hang a run forever.** `run_cmd` had no time limit,
+and the optional MUMmer `dnadiff` summary in the compare report is the one place
+that matters: its `delta-filter -1` stage solves a 1-to-1 alignment selection
+whose cost explodes with the number of alignments, and a repeat-rich genome
+compared against a diverged assembly produces a great many. On a real run a
+959 MB delta file left `delta-filter` burning a full core for 19 hours with a
+zero-byte output, holding up step 14 behind an *optional* table. Two further
+orphans from earlier runs on the same machine had been going for 8 and 11 days.
+
+`run_cmd` now takes a `timeout`, and on expiry signals the command's whole
+**process group** rather than just the immediate child — a shell pipeline's real
+worker is a grandchild, which is exactly how those orphans outlived the runs that
+started them. A timed-out command reports exit 124, as coreutils `timeout` does.
+`dnadiff` is bounded at one hour, overridable with `TACO_DNADIFF_TIMEOUT`, and
+the compare report proceeds without it.
+
+**Deliverable-specific products were shared between representations.** The
+per-mode workspace linked the contents of `busco/` and `merqury/`, which included
+`busco/final`, `merqury/final` and `assemblies/final.telo.fasta` — the output of
+whichever representation produced them. Step 13's BUSCO refresh hit
+`Cannot call rmtree on a symbolic link`; worse, had it not failed, both
+deliverables would have written their final QC through the same links and the
+comparison table would have reported one representation's metrics as the other's.
+Products under the `final` label are now excluded from sharing so each
+representation builds its own, and both `rmtree` sites drop a symlink instead of
+failing on it.
+
+**A failure in one deliverable canceled the other.** `_run_step_list` exits
+rather than raising on a failed step, and `SystemExit` does not derive from
+`Exception`, so a crash in the primary representation aborted the whole run and
+the full one never started — costing a day of compute on a real run. The
+representations are independent products: each is now attempted, failures are
+reported per representation, the surviving deliverable is still written to the
+combined table, and the run exits non-zero.
+
+**A timeout could crash instead of being handled.** The process-group id was
+re-read after signaling, racing with the process exiting and raising an uncaught
+`ProcessLookupError` on the very path meant to recover. It is read once.
+
 ### One combined result table at the run root
 
 `final_results/final_result.csv` now carries the per-assembler columns from step

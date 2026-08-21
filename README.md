@@ -521,6 +521,21 @@ full`. This is a prompt to look, not a biological conclusion: these metrics alon
 do not establish the ploidy of the sample, and the warning does not claim they
 do.
 
+### If a deliverable fails
+
+Under `both` the two representations are independent products, so a failure in
+one does not cancel the other: each is attempted, the surviving genome is still
+written into the combined table, and the run exits non-zero with the failure
+named per representation. Completed work stays in that representation's
+`mode_*/` directory, so re-running it with `--assembly-mode <mode>` resumes
+rather than restarts.
+
+The optional MUMmer `dnadiff` summary in the compare report is time-bounded
+(one hour by default, `TACO_DNADIFF_TIMEOUT` to change it). Its `delta-filter`
+stage can run for days on a repeat-rich genome compared against a diverged
+assembly, and it is a convenience table, so it is abandoned rather than allowed
+to hold up a run. Nothing else in the compare report depends on it.
+
 ### Where the results land
 
 Under the default `both`, each representation is reported inside its own
