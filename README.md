@@ -547,6 +547,29 @@ than reading an existing file, so it needs a reassembly and is not enabled by
 default. Runs made before v1.5.0 have no derived candidates — re-run steps 4, 6
 and 10 to generate them.
 
+### Gene content is protected at every stage that removes it
+
+Three stages can remove sequence, and each is gated separately, because a gate on
+one does not protect the others:
+
+| stage | what it does | gate |
+|---|---|---|
+| 12G merge | rebuilds from the telomere pool, dropping covered backbone sequence | **12G3**: restores backbone contigs carrying lost genes |
+| 12H purge_dups | removes haplotigs by similarity and depth | accepts only within the taxon BUSCO tolerance |
+| 12L report | — | reports the backbone-to-delivered gene-content change |
+
+The merge is the one that matters most and was unguarded until v1.5.1. On a real
+run it turned 972 backbone contigs into 468 and cost 6.3 points of BUSCO
+complete, of which 104 of 112 lost genes were *Missing* rather than *Fragmented*
+— sequence gone, not broken at a junction. The individual pool replacements were
+BUSCO-trialled and accounted for one upgrade and ten additions; the merge did the
+rest unchecked.
+
+`STEP12_SKIP_MERGE_GENE_RECOVERY=1` and `STEP12_SKIP_PURGE_BUSCO_GATE=1` disable
+the respective gates. Restored contigs are suffixed `_gene_rescue` and can
+reintroduce redundancy, which is deliberate: a duplicated locus is recoverable
+downstream and a missing one is not.
+
 ### Gene content is protected against purging
 
 purge_dups removes haplotigs by similarity and depth, with no notion of genes,

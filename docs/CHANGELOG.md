@@ -5,6 +5,55 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.5.1] — 2026-08-24
+
+### The merge was removing complete genes, and every gate was watching something else
+
+v1.5.0 added a gene-content gate to purge_dups. It was the wrong step. On a real
+*Puccinia triticina* run the delivered assemblies still lost gene content in both
+representations — BUSCO complete fell 95.6% → 92.5% in primary and **96.7% →
+90.4% in full**, which skips purge_dups entirely — so the gate could not have
+been responsible.
+
+Tracing it: of the 112 complete BUSCOs lost in full mode, **104 were `Missing`
+and only 8 `Fragmented`**. The sequence was gone, not broken at a merge junction.
+Missing rose from 2.6% to 8.5%.
+
+The cause is step 12's merge. It rebuilds the assembly from the telomere pool and
+drops backbone sequence the pool appears to cover, and **that operation had no
+gene-content gate**. Every existing guard sat elsewhere: the 12F BUSCO trial gates
+individual pool *replacements*, which on that run accounted for one upgrade and
+ten additions, while the merge turned **972 backbone contigs into 468**. The 12H
+purge gate covers purge_dups, which full mode never runs. The 12L do-no-harm
+check compares size and telomere counts, both of which the merge improves.
+
+- **New pass at 12G3**, immediately after the merge and before purge_dups. It
+  compares complete BUSCOs in the backbone against the merge, identifies the
+  backbone contigs carrying whatever was lost, and appends them with a
+  `_gene_rescue` suffix. Validated against the real run: it identifies exactly
+  the 112 lost genes and the 22 backbone contigs that carry them, 17,480,793 bp.
+- **Bounded and honest.** A merge that loses nothing restores nothing. Restored
+  contigs may duplicate sequence the pool already contributed — that is the
+  intended trade, because a duplicated locus is recoverable downstream and a
+  missing one is not. Every restoration is logged with the gene count, the point
+  drop, and the base count. `STEP12_SKIP_MERGE_GENE_RECOVERY=1` disables it.
+- **New `_busco_complete_by_id`** parses `full_table.tsv`, which lists one line
+  per *copy*, so a duplicated gene correctly contributes every contig holding a
+  copy.
+
+A test now asserts that all three content-removing stages — the merge, purge_dups,
+and the final comparison — each check gene content, so a future stage cannot be
+added without one.
+
+### Known limitation
+
+The recovery pass restores whole contigs, so it can reintroduce redundancy: on the
+run above it would add 17.5 Mb, taking the full deliverable from 256.5 Mb to about
+274 Mb, or 1.08x the dikaryotic reference. Restoring only the gene-bearing
+interval rather than the whole contig would be tighter and is not implemented.
+
+---
+
 ## [1.5.0] — 2026-08-18
 
 ### `--assembly-mode {both,primary,full}` — both is the default

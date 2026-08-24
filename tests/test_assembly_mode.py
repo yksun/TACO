@@ -1079,6 +1079,129 @@ def test_concat_fasta_combines_only_what_exists():
         assert st._concat_fasta(R(), [b], os.path.join(tmp, "x.fa"), "t") is False
 
 
+# ── the merge is where gene content actually goes ────────────────────────────
+#
+# Root cause of a 6.3-point BUSCO drop on real Puccinia triticina data. Step 12
+# rebuilds the assembly from the telomere pool and drops backbone sequence the
+# pool appears to cover. Every gate sat on a different operation: the 12F trial
+# gates individual pool REPLACEMENTS (one upgrade, ten additions on that run)
+# and the 12H gate covers purge_dups (which full mode skips entirely), while the
+# merge turned 972 backbone contigs into 468. Of the 112 complete BUSCOs lost,
+# 104 were MISSING and only 8 Fragmented -- sequence gone, not junction-broken.
+
+def test_busco_full_table_parser_handles_duplicated_copies():
+    """full_table lists one line per COPY, so a Duplicated gene has >1 contig."""
+    import tempfile
+    from taco.steps import _busco_complete_by_id
+    with tempfile.TemporaryDirectory() as tmp:
+        run = os.path.join(tmp, "run_x")
+        os.makedirs(run)
+        with open(os.path.join(run, "full_table.tsv"), "w") as f:
+            f.write("# comment line\n")
+            f.write("g1\tComplete\tctg_1\t1\t100\n")
+            f.write("g2\tDuplicated\tctg_2\t1\t100\n")
+            f.write("g2\tDuplicated\tctg_3\t1\t100\n")
+            f.write("g3\tFragmented\tctg_4\t1\t100\n")
+            f.write("g4\tMissing\t\t\t\n")
+        got = _busco_complete_by_id(tmp)
+    assert got == {"g1": {"ctg_1"}, "g2": {"ctg_2", "ctg_3"}}, got
+    assert "g3" not in got and "g4" not in got
+
+
+def _recovery_runner(taxon="fungal"):
+    class R:
+        def __init__(self):
+            self.taxon = taxon
+            self.busco_lineage = "basidiomycota_odb10"
+            self.threads = 2
+            self.logged = []
+        def log(self, m): self.logged.append(m)
+        def log_info(self, m): self.logged.append(m)
+        def log_warn(self, m): self.logged.append(m)
+    return R()
+
+
+def _drive_recovery(c_backbone, c_merged, backbone_extra_contig=True):
+    """Run the recovery pass with mocked BUSCO, return (runner, merged text)."""
+    import tempfile
+    from taco import steps as st
+    real_trial, real_ids, real_which = (
+        st._run_busco_trial, st._busco_complete_by_id, st.shutil.which)
+    st.shutil.which = lambda n: "/usr/bin/busco" if n == "busco" else real_which(n)
+    st._run_busco_trial = lambda fa, lin, thr, label, out, runner=None: (
+        {"C": c_backbone} if label == "merge_backbone" else {"C": c_merged})
+    st._busco_complete_by_id = lambda d: (
+        {"g1": {"bb_1"}, "g2": {"bb_2"}} if d.endswith("merge_backbone")
+        else {"g1": {"mg_1"}})
+    cwd = os.getcwd()
+    try:
+        tmp = tempfile.mkdtemp()
+        os.chdir(tmp)
+        os.makedirs("assemblies", exist_ok=True)
+        bb, mg = "assemblies/bb.fa", "assemblies/merged.fa"
+        with open(bb, "w") as f:
+            f.write(">bb_1\nACGT\n")
+            if backbone_extra_contig:
+                f.write(">bb_2\nTTTTGGGG\n")
+        open(mg, "w").write(">mg_1\nACGT\n")
+        r = _recovery_runner()
+        st._recover_genes_lost_in_merge(r, bb, mg)
+        return r, open(mg).read()
+    finally:
+        os.chdir(cwd)
+        st._run_busco_trial, st._busco_complete_by_id, st.shutil.which = (
+            real_trial, real_ids, real_which)
+
+
+def test_merge_that_loses_genes_gets_them_restored():
+    """96.7 -> 90.4 is 6.3 points, past the 2.0-point fungal tolerance."""
+    r, merged = _drive_recovery(96.7, 90.4)
+    assert "bb_2_gene_rescue" in merged, merged
+    assert "TTTTGGGG" in merged
+    assert any("Restored" in m for m in r.logged), r.logged
+
+
+def test_a_merge_that_preserves_genes_restores_nothing():
+    r, merged = _drive_recovery(96.7, 96.6)      # 0.1 drop, inside tolerance
+    assert "gene_rescue" not in merged, merged
+    assert any("nothing to recover" in m for m in r.logged), r.logged
+
+
+def test_recovery_is_reported_even_when_no_contig_can_be_identified():
+    """A loss with no dropped carrier must warn rather than fail silently."""
+    r, merged = _drive_recovery(96.7, 90.4, backbone_extra_contig=False)
+    assert "gene_rescue" not in merged
+    assert any("not explained by dropped contigs" in m for m in r.logged), r.logged
+
+
+def test_recovery_can_be_disabled_but_says_so():
+    os.environ["STEP12_SKIP_MERGE_GENE_RECOVERY"] = "1"
+    try:
+        r, merged = _drive_recovery(96.7, 50.0)
+        assert "gene_rescue" not in merged
+        assert any("skipped" in m for m in r.logged), r.logged
+    finally:
+        del os.environ["STEP12_SKIP_MERGE_GENE_RECOVERY"]
+
+
+def test_the_recovery_pass_runs_before_purge_dups():
+    """It must see the merge output, not a purged version of it."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    assert src.index("_recover_genes_lost_in_merge(") < src.index(
+        "if _pol.purge_dups_enabled:")
+
+
+def test_every_content_removing_stage_now_has_a_gene_gate():
+    """Merge, purge_dups, and the final comparison each check gene content."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    for guard in ("_recover_genes_lost_in_merge",      # 12G3, the merge
+                  "_purge_preserves_gene_content",     # 12H, purge_dups
+                  "_busco_complete_for_label"):        # 12L, the report
+        assert guard in src, guard
+
+
 def test_policy_rejects_an_unknown_mode():
     try:
         AssemblyPolicy(mode="phased")

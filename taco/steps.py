@@ -5077,6 +5077,130 @@ def _purge_preserves_gene_content(runner, before_fa, after_fa):
     return True
 
 
+def _busco_complete_by_id(busco_dir):
+    """{BUSCO id: set(contig)} for Complete and Duplicated entries in *busco_dir*.
+
+    Reads ``full_table.tsv``, which lists one line per COPY, so a Duplicated
+    gene contributes every contig that carries a copy.
+    """
+    out = {}
+    candidates = sorted(glob.glob(os.path.join(busco_dir, "**", "full_table*.tsv"),
+                                  recursive=True))
+    if not candidates:
+        return out
+    with open(candidates[0], errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 3 and f[1] in ("Complete", "Duplicated"):
+                out.setdefault(f[0], set()).add(f[2])
+    return out
+
+
+def _recover_genes_lost_in_merge(runner, backbone_fa, merged_fa):
+    """Restore backbone contigs carrying complete genes the merge dropped.
+
+    THE PROBLEM THIS SOLVES.  Step 12 rebuilds the assembly from the telomere
+    pool and drops backbone sequence that the pool appears to cover.  That is a
+    content-removing operation and it had no gene-content gate: the 12F trial
+    gates individual pool REPLACEMENTS and the 12H gate covers purge_dups, but
+    on a real run those accounted for one upgrade and ten additions while the
+    merge changed 972 backbone contigs into 468.  Measured on Puccinia
+    triticina, BUSCO complete fell from 96.7% to 90.4% between the selected
+    backbone and the delivered assembly, and 104 of the 112 lost genes were
+    MISSING rather than Fragmented -- the sequence was gone, not broken at a
+    junction.  Nothing in the pipeline noticed, because every gate sat on a
+    different operation.
+
+    THE FIX.  Compare complete BUSCOs in the backbone against the merge, find
+    the backbone contigs carrying whatever the merge lost, and append them.
+    This recovers the genes without undoing the merge's contiguity gains, and it
+    is bounded: a run that lost nothing restores nothing.  Restored contigs may
+    duplicate sequence the pool already contributed, which is the intended
+    trade -- a duplicated locus is recoverable downstream and a missing one is
+    not.
+
+    Skipped when BUSCO is unavailable, or by STEP12_SKIP_MERGE_GENE_RECOVERY=1.
+    """
+    if os.environ.get("STEP12_SKIP_MERGE_GENE_RECOVERY", "0") == "1":
+        runner.log_warn("Merge gene-recovery pass skipped "
+                        "(STEP12_SKIP_MERGE_GENE_RECOVERY=1)")
+        return
+    lineage = getattr(runner, "busco_lineage", None)
+    if not lineage or not shutil.which("busco"):
+        runner.log_warn(
+            "Merge gene-recovery pass skipped: BUSCO unavailable, so genes "
+            "dropped by the merge cannot be detected. Compare BUSCO on "
+            f"{backbone_fa} against {merged_fa} before trusting the result.")
+        return
+    if not (os.path.isfile(backbone_fa) and os.path.isfile(merged_fa)):
+        return
+
+    taxon = getattr(runner, "taxon", "other")
+    tol = float(os.environ.get("STEP12_MAX_BUSCO_C_DROP",
+                               _busco_delta_thresholds(taxon)[0]))
+    work = "assemblies/merge_gene_recovery"
+    os.makedirs(work, exist_ok=True)
+
+    bb = _run_busco_trial(backbone_fa, lineage, runner.threads,
+                          "merge_backbone", work, runner=runner)
+    mg = _run_busco_trial(merged_fa, lineage, runner.threads,
+                          "merge_result", work, runner=runner)
+    if not bb or not mg:
+        runner.log_warn("Merge gene-recovery pass inconclusive: a BUSCO trial "
+                        "produced no metrics.")
+        return
+
+    c_bb, c_mg = float(bb.get("C", 0)), float(mg.get("C", 0))
+    delta = c_mg - c_bb
+    runner.log(f"Merge gene check: BUSCO C {c_bb:.1f}% -> {c_mg:.1f}% "
+               f"({delta:+.1f}); tolerance for --taxon {taxon} is {-tol:+.1f}")
+    if delta >= -tol:
+        runner.log_info("Merge preserved gene content; nothing to recover")
+        return
+
+    bb_ids = _busco_complete_by_id(os.path.join(work, "merge_backbone"))
+    mg_ids = _busco_complete_by_id(os.path.join(work, "merge_result"))
+    if not bb_ids:
+        runner.log_warn(
+            f"Merge lost {-delta:.1f} points of BUSCO complete but the backbone "
+            f"full_table could not be read, so the carrying contigs cannot be "
+            f"identified. The merge is delivered as-is; inspect {backbone_fa}.")
+        return
+
+    lost = set(bb_ids) - set(mg_ids)
+    carriers = set()
+    for gene in lost:
+        carriers |= bb_ids.get(gene, set())
+    if not carriers:
+        runner.log_warn(f"Merge lost {len(lost)} complete gene(s) but no "
+                        f"carrying contig could be identified.")
+        return
+
+    merged_names = {n for n, _ in _read_fasta_records(merged_fa)}
+    recs = [(n, seq) for n, seq in _read_fasta_records(backbone_fa)
+            if n in carriers and n not in merged_names]
+    if not recs:
+        runner.log_warn(
+            f"Merge lost {len(lost)} complete gene(s); their {len(carriers)} "
+            f"backbone contig(s) are already present by name, so the loss is "
+            f"not explained by dropped contigs. Delivering the merge as-is.")
+        return
+
+    restored_bp = sum(len(sq) for _, sq in recs)
+    with open(merged_fa, "a") as fh:
+        for n, sq in recs:
+            fh.write(f">{n}_gene_rescue\n")
+            for i in range(0, len(sq), 60):
+                fh.write(sq[i:i + 60] + "\n")
+    runner.log_warn(
+        f"Merge dropped {len(lost)} complete BUSCO gene(s) ({-delta:.1f} points, "
+        f"beyond the {tol:.1f}-point tolerance). Restored {len(recs)} backbone "
+        f"contig(s) totalling {restored_bp:,} bp that carry them, suffixed "
+        f"'_gene_rescue'. Set STEP12_SKIP_MERGE_GENE_RECOVERY=1 to disable.")
+
+
 def _run_purge_dups(runner, input_fa, output_fa):
     """Run purge_dups on the assembly to remove haplotigs and overlaps.
 
@@ -6857,6 +6981,10 @@ def step_12_refine(runner):
     prot = "assemblies/protected.telomere.fa"
 
     runner.log(f"Built assemblies/final_merge.raw.fasta (mode: {protected_mode})")
+
+    # ---- 12G3. Recover complete genes the merge dropped ----
+    _recover_genes_lost_in_merge(
+        runner, f"assemblies/{assembler}.result.fasta", raw_out)
 
     # ---- 12H. purge_dups default cleanup ----
     # purge_dups removes haplotigs by design, so full mode declines it.

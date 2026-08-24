@@ -45,7 +45,7 @@ class TeeWriter:
 class PipelineRunner:
     """Main pipeline execution engine for TACO."""
 
-    PIPELINE_NAME = "TACO-1.5.0"
+    PIPELINE_NAME = "TACO-1.5.1"
 
     def __init__(self, args):
         # Core parameters
