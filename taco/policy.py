@@ -342,8 +342,38 @@ def telomere_reward_cap(expected_haploid, mode=DEFAULT_MODE, ploidy=None):
     return max(1.0, 2.0 * n_chromosomes)
 
 
+def partially_available_metrics(all_metrics, optional=("merqury_qv", "merqury_comp")):
+    """Optional metrics present for SOME candidates but not all.
+
+    A metric that some candidates lack is not comparable across the set.
+    Scoring the absentees as zero does not make the term neutral -- zero is the
+    minimum, so it is the maximum penalty, and raising a weight makes the
+    distortion proportionally worse.  On a real run two of nine candidates had
+    no Merqury QV, which cost them 6,600 points against a peer at QV 55.
+
+    Returns the names of such metrics so the caller can drop those terms for
+    every candidate rather than penalising the ones with missing data.
+    """
+    def _numeric(v):
+        # A non-finite or non-numeric value (Merqury reports "+inf" when it
+        # finds no unsupported k-mers) is not scoreable, so it counts as absent.
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return f == f and abs(f) != float("inf") and f != 0
+
+    partial = set()
+    for key in optional:
+        seen = [m.get(key) for m in all_metrics]
+        have = [v for v in seen if _numeric(v)]
+        if have and len(have) < len(seen):
+            partial.add(key)
+    return partial
+
+
 def score_assembly(metrics, mode=DEFAULT_MODE, taxon="other",
-                   expected_haploid=0, ploidy=None):
+                   expected_haploid=0, ploidy=None, unavailable=()):
     """Composite selection score for one candidate assembly.
 
     Args:
@@ -362,8 +392,20 @@ def score_assembly(metrics, mode=DEFAULT_MODE, taxon="other",
     """
     import math
 
-    w = resolve_weights(mode, taxon)
-    g = lambda k: float(metrics.get(k) or 0)
+    w = dict(resolve_weights(mode, taxon))
+    # A metric that is not comparable across the candidate set is dropped for
+    # everyone; see partially_available_metrics.
+    for key in unavailable:
+        if key == "merqury_qv":
+            w["w_merqury_qv"] = 0
+        elif key == "merqury_comp":
+            w["w_merqury_comp"] = 0
+    def g(k):
+        try:
+            v = float(metrics.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0.0                 # e.g. Merqury's "+inf (no unsupported k-mers)"
+        return 0.0 if (v != v or abs(v) == float("inf")) else v
 
     busco_s, busco_d, contigs = g("busco_s"), g("busco_d"), g("contigs")
     n50, total_len = g("n50"), g("total_len")

@@ -915,6 +915,17 @@ def test_gate_accepts_a_purge_that_only_removes_redundancy():
     ok, r = _run_gate(96.3, 96.2)
     assert ok is True
     assert any("accepted" in m for m in r.logged), r.logged
+    # a negated zero prints "-0.0", which reads as nonsense in a log
+    assert not any("-0.0" in m for m in r.logged), r.logged
+
+
+def test_gate_reports_a_no_op_purge_in_words():
+    """On a haploid genome there is nothing to purge; the log must say so
+    rather than printing '-0.0 points'."""
+    ok, r = _run_gate(96.3, 96.3, before_d=0.6, after_d=0.6)
+    assert ok is True
+    assert any("nothing to purge" in m for m in r.logged), r.logged
+    assert not any("-0.0" in m for m in r.logged), r.logged
 
 
 def test_gate_tolerance_follows_the_taxon():
@@ -1202,6 +1213,179 @@ def test_every_content_removing_stage_now_has_a_gene_gate():
         assert guard in src, guard
 
 
+# ── a metric some candidates lack must not penalise them ─────────────────────
+#
+# Merqury does not always produce a QV for every assembly. Scoring the absentees
+# as zero is not neutral -- zero is the minimum, so it is the maximum penalty --
+# and raising w_merqury_qv from 20 to 120 in v1.5.0 made the distortion six
+# times worse. On the real Fusarium run two of nine candidates had no QV, which
+# cost them 6,600 points against a peer at QV 55.
+
+def test_partially_available_metrics_are_detected():
+    from taco.policy import partially_available_metrics as p
+    # present for some, absent for others -> not comparable
+    assert p([{"merqury_qv": 50}, {"merqury_qv": None}]) == {"merqury_qv"}
+    assert p([{"merqury_qv": 50}, {"merqury_qv": 0}]) == {"merqury_qv"}
+    assert p([{"merqury_qv": 50}, {}]) == {"merqury_qv"}
+    # present for all -> comparable, keep it
+    assert p([{"merqury_qv": 50}, {"merqury_qv": 60}]) == set()
+    # absent for all -> nothing to drop, the term is already inert
+    assert p([{"merqury_qv": None}, {}]) == set()
+
+
+def test_an_unavailable_metric_is_dropped_for_every_candidate():
+    """Dropping it for one candidate only would still distort the comparison."""
+    have = dict(busco_c=99.1, busco_d=0.6, contigs=12, n50=6_409_127,
+                merqury_qv=75.5, merqury_comp=97.9, total_len=50_930_550)
+    lacks = dict(have, merqury_qv=None)
+    G = 46_200_000
+    # with the term active, the candidate lacking QV is penalised
+    a, _ = score_assembly(have, mode="primary", taxon="fungal", expected_haploid=G)
+    b, _ = score_assembly(lacks, mode="primary", taxon="fungal", expected_haploid=G)
+    assert a - b > 5000, (a, b)
+    # dropped for both, the gap closes to nothing
+    a2, ca = score_assembly(have, mode="primary", taxon="fungal",
+                            expected_haploid=G, unavailable={"merqury_qv"})
+    b2, _ = score_assembly(lacks, mode="primary", taxon="fungal",
+                           expected_haploid=G, unavailable={"merqury_qv"})
+    assert abs(a2 - b2) < 1e-9, (a2, b2)
+    assert ca["merqury_qv"] == 0
+
+
+def test_dropping_one_metric_leaves_the_others_intact():
+    G = 46_200_000
+    m = dict(busco_c=99.1, busco_d=0.6, contigs=12, n50=6_409_127,
+             merqury_qv=75.5, merqury_comp=97.9, total_len=50_930_550)
+    _, c = score_assembly(m, mode="primary", taxon="fungal",
+                          expected_haploid=G, unavailable={"merqury_qv"})
+    assert c["merqury_qv"] == 0
+    assert c["merqury_completeness"] != 0, "completeness must survive"
+    assert c["busco"] != 0 and c["contiguity"] != 0
+
+
+def test_selection_reports_when_a_metric_is_dropped():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index("def _auto_select_backbone"):]
+    blk = blk[:blk.index("\ndef ", 1)]
+    assert "partially_available_metrics" in blk
+    assert "not comparable across the set" in blk, "the drop must be logged"
+
+
+# ── cached results must not describe a different assembly ────────────────────
+#
+# Re-running a pipeline in place leaves the previous run's outputs in position.
+# BUSCO guards against reusing them by validating the lineage recorded in its
+# output; Merqury had no equivalent and asked only whether the files existed.
+# Observed on a real rerun: a 120 Mb assembly's QV 76.77 and completeness 88.73
+# were reported verbatim for the 145 Mb assembly that replaced it.
+
+def test_merqury_cache_is_rejected_when_older_than_the_assembly():
+    import tempfile, time
+    from taco import steps as st
+
+    class R:
+        def __init__(self): self.logged = []
+        def log_info(self, m): self.logged.append(m)
+        def log_warn(self, m): self.logged.append(m)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        qv = os.path.join(tmp, "x.qv")
+        comp = os.path.join(tmp, "x.completeness.stats")
+        asm = os.path.join(tmp, "asm.fa")
+        for p in (qv, comp):
+            open(p, "w").write("0\n")
+        time.sleep(0.02)
+        open(asm, "w").write(">c\nACGT\n")        # assembly is NEWER
+        r = R()
+        assert st._merqury_cache_is_current(r, asm, qv, comp, "final") is False
+        assert any("describes a different assembly" in m for m in r.logged), r.logged
+
+
+def test_merqury_cache_is_kept_when_newer_than_the_assembly():
+    import tempfile, time
+    from taco import steps as st
+
+    class R:
+        def log_info(self, m): pass
+        def log_warn(self, m): pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asm = os.path.join(tmp, "asm.fa")
+        open(asm, "w").write(">c\nACGT\n")
+        time.sleep(0.02)
+        qv = os.path.join(tmp, "x.qv")
+        comp = os.path.join(tmp, "x.completeness.stats")
+        for p in (qv, comp):
+            open(p, "w").write("0\n")             # cache is NEWER
+        assert st._merqury_cache_is_current(R(), asm, qv, comp, "final") is True
+
+
+def test_merqury_reuse_consults_the_freshness_check():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index("def _run_merqury_for_assembly"):]
+    blk = blk[:blk.index("\ndef ", 1)]
+    assert "_merqury_cache_is_current" in blk, (
+        "reuse must check the cache is newer than the assembly, not just that "
+        "the files exist")
+
+
+def test_do_no_harm_will_not_compare_against_a_previous_run():
+    """The delivered assembly is emitted at 13C, after 12L runs, so any
+    busco/final present at 12L describes an earlier run."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index('# ---- 12L. "Do no harm" safety comparison ----'):]
+    blk = blk[:blk.index("\ndef ", 1)]
+    assert "getmtime(final_fa)" in blk, "12L must check BUSCO post-dates the merge"
+    assert "produced at 13D" in blk
+
+
+# ── "no errors detected" is not the same as "not measured" ───────────────────
+#
+# Merqury writes "+inf" in the QV column when it finds no unsupported k-mers.
+# The parser's 1..1000 sanity guard silently rejected it and TACO reported "NA",
+# turning a good result into an apparent measurement failure. Observed on a
+# purified Fusarium assembly: 0 error k-mers, against the published reference's
+# 110.
+
+def test_infinite_qv_is_reported_not_discarded():
+    import tempfile
+    from taco.steps import _parse_merqury_qv, MERQURY_QV_NO_ERRORS
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "final.qv")
+        open(p, "w").write("final.purified\t0\t46238087\t+inf\t0\n")
+        assert _parse_merqury_qv(p) == MERQURY_QV_NO_ERRORS
+        for variant in ("inf", "Infinity", "+Inf"):
+            open(p, "w").write(f"a\t0\t100\t{variant}\t0\n")
+            assert _parse_merqury_qv(p) == MERQURY_QV_NO_ERRORS, variant
+
+
+def test_a_normal_qv_still_parses():
+    import tempfile
+    from taco.steps import _parse_merqury_qv
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "compare.qv")
+        open(p, "w").write("compare.result\t110\t46236275\t68.7886\t1.32172e-07\n")
+        assert _parse_merqury_qv(p) == "68.7886"
+
+
+def test_a_non_numeric_qv_is_unscoreable_rather_than_fatal():
+    """It must count as unavailable, not crash and not score as zero."""
+    from taco.policy import partially_available_metrics
+    from taco.steps import MERQURY_QV_NO_ERRORS
+    assert partially_available_metrics(
+        [{"merqury_qv": MERQURY_QV_NO_ERRORS}, {"merqury_qv": 68.8}]) == {"merqury_qv"}
+    m = dict(busco_c=99.2, contigs=10, n50=5_140_964,
+             merqury_qv=MERQURY_QV_NO_ERRORS, merqury_comp=89.59,
+             total_len=46_238_257)
+    total, c = score_assembly(m, mode="primary", taxon="fungal",
+                              expected_haploid=46_200_000)
+    assert total == total and abs(total) != float("inf")
+    assert c["merqury_qv"] == 0
+
+
 def test_policy_rejects_an_unknown_mode():
     try:
         AssemblyPolicy(mode="phased")
@@ -1301,3 +1485,26 @@ if __name__ == "__main__":
                 print("FAIL  %s: %s" % (name, e))
     print("\n%s" % ("ALL TESTS PASSED" if not fails else "%d TEST(S) FAILED" % fails))
     sys.exit(1 if fails else 0)
+
+
+def test_recorded_formula_omits_a_dropped_metric():
+    """selection_decision.txt must state the formula actually used. On the real
+    Fusarium run it listed MerquryQV*120 while every score excluded the term."""
+    from taco.steps import _describe_score_formula
+    from taco import policy
+    w = policy.resolve_weights("primary", "fungal")
+    full = _describe_score_formula(w, "fungal", True)
+    assert "MerquryQV*" in full and "MerquryComp*" in full
+    d = _describe_score_formula(w, "fungal", True, dropped={"merqury_qv"})
+    assert "MerquryQV*" not in d, d
+    assert "MerquryComp*" in d, "only the dropped term goes"
+    assert "merqury_qv dropped" in d, "the formula must say why"
+
+
+def test_selection_passes_dropped_metrics_to_the_formula_record():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index("def _auto_select_backbone"):]
+    blk = blk[:blk.index("\ndef ", 1)]
+    assert "dropped=_unavailable" in blk
+

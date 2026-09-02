@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1128" viewBox="0 0 1280 1128" font-family="Helvetica Neue,Helvetica,Arial,sans-serif">
+<rect width="1280" height="1128" fill="#FFFFFF"/>
+<text x="32" y="24" font-size="15" font-weight="700" fill="#14232B">TACO — run nine long-read assemblers, compare them on one table</text>
+<rect x="120" y="48" width="672" height="48" fill="#EFF2F4" stroke="#5A6B75" stroke-width="1.6"/>
+<text x="456.0" y="69" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">One long-read set</text>
+<text x="456.0" y="84" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">PacBio HiFi · Nanopore · PacBio CLR</text>
+<rect x="120" y="120" width="672" height="48" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="456.0" y="141" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Install and select</text>
+<text x="456.0" y="156" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">one conda environment; assemblers absent from PATH are skipped by name</text>
+<text x="120" y="186" font-size="10.5" fill="#5A6B75">Run each assembler on the same reads, in its own directory</text>
+<rect x="120" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="153.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">HiCanu</text>
+<rect x="195" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="228.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">NextDenovo</text>
+<rect x="270" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="303.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">Peregrine</text>
+<rect x="345" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="378.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">IPA</text>
+<rect x="420" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="453.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">Flye</text>
+<rect x="495" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="528.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">hifiasm</text>
+<rect x="570" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="603.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">LJA</text>
+<rect x="645" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="678.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">MBG</text>
+<rect x="720" y="192" width="67" height="40" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="753.5" y="215" font-size="9.5" font-weight="600" fill="#14232B" text-anchor="middle">Raven</text>
+<rect x="120" y="256" width="672" height="48" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="456.0" y="277" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Standardize</text>
+<text x="456.0" y="292" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">uniform contig names; capture alternate contig sets the assemblers already wrote</text>
+<text x="120" y="322" font-size="10.5" fill="#5A6B75">Measure every assembly the same way</text>
+<rect x="120" y="328" width="162" height="40" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="201.0" y="352" font-size="10" font-weight="600" fill="#14232B" text-anchor="middle">BUSCO</text>
+<rect x="290" y="328" width="162" height="40" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="371.0" y="352" font-size="10" font-weight="600" fill="#14232B" text-anchor="middle">QUAST</text>
+<rect x="460" y="328" width="162" height="40" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="541.0" y="352" font-size="10" font-weight="600" fill="#14232B" text-anchor="middle">Telomere classification</text>
+<rect x="630" y="328" width="162" height="40" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="711.0" y="352" font-size="10" font-weight="600" fill="#14232B" text-anchor="middle">Merqury</text>
+<rect x="120" y="392" width="672" height="48" fill="#EFF2F4" stroke="#5A6B75" stroke-width="1.6"/>
+<text x="456.0" y="413" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">assembly_info.csv — the comparison table</text>
+<text x="456.0" y="428" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">one row per metric, one column per assembly</text>
+<rect x="32" y="40" width="40" height="416" fill="#FFFFFF" stroke="#5A6B75" stroke-width="1.4"/>
+<text x="47.0" y="248.0" font-size="12.5" font-weight="700" fill="#14232B" text-anchor="middle" transform="rotate(-90 47.0 248.0)">MEASURE</text>
+<text x="63.0" y="248.0" font-size="10" fill="#5A6B75" text-anchor="middle" transform="rotate(-90 63.0 248.0)">the primary output</text>
+<line x1="32" y1="448" x2="1248" y2="448" stroke="#14232B" stroke-width="2.4"/>
+<rect x="120" y="436.0" width="296" height="24" fill="#FFFFFF"/>
+<text x="128" y="452" font-size="11.5" font-weight="700" fill="#14232B">--assembly-only stops here</text>
+<rect x="120" y="472" width="672" height="48" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="456.0" y="493" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Select a backbone</text>
+<text x="456.0" y="508" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">explicit score, written to disk with its weights</text>
+<rect x="120" y="544" width="672" height="48" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="456.0" y="565" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Build the telomere pool</text>
+<text x="456.0" y="580" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">telomere-bearing contigs from every assembly</text>
+<rect x="120" y="616" width="672" height="48" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="456.0" y="637" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Merge</text>
+<text x="456.0" y="652" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">rebuild from the pool, dropping covered backbone sequence</text>
+<rect x="856" y="616" width="368" height="48" fill="#FBE7D8" stroke="#C25400" stroke-width="1.6"/>
+<text x="1040.0" y="630" font-size="10.5" font-weight="600" fill="#14232B" text-anchor="middle">GATE</text>
+<text x="1040.0" y="644" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">restore backbone contigs</text>
+<text x="1040.0" y="658" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">carrying genes the merge dropped</text>
+<line x1="792" y1="640.0" x2="850" y2="640.0" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="850,636.0 850,644.0 856,640.0" fill="#14232B"/>
+<rect x="120" y="688" width="672" height="48" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="456.0" y="709" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">purge_dups</text>
+<text x="456.0" y="724" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">remove residual duplication</text>
+<rect x="856" y="688" width="368" height="48" fill="#FBE7D8" stroke="#C25400" stroke-width="1.6"/>
+<text x="1040.0" y="702" font-size="10.5" font-weight="600" fill="#14232B" text-anchor="middle">GATE</text>
+<text x="1040.0" y="716" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">accept only within the</text>
+<text x="1040.0" y="730" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">taxon BUSCO tolerance</text>
+<line x1="792" y1="712.0" x2="850" y2="712.0" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="850,708.0 850,716.0 856,712.0" fill="#14232B"/>
+<rect x="120" y="760" width="672" height="48" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="456.0" y="781" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Screen foreign sequence</text>
+<text x="456.0" y="796" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">read depth AND composition both required</text>
+<rect x="120" y="832" width="672" height="48" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.6"/>
+<text x="456.0" y="853" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Resolve mis-joins</text>
+<text x="456.0" y="868" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">split where other assemblies disagree and no read spans the junction</text>
+<rect x="856" y="832" width="368" height="48" fill="#FBE7D8" stroke="#C25400" stroke-width="1.6"/>
+<text x="1040.0" y="846" font-size="10.5" font-weight="600" fill="#14232B" text-anchor="middle">GATE</text>
+<text x="1040.0" y="860" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">majority of informative assemblies</text>
+<text x="1040.0" y="874" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">must split, and reads must not span</text>
+<line x1="792" y1="856.0" x2="850" y2="856.0" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="850,852.0 850,860.0 856,856.0" fill="#14232B"/>
+<rect x="120" y="904" width="672" height="48" fill="#FFFFFF" stroke="#00815F" stroke-width="1.6"/>
+<text x="456.0" y="925" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Measure what was delivered</text>
+<text x="456.0" y="940" font-size="10.0" font-weight="400" fill="#5A6B75" text-anchor="middle">on the file TACO actually writes</text>
+<rect x="856" y="904" width="368" height="48" fill="#FBE7D8" stroke="#C25400" stroke-width="1.6"/>
+<text x="1040.0" y="918" font-size="10.5" font-weight="600" fill="#14232B" text-anchor="middle">GATE</text>
+<text x="1040.0" y="932" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">report backbone vs delivered:</text>
+<text x="1040.0" y="946" font-size="9.0" font-weight="400" fill="#5A6B75" text-anchor="middle">size, telomeres, gene content</text>
+<line x1="792" y1="928.0" x2="850" y2="928.0" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="850,924.0 850,932.0 856,928.0" fill="#14232B"/>
+<rect x="120" y="976" width="672" height="48" fill="#EFF2F4" stroke="#5A6B75" stroke-width="1.6"/>
+<text x="456.0" y="1004" font-size="11.5" font-weight="600" fill="#14232B" text-anchor="middle">Final assembly + provenance + comparison report</text>
+<rect x="32" y="464" width="40" height="576" fill="#FFFFFF" stroke="#5A6B75" stroke-width="1.4"/>
+<text x="47.0" y="752.0" font-size="12.5" font-weight="700" fill="#14232B" text-anchor="middle" transform="rotate(-90 47.0 752.0)">MODIFY</text>
+<text x="63.0" y="752.0" font-size="10" fill="#5A6B75" text-anchor="middle" transform="rotate(-90 63.0 752.0)">optional refinement</text>
+<line x1="456.0" y1="96" x2="456.0" y2="114" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,114 460.0,114 456.0,120" fill="#14232B"/>
+<line x1="456.0" y1="168" x2="456.0" y2="186" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,186 460.0,186 456.0,192" fill="#14232B"/>
+<line x1="456.0" y1="232" x2="456.0" y2="250" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,250 460.0,250 456.0,256" fill="#14232B"/>
+<line x1="456.0" y1="304" x2="456.0" y2="322" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,322 460.0,322 456.0,328" fill="#14232B"/>
+<line x1="456.0" y1="368" x2="456.0" y2="386" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,386 460.0,386 456.0,392" fill="#14232B"/>
+<line x1="456.0" y1="440" x2="456.0" y2="466" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,466 460.0,466 456.0,472" fill="#14232B"/>
+<line x1="456.0" y1="520" x2="456.0" y2="538" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,538 460.0,538 456.0,544" fill="#14232B"/>
+<line x1="456.0" y1="592" x2="456.0" y2="610" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,610 460.0,610 456.0,616" fill="#14232B"/>
+<line x1="456.0" y1="664" x2="456.0" y2="682" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,682 460.0,682 456.0,688" fill="#14232B"/>
+<line x1="456.0" y1="736" x2="456.0" y2="754" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,754 460.0,754 456.0,760" fill="#14232B"/>
+<line x1="456.0" y1="808" x2="456.0" y2="826" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,826 460.0,826 456.0,832" fill="#14232B"/>
+<line x1="456.0" y1="880" x2="456.0" y2="898" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,898 460.0,898 456.0,904" fill="#14232B"/>
+<line x1="456.0" y1="952" x2="456.0" y2="970" stroke="#14232B" stroke-width="1.6"/>
+<polygon points="452.0,970 460.0,970 456.0,976" fill="#14232B"/>
+<rect x="120" y="1087" width="16" height="12.0" fill="#FFFFFF" stroke="#00815F" stroke-width="1.4"/>
+<text x="140.8" y="1097" font-size="10.5" fill="#5A6B75">measures only</text>
+<rect x="237.6" y="1087" width="16" height="12.0" fill="#DCE9F2" stroke="#0B6FA4" stroke-width="1.4"/>
+<text x="258.4" y="1097" font-size="10.5" fill="#5A6B75">changes sequence</text>
+<rect x="372.0" y="1087" width="16" height="12.0" fill="#FBE7D8" stroke="#C25400" stroke-width="1.4"/>
+<text x="392.8" y="1097" font-size="10.5" fill="#5A6B75">check that can veto the step beside it</text>
+<rect x="629.6" y="1087" width="16" height="12.0" fill="#EFF2F4" stroke="#5A6B75" stroke-width="1.4"/>
+<text x="650.4" y="1097" font-size="10.5" fill="#5A6B75">file on disk</text>
+</svg>

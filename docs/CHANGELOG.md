@@ -5,6 +5,80 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.5.2] — 2026-09-02
+
+Five corrections found while re-running v1.5.1 on *Fusarium tricinctum* and
+re-reading its logs. None changes the delivered assembly on that data set. Three
+change what TACO reports about it, and two stop an in-place rerun from describing
+the previous run's files as this run's.
+
+### A metric that some candidates lack no longer penalises them
+
+Merqury does not always produce a QV for every assembly. `score_assembly` treated
+a missing value as zero, and the docstring claimed that made the term neutral. It
+does not: zero is the *minimum*, so a missing value is the maximum penalty. v1.5.0
+made this six times worse by raising `w_merqury_qv` from 20 to 120.
+
+On the real *Fusarium tricinctum* run two of nine candidates had no Merqury QV,
+which cost them **6,600 points** against a peer at QV 55 and pushed them from
+ranks 2–3 to 6–7.
+
+A metric present for some candidates but not all is not comparable across the
+set, so `partially_available_metrics` now detects that case and the term is
+dropped for **every** candidate, with a warning naming the metric. Dropping it
+for the absentees alone would distort the comparison just as badly in the other
+direction. The selected backbone is unchanged on that data set either way, which
+is the reassuring part.
+
+The decision record now matches the score. `selection_decision.txt` had listed
+`MerquryQV*120` in `score_formula` while the term was excluded from every
+candidate's score — exactly the case on the *Fusarium* run, where Flye and
+NextDenovo had no QV. `_describe_score_formula` now omits a dropped term and
+appends `merqury_qv dropped: missing for some candidates, so excluded for all`
+to the formula's notes.
+
+### Cached Merqury output must post-date the assembly it describes
+
+Re-running in place leaves the previous run's `merqury/<label>/` in position, and
+the reuse check asked only whether the files existed. Observed on a real rerun: a
+120 Mb assembly's QV 76.77 and completeness 88.73 were reported verbatim for the
+145 Mb assembly that replaced it. BUSCO already validates the lineage recorded in
+its output; Merqury had no equivalent.
+
+- **New `_merqury_cache_is_current`.** Cached `.qv` and `.completeness.stats`
+  are reused only when both are newer than the assembly FASTA. Otherwise Merqury
+  is recomputed, and the log names the stale file.
+
+### "No unsupported k-mers" is a result, not a missing value
+
+Merqury writes `+inf` in the QV column when every assembly k-mer occurs in the
+reads. The parser's sanity guard (1–1000) rejected it and TACO reported `NA`, so
+the best possible QV looked like a failed measurement. Observed on the purified
+*Fusarium* assembly: 0 error k-mers, against the published reference's 110.
+
+- `_parse_merqury_qv` now returns `inf (no unsupported k-mers)` for `+inf`,
+  `inf`, and `Infinity`. The value is written to `final_result.csv` as is, and
+  selection treats it as unscoreable, which is correct: it is not comparable to
+  a finite QV, and the delivered assembly is not a selection candidate.
+
+### 12L compares against this run's assembly only
+
+The delivered assembly is emitted at 13C and measured at 13D, after 12L runs, so
+any `busco/final` present at 12L belongs to an earlier run. On a real rerun 12L
+compared this run's backbone against last run's delivered assembly and reported a
+plausible-looking BUSCO delta. 12L now uses `busco/final` only when it post-dates
+`final.merged.fasta`; otherwise it states that the comparison is deferred to the
+final report.
+
+### A no-op purge is described in words
+
+`purge_dups accepted: removed -0.0 points of duplication for -0.0 points of
+complete genes` was the log line on a haploid genome with nothing to purge. The
+gate now reports signed deltas, and when both round to zero it says
+`nothing to purge`.
+
+---
+
 ## [1.5.1] — 2026-08-24
 
 ### The merge was removing complete genes, and every gate was watching something else

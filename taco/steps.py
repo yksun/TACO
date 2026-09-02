@@ -2882,6 +2882,35 @@ def _ensure_merqury_db(runner):
     return db
 
 
+def _merqury_cache_is_current(runner, asm_fa, qv_path, comp_path, label):
+    """True when cached Merqury output post-dates the assembly it describes.
+
+    The reuse check used to ask only whether the output files existed, which is
+    not the same question.  Re-running a pipeline in place leaves last run's
+    ``merqury/<label>/`` in position, so a QV and k-mer completeness computed on
+    the PREVIOUS assembly were reported for the current one.  Observed on a real
+    rerun: a 120 Mb assembly's QV 76.77 and completeness 88.73 were reported
+    verbatim for the 145 Mb assembly that replaced it.  BUSCO already guards
+    against this by validating the lineage recorded in its output; Merqury had
+    no equivalent.
+    """
+    try:
+        asm_mtime = os.path.getmtime(asm_fa)
+    except OSError:
+        return True                    # cannot compare; leave the cache alone
+    for path in (qv_path, comp_path):
+        try:
+            if os.path.getmtime(path) < asm_mtime:
+                runner.log_warn(
+                    f"Merqury output for {label} ({path}) is older than "
+                    f"{asm_fa}, so it describes a different assembly. "
+                    f"Recomputing.")
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
     """Run Merqury unless the expected QV and completeness files already exist."""
     prefixes = _merqury_prefixes_for_label(label, preferred=out_prefix)
@@ -2889,10 +2918,11 @@ def _run_merqury_for_assembly(runner, db, asm_fa, out_prefix, label):
         prefixes, ".qv", _parse_merqury_qv)
     comp_ready, comp_ready_path = _find_merqury_metric_for_prefixes(
         prefixes, ".completeness.stats", _parse_merqury_completeness)
-    if qv_ready and comp_ready:
+    if qv_ready and comp_ready and _merqury_cache_is_current(
+            runner, asm_fa, qv_ready_path, comp_ready_path, label):
         runner.log_info(
-            f"Merqury output exists for {label}; reusing "
-            f"{qv_ready_path} and {comp_ready_path}")
+            f"Merqury output exists for {label} and is newer than {asm_fa}; "
+            f"reusing {qv_ready_path} and {comp_ready_path}")
         return
 
     merqury_bin = shutil.which("merqury.sh")
@@ -3121,8 +3151,23 @@ def _format_merqury_number(value):
     return f"{value:g}"
 
 
+#: Reported in place of a numeric QV when Merqury finds no unsupported k-mers.
+#: Merqury writes "+inf" in that case, which is a real and interpretable result
+#: -- every k-mer in the assembly occurs in the reads -- but it is not a number,
+#: and the sanity guard below (1..1000) silently rejected it, so TACO reported
+#: "NA" as though the measurement had failed. Observed on a purified Fusarium
+#: assembly whose foreign contigs had been removed: 0 error k-mers against the
+#: published reference's 110.
+MERQURY_QV_NO_ERRORS = "inf (no unsupported k-mers)"
+
+
 def _parse_merqury_qv(path):
-    """Parse Merqury .qv files: assembly, asm-only kmers, total kmers, QV, error."""
+    """Parse Merqury .qv files: assembly, asm-only kmers, total kmers, QV, error.
+
+    A QV of ``+inf`` is reported as :data:`MERQURY_QV_NO_ERRORS` rather than as
+    a missing value, because "no errors detected" and "not measured" are
+    different statements and only one of them is good news.
+    """
     if not os.path.exists(path):
         return ""
     with open(path, "r", errors="ignore") as f:
@@ -3131,6 +3176,8 @@ def _parse_merqury_qv(path):
             if not line or line.startswith("#"):
                 continue
             parts = re.split(r"\s+", line)
+            if len(parts) >= 4 and parts[3].lstrip("+").lower() in ("inf", "infinity"):
+                return MERQURY_QV_NO_ERRORS
             if len(parts) >= 4:
                 value = _parse_merqury_number(parts[3])
                 if value is not None and 1 <= value <= 1000:
@@ -3603,6 +3650,28 @@ def _auto_select_backbone(runner):
     weights = policy.resolve_weights(asm_mode, taxon)
     expected_size = _parse_genome_size(runner.genomesize)
 
+    # Optional metrics missing for SOME candidates are not comparable across the
+    # set, so they are dropped for everyone rather than scored as zero, which
+    # would be the maximum penalty for the candidates that lack them.
+    _prescan = []
+    for _i, _a in enumerate(header[1:], start=1):
+        _a = _a.strip()
+        if not _a or _a.lower() in EXCLUDED_FROM_BACKBONE:
+            continue
+        _fa = f"assemblies/{_a}.result.fasta"
+        if not os.path.isfile(_fa) or os.path.getsize(_fa) == 0:
+            continue
+        _prescan.append({"merqury_qv": get_val("merqury qv", _i),
+                         "merqury_comp": get_val("merqury completeness (%)", _i)})
+    _unavailable = policy.partially_available_metrics(_prescan)
+    if _unavailable:
+        runner.log_warn(
+            f"Metric(s) {', '.join(sorted(_unavailable))} are missing for some "
+            f"candidates but not all, so they are not comparable across the set "
+            f"and are excluded from scoring for every candidate. Scoring the "
+            f"absentees as zero would penalise them, not treat them neutrally.")
+
+    all_candidate_metrics = []
     for idx, asm in enumerate(header[1:], start=1):
         asm = asm.strip()
         if not asm:
@@ -3636,6 +3705,12 @@ def _auto_select_backbone(runner):
 
         total_len = get_val("total length", idx)
         contributions = {}
+        metric_rows_for_candidate = {
+            "busco_s": busco_s, "busco_d": busco_d, "busco_c": busco_c,
+            "t2t": t2t, "single_tel": single, "merqury_qv": merqury_qv,
+            "merqury_comp": merqury_comp, "contigs": contigs,
+            "n50": n50, "total_len": total_len}
+        all_candidate_metrics.append(metric_rows_for_candidate)
 
         if mode == "n50":
             if n50 <= 0:
@@ -3645,11 +3720,9 @@ def _auto_select_backbone(runner):
             if contigs <= 0 or n50 <= 0:
                 continue
             score, contributions = policy.score_assembly(
-                {"busco_s": busco_s, "busco_d": busco_d, "busco_c": busco_c,
-                 "t2t": t2t, "single_tel": single, "merqury_qv": merqury_qv,
-                 "merqury_comp": merqury_comp, "contigs": contigs,
-                 "n50": n50, "total_len": total_len},
-                mode=asm_mode, taxon=taxon, expected_haploid=expected_size)
+                metric_rows_for_candidate,
+                mode=asm_mode, taxon=taxon, expected_haploid=expected_size,
+                unavailable=_unavailable)
 
         records.append({
             "assembler": asm, "busco_s": busco_s, "busco_d": busco_d,
@@ -3696,12 +3769,12 @@ def _auto_select_backbone(runner):
         f.write(f"selected_score\t{best_score if best_score is not None else ''}\n")
         # Note: MerquryComp and MerquryQV contribute 0 when Merqury is not enabled
         has_merqury = any(r["merqury_qv"] > 0 or r["merqury_comp"] > 0 for r in records)
-        f.write(f"score_formula\t{_describe_score_formula(weights, taxon, has_merqury)}\n")
+        f.write(f"score_formula\t{_describe_score_formula(weights, taxon, has_merqury, dropped=_unavailable)}\n")
 
     return best_name
 
 
-def _describe_score_formula(w, taxon, has_merqury=True):
+def _describe_score_formula(w, taxon, has_merqury=True, dropped=()):
     """Human-readable form of the active scoring profile.
 
     Written into selection_decision.txt and the final report so a run states the
@@ -3711,8 +3784,14 @@ def _describe_score_formula(w, taxon, has_merqury=True):
     terms = [f"{busco_label}*{w['w_busco']}", f"T2T*{w['w_t2t']}",
              f"single*{w['w_single_tel']}"]
     if has_merqury:
-        terms += [f"MerquryComp*{w['w_merqury_comp']}",
-                  f"MerquryQV*{w['w_merqury_qv']}"]
+        # A metric dropped for the whole candidate set (see
+        # partially_available_metrics) must not appear in the formula the run
+        # claims to have used: on a real run the decision file listed
+        # MerquryQV*120 while every score excluded it.
+        if w.get("w_merqury_comp") and "merqury_comp" not in dropped:
+            terms.append(f"MerquryComp*{w['w_merqury_comp']}")
+        if w.get("w_merqury_qv") and "merqury_qv" not in dropped:
+            terms.append(f"MerquryQV*{w['w_merqury_qv']}")
     if w.get("w_contigs"):
         terms.append(f"- contigs*{w['w_contigs']}")
     if w.get("w_contig_density"):
@@ -3724,6 +3803,9 @@ def _describe_score_formula(w, taxon, has_merqury=True):
         terms.append(f"- size_deviation*{w['w_size_penalty']}")
     joined = " + ".join(terms).replace("+ -", "-")
     notes = [f"taxon={taxon}"]
+    if dropped:
+        notes.append(f"{', '.join(sorted(dropped))} dropped: missing for some "
+                     f"candidates, so excluded for all")
     if not has_merqury:
         notes.append("Merqury not available")
     if not w.get("w_busco_d"):
@@ -5071,9 +5153,16 @@ def _purge_preserves_gene_content(runner, before_fa, after_fa):
         f"{-max_c_drop:+.1f} on C")
     if c_delta < -max_c_drop:
         return False
-    runner.log_info(
-        f"purge_dups accepted: removed {-d_delta:.1f} points of duplication for "
-        f"{-c_delta:.1f} points of complete genes")
+    # Report signed deltas rather than negated ones: negating a zero prints
+    # "-0.0", which reads as nonsense in a log line meant to build confidence.
+    if abs(c_delta) < 0.05 and abs(d_delta) < 0.05:
+        runner.log_info(
+            "purge_dups accepted: no measurable change to duplication or gene "
+            "content (nothing to purge)")
+    else:
+        runner.log_info(
+            f"purge_dups accepted: duplication {d_delta:+.1f} points, "
+            f"complete genes {c_delta:+.1f} points")
     return True
 
 
@@ -7470,8 +7559,28 @@ def step_12_refine(runner):
         # real data this check reported "quality OK" while BUSCO complete fell
         # 3.1 points. Reported whenever both measurements exist; the enforcing
         # gate is at 12H, on purge_dups itself.
+        # The delivered assembly does not exist yet at 12L -- step 13C emits it
+        # and 13D measures it -- so any busco/final present here describes a
+        # PREVIOUS run. Reporting it produced a plausible-looking but meaningless
+        # comparison on a real rerun: this run's backbone against last run's
+        # delivered assembly. Only use it when it post-dates the merge.
         bb_c = _busco_complete_for_label(assembler)
         fn_c = _busco_complete_for_label("final")
+        if fn_c is not None and os.path.isfile(final_fa):
+            fresh = False
+            for pat in ("busco/final/short_summary*.txt",
+                        "busco/final/run_*/short_summary*.txt"):
+                for p in glob.glob(pat):
+                    try:
+                        fresh = fresh or os.path.getmtime(p) >= os.path.getmtime(final_fa)
+                    except OSError:
+                        pass
+            if not fresh:
+                runner.log_info(
+                    "Do-no-harm: gene content not compared here — BUSCO for the "
+                    "delivered assembly is produced at 13D, after this check. "
+                    "See the final report for the backbone-to-delivered change.")
+                fn_c = None
         if bb_c is not None and fn_c is not None:
             delta = fn_c - bb_c
             runner.log(f"Do-no-harm: BUSCO complete {bb_c:.1f}% → {fn_c:.1f}% "
