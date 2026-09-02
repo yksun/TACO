@@ -46,12 +46,6 @@ TACO was developed at the **Grainger Bioinformatics Center, Field Museum of Natu
 
 ## Overview
 
-<img src="/docs/figures/taco_workflow.png" alt="TACO workflow: nine assemblers run from one read set, are standardized and measured on a common panel to produce one comparison table; an optional refinement stage selects a backbone, substitutes telomere-to-telomere contigs, screens foreign sequence, and gates every step that removes sequence" width="100%">
-
-Everything above the rule measures and is the primary output — `--assembly-only`
-stops there. Everything below it modifies sequence and is optional. Each stage
-that can remove sequence is paired with the check that can veto it.
-
 Genome assemblers often produce different results from the same long-read dataset. One assembler may recover longer contigs, another may preserve more complete chromosome ends, and another may provide a better balance of completeness, contiguity, and redundancy. TACO makes these comparisons systematic, interpretable, and reproducible.
 
 TACO operates in two modes. In **assembly-only mode** (`--assembly-only`), the pipeline runs all compatible assemblers, standardizes their outputs, evaluates quality with BUSCO, QUAST, telomere detection, and optional Merqury, then produces a unified comparison table. In **full refinement mode** (default), TACO continues into telomere-pool construction, backbone refinement, final QC, and report cleanup.
