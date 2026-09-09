@@ -4040,6 +4040,88 @@ def _self_dedup_non_telomeric(fasta_path, telo_ids, out_path, threads,
     return len(drop)
 
 
+#: Full mode removes a contig only when it is a near-identical copy of part of
+#: a longer contig.  0.998 leaves real haplotigs alone: heterozygous haplotypes
+#: differ at roughly 0.1-2% of sites, while an assembly duplicate differs only
+#: by consensus error.  Observed on Fusarium tricinctum: a 56,756 bp Peregrine
+#: fragment 99.98% identical to, and fully inside, a 6.4 Mb contig.
+FULL_DEDUP_MIN_IDENTITY = 0.998
+FULL_DEDUP_MIN_COVERAGE = 0.95
+
+
+def _near_identical_contained_drops(paf_rows, protected_ids,
+                                    cov_thr=FULL_DEDUP_MIN_COVERAGE,
+                                    id_thr=FULL_DEDUP_MIN_IDENTITY):
+    """Decide which contigs are near-identical copies of part of a LONGER contig.
+
+    Pure: takes PAF rows already split on tabs, so it is testable without
+    minimap2.  A contig is dropped when the union of its alignment blocks to one
+    longer contig, counting only blocks at >= *id_thr* identity, covers
+    >= *cov_thr* of its length.  Protected (telomere-bearing) contigs are never
+    dropped, and a longer contig is never dropped in favour of a shorter one, so
+    a redundant pair loses exactly its shorter member.
+    """
+    blocks, qlens = {}, {}
+    for p in paf_rows:
+        if len(p) < 11:
+            continue
+        q, t = p[0], p[5]
+        if q == t or q in protected_ids:
+            continue
+        qlen, tlen = int(p[1]), int(p[6])
+        if qlen >= tlen:
+            continue
+        alnlen = int(p[10])
+        if alnlen <= 0 or int(p[9]) / alnlen < id_thr:
+            continue
+        qlens[q] = qlen
+        blocks.setdefault((q, t), []).append((int(p[2]), int(p[3])))
+    drop = set()
+    for (q, t), ivals in blocks.items():
+        ivals.sort()
+        covered, (cs, ce) = 0, ivals[0]
+        for s, e in ivals[1:]:
+            if s > ce:
+                covered += ce - cs
+                cs, ce = s, e
+            else:
+                ce = max(ce, e)
+        covered += ce - cs
+        if covered / qlens[q] >= cov_thr:
+            drop.add(q)
+    return drop
+
+
+def _remove_near_identical_contained(runner, fasta_path, protected_ids, out_path,
+                                     cov_thr=FULL_DEDUP_MIN_COVERAGE,
+                                     id_thr=FULL_DEDUP_MIN_IDENTITY):
+    """Self-align *fasta_path* and drop what :func:`_near_identical_contained_drops`
+    selects.  Dropped contigs are preserved in ``assemblies/full_dedup_removed.fasta``.
+    Returns ``(n_dropped, dropped_names, dropped_bp)``.
+    """
+    if not os.path.isfile(fasta_path) or os.path.getsize(fasta_path) == 0:
+        _write_fasta([], out_path)
+        return 0, [], 0
+    if not shutil.which("minimap2"):
+        runner.log_warn("minimap2 not found; near-identical duplicate removal skipped")
+        shutil.copy(fasta_path, out_path)
+        return 0, [], 0
+    # asm5 reports near-identical alignments only, which is the point: a
+    # divergent haplotig aligns poorly or not at all under it and is kept.
+    cmd = f"minimap2 -cx asm5 -D -P -t {runner.threads} {fasta_path} {fasta_path}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    rows = [ln.split("\t") for ln in result.stdout.splitlines() if ln.strip()]
+    drop = _near_identical_contained_drops(rows, protected_ids,
+                                           cov_thr=cov_thr, id_thr=id_thr)
+    keep, gone = [], []
+    for n, s in _read_fasta_records(fasta_path):
+        (gone if n in drop else keep).append((n, s))
+    _write_fasta(keep, out_path)
+    if gone:
+        _write_fasta(gone, "assemblies/full_dedup_removed.fasta")
+    return len(gone), [n for n, _ in gone], sum(len(s) for _, s in gone)
+
+
 def _write_provenance_gff(final_fa, gff_path, name_map, protected_ids,
                           replaced_map, backbone_assembler, pool_asm_map,
                           pool_provenance_map=None, runner=None):
@@ -5095,7 +5177,7 @@ def _purge_dups_safety_check(runner, before_recs, after_recs, profile, mode,
     return verdict == "accept", reason
 
 
-def _purge_preserves_gene_content(runner, before_fa, after_fa):
+def _purge_preserves_gene_content(runner, before_fa, after_fa, what="purge_dups"):
     """True when purge_dups did not remove complete genes beyond tolerance.
 
     purge_dups removes haplotigs by sequence similarity and read depth; it has
@@ -5115,15 +5197,16 @@ def _purge_preserves_gene_content(runner, before_fa, after_fa):
     which routes more sequence through an unguarded step. The tolerance is the
     same taxon-aware BUSCO C drop the rescue trial uses.
     """
+    tag = "purge" if what == "purge_dups" else "dedup"
     if os.environ.get("STEP12_SKIP_PURGE_BUSCO_GATE", "0") == "1":
-        runner.log_warn("purge_dups gene-content gate skipped "
+        runner.log_warn(f"{what} gene-content gate skipped "
                         "(STEP12_SKIP_PURGE_BUSCO_GATE=1)")
         return True
     lineage = getattr(runner, "busco_lineage", None)
     if not lineage or not shutil.which("busco"):
         runner.log_warn(
-            "purge_dups gene-content gate skipped: BUSCO unavailable, so the "
-            "purge cannot be checked for gene loss. Compare BUSCO on "
+            f"{what} gene-content gate skipped: BUSCO unavailable, so the "
+            "result cannot be checked for gene loss. Compare BUSCO on "
             f"{before_fa} against {after_fa} before trusting the result.")
         return True
 
@@ -5134,20 +5217,20 @@ def _purge_preserves_gene_content(runner, before_fa, after_fa):
     os.makedirs(trial_dir, exist_ok=True)
 
     before = _run_busco_trial(before_fa, lineage, runner.threads,
-                              "purge_before", trial_dir, runner=runner)
+                              f"{tag}_before", trial_dir, runner=runner)
     after = _run_busco_trial(after_fa, lineage, runner.threads,
-                             "purge_after", trial_dir, runner=runner)
+                             f"{tag}_after", trial_dir, runner=runner)
     if not before or not after:
         runner.log_warn(
-            "purge_dups gene-content gate inconclusive: a BUSCO trial did not "
-            "produce metrics. Accepting the purge.")
+            f"{what} gene-content gate inconclusive: a BUSCO trial did not "
+            "produce metrics. Accepting the result.")
         return True
 
     c_before, c_after = float(before.get("C", 0)), float(after.get("C", 0))
     d_before, d_after = float(before.get("D", 0)), float(after.get("D", 0))
     c_delta, d_delta = c_after - c_before, d_after - d_before
     runner.log(
-        f"purge_dups gene-content gate: BUSCO C {c_before:.1f}% -> "
+        f"{what} gene-content gate: BUSCO C {c_before:.1f}% -> "
         f"{c_after:.1f}% ({c_delta:+.1f}), D {d_before:.1f}% -> {d_after:.1f}% "
         f"({d_delta:+.1f}); tolerance for --taxon {taxon} is "
         f"{-max_c_drop:+.1f} on C")
@@ -5157,11 +5240,11 @@ def _purge_preserves_gene_content(runner, before_fa, after_fa):
     # "-0.0", which reads as nonsense in a log line meant to build confidence.
     if abs(c_delta) < 0.05 and abs(d_delta) < 0.05:
         runner.log_info(
-            "purge_dups accepted: no measurable change to duplication or gene "
+            f"{what} accepted: no measurable change to duplication or gene "
             "content (nothing to purge)")
     else:
         runner.log_info(
-            f"purge_dups accepted: duplication {d_delta:+.1f} points, "
+            f"{what} accepted: duplication {d_delta:+.1f} points, "
             f"complete genes {c_delta:+.1f} points")
     return True
 
@@ -7093,6 +7176,43 @@ def step_12_refine(runner):
                     f"preserved at {purged_fa} and the removed haplotigs at "
                     f"assemblies/purge_dups_work/hap.fa, so the call can be "
                     f"reviewed or forced with STEP12_SKIP_PURGE_BUSCO_GATE=1.")
+    elif _pol.near_identical_dedup_enabled:
+        # Full mode retains alternate sequence, which is divergent by
+        # definition.  A contig that is a near-identical copy of part of a
+        # LONGER contig is redundancy under either representation and was kept
+        # here only because purge_dups is declined.  Observed on Fusarium:
+        # primary delivered 10 contigs and full 11, the extra one a 56,756 bp
+        # Peregrine fragment 99.98% identical to, and fully inside, a 6.4 Mb
+        # contig.  Telomere-bearing contigs are never removed, and the result
+        # passes the same gene-content gate as purge_dups.
+        id_thr = float(os.environ.get("FULL_DEDUP_MIN_IDENTITY", FULL_DEDUP_MIN_IDENTITY))
+        cov_thr = float(os.environ.get("FULL_DEDUP_MIN_COVERAGE", FULL_DEDUP_MIN_COVERAGE))
+        runner.log_info(
+            "purge_dups skipped (--assembly-mode full retains alternate sequence); "
+            f"removing near-identical contained duplicates only (identity >= {id_thr}, "
+            f"query coverage >= {cov_thr}; telomere-bearing contigs are never removed). "
+            "Disable with --no-purge-dups.")
+        try:
+            _dd_t2t, _dd_telo = _classify_contigs_telomere_status(raw_out, runner)
+        except Exception:
+            _dd_t2t, _dd_telo = set(), set()
+        dedup_fa = "assemblies/final_merge.dedup.fasta"
+        n_dup, dup_names, dup_bp = _remove_near_identical_contained(
+            runner, raw_out, _dd_t2t | _dd_telo, dedup_fa,
+            cov_thr=cov_thr, id_thr=id_thr)
+        if n_dup == 0:
+            runner.log_info("Near-identical duplicate removal: none found")
+        elif _purge_preserves_gene_content(runner, raw_out, dedup_fa,
+                                           what="near-identical duplicate removal"):
+            runner.log(f"Near-identical duplicate removal: removed {n_dup} contig(s), "
+                       f"{dup_bp:,} bp ({', '.join(dup_names)}); preserved at "
+                       f"assemblies/full_dedup_removed.fasta")
+            shutil.copy(dedup_fa, raw_out)
+        else:
+            runner.log_warn(
+                "Near-identical duplicate removal REJECTED: it removed complete genes "
+                f"beyond the tolerance for --taxon {getattr(runner, 'taxon', 'other')}. "
+                f"Keeping the unfiltered assembly; the filtered version is at {dedup_fa}.")
     elif _pol.user_no_purge_dups:
         runner.log_info("purge_dups skipped (--no-purge-dups)")
     else:

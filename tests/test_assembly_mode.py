@@ -1508,3 +1508,88 @@ def test_selection_passes_dropped_metrics_to_the_formula_record():
     blk = blk[:blk.index("\ndef ", 1)]
     assert "dropped=_unavailable" in blk
 
+
+# ── full mode keeps alternate sequence, not identical copies of it ────────────
+#
+# On the Fusarium run full mode delivered 11 contigs to primary's 10. The extra
+# one, contig_12 (56,756 bp, from the Peregrine backbone, no telomere), aligns to
+# contig_4 at 4,297,419-4,354,184 with 100% coverage and 99.98% identity. That is
+# a duplicate, not a haplotype, and full mode kept it only because it declined
+# every redundancy pass along with purge_dups.
+
+def _paf(q, qlen, qs, qe, t, tlen, ts, te, matches, alnlen):
+    return [q, str(qlen), str(qs), str(qe), "+", t, str(tlen), str(ts), str(te),
+            str(matches), str(alnlen), "60"]
+
+
+def test_near_identical_contained_fragment_is_dropped():
+    from taco.steps import _near_identical_contained_drops as drops
+    rows = [_paf("contig_12", 56756, 0, 56756, "contig_4", 6409117,
+                 4297419, 4354184, 56745, 56756)]           # the real case
+    assert drops(rows, set()) == {"contig_12"}
+
+
+def test_divergent_contained_contig_is_kept():
+    """A 98%-identical contig is what a retained haplotype looks like."""
+    from taco.steps import _near_identical_contained_drops as drops
+    rows = [_paf("hap", 56756, 0, 56756, "big", 6409117, 0, 56800, 55620, 56756)]
+    assert drops(rows, set()) == set()
+
+
+def test_telomere_bearing_contig_is_never_dropped():
+    from taco.steps import _near_identical_contained_drops as drops
+    rows = [_paf("contig_12", 56756, 0, 56756, "contig_4", 6409117,
+                 4297419, 4354184, 56745, 56756)]
+    assert drops(rows, {"contig_12"}) == set()
+
+
+def test_only_the_shorter_member_of_a_redundant_pair_is_dropped():
+    """minimap2 -D -P reports both directions; the longer contig must survive."""
+    from taco.steps import _near_identical_contained_drops as drops
+    a = _paf("short", 1000, 0, 1000, "long", 5000, 0, 1000, 1000, 1000)
+    b = _paf("long", 5000, 0, 1000, "short", 1000, 0, 1000, 1000, 1000)
+    assert drops([a, b], set()) == {"short"}
+
+
+def test_coverage_is_the_union_of_alignment_blocks():
+    """A duplicate split by an indel still counts; one block alone does not."""
+    from taco.steps import _near_identical_contained_drops as drops
+    rows = [_paf("q", 10000, 0, 6000, "t", 50000, 0, 6000, 5999, 6000),
+            _paf("q", 10000, 5900, 9800, "t", 50000, 5950, 9850, 3899, 3900)]
+    assert drops(rows, set()) == {"q"}
+    assert drops(rows[:1], set()) == set()
+
+
+def test_policy_full_mode_removes_identical_copies_unless_told_not_to():
+    assert AssemblyPolicy(mode="full", taxon="fungal").near_identical_dedup_enabled is True
+    assert AssemblyPolicy(mode="primary", taxon="fungal").near_identical_dedup_enabled is False
+    try:
+        p = AssemblyPolicy(mode="full", taxon="fungal", user_no_purge_dups=True)
+    except TypeError:
+        p = AssemblyPolicy(mode="full", taxon="fungal")
+        p.user_no_purge_dups = True
+    assert p.near_identical_dedup_enabled is False, "--no-purge-dups means remove nothing"
+    try:
+        AssemblyPolicy(mode=MODE_BOTH, taxon="fungal").near_identical_dedup_enabled
+        assert False, "both is a driver mode, not a scoring profile"
+    except ValueError:
+        pass
+
+
+def test_12H_full_mode_dedup_is_gene_gated_and_preserves_what_it_removes():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "taco", "steps.py")).read()
+    blk = src[src.index("# ---- 12H. purge_dups default cleanup ----"):]
+    blk = blk[:blk.index("# ---- 12I.")]
+    assert "near_identical_dedup_enabled" in blk
+    assert "_remove_near_identical_contained" in blk
+    assert 'what="near-identical duplicate removal"' in blk, "gate must name its caller"
+    assert "_purge_preserves_gene_content" in blk, "the removal must be gene-gated"
+    assert "full_dedup_removed.fasta" in blk, "removed sequence must be preserved"
+
+
+def test_gate_log_names_the_pass_that_called_it():
+    ok, r = _run_gate(96.3, 96.3, before_d=0.6, after_d=0.6)   # existing helper
+    assert ok is True
+    assert any(m.startswith("purge_dups accepted") for m in r.logged), r.logged
+

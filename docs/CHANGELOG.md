@@ -5,6 +5,33 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.5.3] — 2026-09-09
+
+### Full mode keeps alternate sequence, not identical copies of it
+
+`--assembly-mode full` declines purge_dups because purge_dups removes haplotigs,
+and a retained haplotype is the point of the mode. It also declined every other
+redundancy pass, and that was too broad. On the *Fusarium tricinctum* run the
+primary deliverable had 10 contigs and the full deliverable 11. The extra one,
+`contig_12` (56,756 bp, from the Peregrine backbone, no telomere), aligns to
+`contig_4` at 4,297,419–4,354,184 with 100% query coverage and 99.98% identity.
+That is not an alternate haplotype. Heterozygous haplotypes differ at roughly
+0.1–2% of sites; a 0.02% difference is consensus error on a duplicate.
+
+- **New pass at 12H in full mode.** Where purge_dups would run, TACO now
+  self-aligns the merged assembly (`minimap2 -cx asm5`) and removes a contig
+  only when it is shorter than the contig it aligns to and the union of its
+  alignment blocks at ≥ 99.8% identity covers ≥ 95% of its length
+  (`FULL_DEDUP_MIN_IDENTITY`, `FULL_DEDUP_MIN_COVERAGE`). Telomere-bearing
+  contigs are never removed. The result passes the same gene-content gate as
+  purge_dups, and removed contigs are preserved in
+  `assemblies/full_dedup_removed.fasta`. `--no-purge-dups` disables it.
+- **The gate names its caller.** `_purge_preserves_gene_content` logged
+  "purge_dups accepted" whatever called it; it now reports the pass it gated.
+- Primary mode is unchanged: purge_dups already removes this class of contig.
+
+---
+
 ## [1.5.2] — 2026-09-02
 
 Five corrections found while re-running v1.5.1 on *Fusarium tricinctum* and

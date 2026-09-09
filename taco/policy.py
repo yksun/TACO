@@ -518,6 +518,25 @@ class AssemblyPolicy:
         return not self.is_full
 
     @property
+    def near_identical_dedup_enabled(self):
+        """Full mode's replacement for purge_dups: remove identical copies only.
+
+        Full mode declines purge_dups because purge_dups removes haplotigs, and
+        a retained haplotype is the point of the mode.  A contig that is a
+        near-identical copy of part of a LONGER contig is not a haplotype --
+        heterozygous haplotypes differ at roughly 0.1-2% of sites, a 0.02%
+        difference is consensus error on a duplicate -- so it is redundancy
+        under either representation.  Observed on Fusarium tricinctum: full
+        mode delivered 11 contigs to primary's 10, the extra one a 56,756 bp
+        Peregrine fragment 99.98% identical to, and fully inside, a 6.4 Mb
+        contig.  ``--no-purge-dups`` disables this too: it means remove nothing.
+        """
+        self._reject_both("near-identical duplicate removal")
+        if self.user_no_purge_dups:
+            return False
+        return self.is_full
+
+    @property
     def collapse_redundancy_enabled(self):
         """Self-dedup and containment filtering also delete alternate copies.
 
